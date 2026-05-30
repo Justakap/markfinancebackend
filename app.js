@@ -17,23 +17,7 @@ const { requireAuth } = require("./middleware/auth");
 
 const app = express();
 
-const allowedOrigins = (process.env.FRONTEND_URL || "http://localhost:3000")
-    .split(",")
-    .map((origin) => origin.trim())
-    .filter(Boolean);
-
-app.use(
-    cors({
-        origin(origin, callback) {
-            if (!origin || allowedOrigins.includes(origin)) {
-                return callback(null, true);
-            }
-
-            return callback(new Error("Not allowed by CORS"));
-        },
-        credentials: true,
-    })
-);
+app.use(cors());
 app.use(express.json());
 
 // Simple in-memory cache with TTL
