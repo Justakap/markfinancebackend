@@ -1424,7 +1424,6 @@ app.get("/api/strategy-details/:id", async (req, res) => {
 
 app.post("/api/backtest/run", requireAuth, async (req, res) => {
     try {
-        if (!rateLimit(req.ip, 4, 60)) return res.status(429).json({ message: "Too many requests" });
         const {
             strategyId,
             symbol,
