@@ -22,6 +22,12 @@ const conditionSchema = new mongoose.Schema(
             type: String,
             required: true,
         },
+
+        nextLogic: {
+            type: String,
+            enum: ["AND", "OR"],
+            default: undefined,
+        },
     },
     { _id: false }
 );

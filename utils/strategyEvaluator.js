@@ -130,12 +130,20 @@ function evaluateCondition(current, previous, condition) {
 function evaluateStrategy(current, previous, conditions = [], logic = "AND") {
     if (!conditions || !conditions.length) return false;
 
-    if (logic === "OR") {
-        return conditions.some((c) => evaluateCondition(current, previous, c));
+    let result = evaluateCondition(current, previous, conditions[0]);
+
+    for (let i = 1; i < conditions.length; i++) {
+        const connector = conditions[i - 1].nextLogic || logic || "AND";
+        const currentResult = evaluateCondition(current, previous, conditions[i]);
+
+        if (connector === "OR") {
+            result = result || currentResult;
+        } else {
+            result = result && currentResult;
+        }
     }
 
-    // default AND
-    return conditions.every((c) => evaluateCondition(current, previous, c));
+    return result;
 }
 
 function getIndicatorWarmup(indicator) {
