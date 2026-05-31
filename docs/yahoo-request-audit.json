@@ -1,0 +1,68 @@
+[
+  {
+    "endpoint": "GET /api/market-data/:watchlistId",
+    "yahooRequestsPerStock": "0 on cache hit; up to 6 on miss (1 quote + 5 charts)",
+    "indicators": ["RSI 1m/5m/15m/1h/D", "EMA20/50/200", "Volume Change", "PE"],
+    "cache": "marketCache (primary) + yahooClient layer",
+    "avgTimeTarget": "<200ms cached",
+    "notes": "User requests read cache only; engine warms in background"
+  },
+  {
+    "endpoint": "POST /api/strategies/run",
+    "yahooRequestsPerStock": "0 (cache only)",
+    "indicators": "Read from marketCache",
+    "cache": "marketCache",
+    "avgTimeTarget": "<500ms",
+    "notes": "No Yahoo on scan path"
+  },
+  {
+    "endpoint": "POST /api/backtest/run",
+    "yahooRequestsPerStock": "1-6 charts per run",
+    "indicators": ["RSI", "EMA"],
+    "cache": "yahooClient chart cache",
+    "avgTimeTarget": "unchanged this phase",
+    "notes": "Phase 12 skipped"
+  },
+  {
+    "endpoint": "GET /api/search-stock",
+    "yahooRequests": "1 search per unique query",
+    "indicators": "none",
+    "cache": "yahooClient searchSymbols 300s",
+    "notes": "Routed through yahooClient"
+  },
+  {
+    "endpoint": "POST /api/watchlists/:id/stocks",
+    "yahooRequests": "1 quote + 1 quoteSummary",
+    "indicators": "none",
+    "cache": "yahooClient",
+    "notes": "Routed through fetchQuote/fetchQuoteSummary"
+  },
+  {
+    "endpoint": "POST /api/watchlists/:id/refresh-fundamentals",
+    "yahooRequests": "2 per stock",
+    "indicators": "none",
+    "cache": "yahooClient",
+    "notes": "Routed through yahooClient"
+  },
+  {
+    "endpoint": "GET /api/debug/:symbol",
+    "yahooRequests": "via getMarketData → engine refresh",
+    "indicators": "full set",
+    "cache": "marketCache after refresh",
+    "notes": "Dev only"
+  },
+  {
+    "endpoint": "GET /test",
+    "yahooRequests": "1 quote",
+    "indicators": "none",
+    "cache": "yahooClient",
+    "notes": "Legacy test route"
+  },
+  {
+    "endpoint": "Market Engine (background)",
+    "yahooRequests": "deduplicated per symbol",
+    "indicators": "full set on refresh",
+    "cache": "marketCache + broadcast via Socket.IO",
+    "notes": "15s price / 60s indicators when open; 5min when closed"
+  }
+]

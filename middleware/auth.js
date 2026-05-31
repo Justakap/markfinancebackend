@@ -1,4 +1,5 @@
 const jwt = require("jsonwebtoken");
+const { getJwtSecret } = require("../config/jwt");
 
 function requireAuth(req, res, next) {
     const auth = req.headers.authorization || req.headers.Authorization;
@@ -10,7 +11,7 @@ function requireAuth(req, res, next) {
     const token = auth.split(" ")[1];
 
     try {
-        const payload = jwt.verify(token, process.env.JWT_SECRET || "dev-secret");
+        const payload = jwt.verify(token, getJwtSecret());
 
         req.user = payload;
 
