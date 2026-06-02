@@ -19,6 +19,12 @@ const watchlistSchema = new mongoose.Schema(
                 name: String,
                 longName: String,
 
+                instrumentKey: {
+                    type: String,
+                    index: true,
+                },
+                instrumentType: String,
+
                 exchange: String,
                 market: String,
                 assetType: String,
