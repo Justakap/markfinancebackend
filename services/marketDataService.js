@@ -167,7 +167,13 @@ function isSupportedInstrument(item) {
         type === "INDEX" ||
         type.includes("FUT") ||
         type.includes("OPT") ||
+        type === "CE" ||
+        type === "PE" ||
+        type === "CALL" ||
+        type === "PUT" ||
         type === "ETF" ||
+        segment.includes("NSE_FO") ||
+        segment.includes("BSE_FO") ||
         segment.includes("MCX") ||
         segment.includes("BCD") ||
         segment.includes("NCD") ||
@@ -266,8 +272,7 @@ async function searchInstruments(query) {
         return cached.results;
     }
 
-    const instruments = await loadInstruments();
-    const results = rankSearchResults(
+    const matchInstruments = (instruments = []) =>
         instruments.filter((item) => {
             const symbol = item.symbol.toUpperCase();
             const name = item.name.toUpperCase();
@@ -280,9 +285,16 @@ async function searchInstruments(query) {
             const text =
                 `${symbol} ${name} ${key} ${(item.segment || "").toUpperCase()}`.trim();
             return tokens.every((token) => text.includes(token));
-        }),
-        q,
-    );
+        });
+
+    let instruments = await loadInstruments();
+    let matched = matchInstruments(instruments);
+    if (!matched.length) {
+        instruments = await loadInstruments(true);
+        matched = matchInstruments(instruments);
+    }
+
+    const results = rankSearchResults(matched, q);
 
     searchResultCache.set(cacheKey, {
         results,
