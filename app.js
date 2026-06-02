@@ -29,10 +29,12 @@ const {
 const { runIndicatorValidation } = require("./utils/validationService");
 const { ensureYahooSymbol } = require("./utils/symbols");
 const marketEngine = require("./services/marketEngine");
+const upstoxMarketData = require("./services/marketDataService");
 const marketCache = require("./services/marketCache");
 const { getMetrics, recordScanTime, recordBacktestTime } = require("./utils/metrics");
 const http = require("http");
 const { Server } = require("socket.io");
+const { createStockAnalysisRoutes } = require("./routes/stockAnalysisRoutes");
 
 const VALIDATION_MODE =
     process.env.ENABLE_VALIDATION_MODE === "true" ||
@@ -68,6 +70,11 @@ function rateLimit(ip, limit = 20, windowSec = 60) {
     return entry.count <= limit;
 }
 
+// Search is local (instrument master cache) — allow frequent debounced typing
+function searchRateLimit(ip, limit = 120, windowSec = 60) {
+    return rateLimit(`search:${ip}`, limit, windowSec);
+}
+
 app.get("/", (req, res) => {
     res.send("Share Analysis MK API Running");
 });
@@ -80,6 +87,17 @@ app.get("/api/health", (req, res) => {
 });
 
 app.use("/api", requireDatabase);
+app.use(
+    "/api",
+    createStockAnalysisRoutes({
+        Watchlist,
+        requireAuth,
+        ownsResource,
+        rateLimit,
+        searchRateLimit,
+        upstoxMarketData,
+    }),
+);
 
 //market mapper
 
@@ -188,30 +206,22 @@ app.post(
 
             const stocks = watchlist.stocks.map((stock) => ({
                 symbol: stock.symbol,
-                yahooSymbol: ensureYahooSymbol(stock.symbol, stock.market),
+                yahooSymbol: ensureYahooSymbol(
+                    stock.symbol,
+                    stock.market || stock.exchange,
+                ),
                 name: stock.name,
-                market: stock.market || "",
+                market: stock.market || stock.exchange || "",
                 displaySymbol: stock.symbol,
             }));
 
             marketEngine.trackSymbols(stocks);
 
             const scanStart = Date.now();
-            const { rows: marketData } = marketEngine.getScanData(stocks);
-            recordScanTime(Date.now() - scanStart);
-
-            if (!marketData.length) {
-                await marketEngine.warmMissing(
-                    stocks.slice(0, 10).map((s) => ({
-                        yahooSymbol: s.yahooSymbol,
-                        displaySymbol: s.symbol,
-                        name: s.name,
-                        market: s.market || "",
-                    })),
-                );
-            }
-
+            await marketEngine.warmQuotesFast(stocks, 6);
+            await marketEngine.warmIndicators(stocks, 4);
             const cachedRows = marketEngine.getScanData(stocks).rows;
+            recordScanTime(Date.now() - scanStart);
 
             const conditions =
                 strategy.entryConditions?.length
@@ -232,7 +242,7 @@ app.post(
                     matches.length,
                 matches,
                 scanTimeMs: Date.now() - scanStart,
-                cacheOnly: true,
+                cacheOnly: false,
             });
         } catch (error) {
             console.log(error);
@@ -413,79 +423,6 @@ app.get("/test", async (req, res) => {
 
 
 
-// =======================
-// Market Data
-// =======================
-
-app.get("/api/market-data/:watchlistId", requireAuth, async (req, res) => {
-    const start = Date.now();
-
-    try {
-        const watchlist = await Watchlist.findById(req.params.watchlistId);
-        if (!watchlist) return res.status(404).json({ message: "Watchlist not found" });
-
-        if (watchlist.userId && !ownsResource(watchlist.userId, req)) {
-            return res.status(403).json({ message: "Forbidden" });
-        }
-
-        if (!watchlist.stocks?.length) {
-            return res.json({ data: [], total: 0, offset: 0, limit: 0, fromCache: true });
-        }
-
-        const offset = Math.max(0, parseInt(req.query.offset || "0", 10));
-        const limit = Math.max(1, parseInt(req.query.limit || "50", 10));
-
-        const stocks = watchlist.stocks.map((stock) => ({
-            symbol: stock.symbol,
-            yahooSymbol: ensureYahooSymbol(stock.symbol, stock.market),
-            name: stock.name,
-            market: stock.market || "",
-            displaySymbol: stock.symbol,
-        }));
-
-        marketEngine.trackWatchlist(watchlist._id.toString(), stocks);
-
-        let result = marketEngine.getWatchlistFromCache(stocks, { offset, limit });
-
-        const allMissing = stocks.filter(
-            (s) => !marketCache.has(s.yahooSymbol),
-        );
-
-        if (allMissing.length > 0 && watchlist.stocks.length <= 80) {
-            await marketEngine.warmQuotesFast(allMissing, 6);
-            result = marketEngine.getWatchlistFromCache(stocks, { offset, limit });
-
-            setImmediate(() => {
-                marketEngine
-                    .warmIndicators(allMissing, 3)
-                    .catch((err) => console.log("Indicator warm:", err.message));
-            });
-        } else if (result.missing > 0) {
-            const chunk = stocks.slice(offset, offset + limit);
-            setImmediate(() => {
-                marketEngine
-                    .warmMissing(chunk)
-                    .catch((err) => console.log("Warm missing:", err.message));
-            });
-        }
-
-        res.json({
-            data: result.data,
-            total: result.total,
-            offset: result.offset,
-            limit: result.limit,
-            fromCache: true,
-            marketStatus: result.marketStatus,
-            updatedAt: result.updatedAt,
-            responseTimeMs: Date.now() - start,
-        });
-    } catch (error) {
-        console.log("Market data error:", error);
-        res.status(500).json({
-            message: error.message || "Failed to load market data",
-        });
-    }
-});
 
 
 // Stratergy 
@@ -694,47 +631,6 @@ app.post("/api/watchlists/:id/refresh-fundamentals", requireAuth, async (req, re
 
 
 
-// =======================
-// Search Stock
-// =======================
-
-app.get("/api/search-stock", async (req, res) => {
-    if (!rateLimit(req.ip, 10, 60)) return res.status(429).json({ message: "Too many requests" });
-    try {
-        const q = req.query.q;
-
-        if (!q) {
-            return res.json([]);
-        }
-
-        const result = await searchSymbols(q);
-
-        const stocks = result.quotes
-            .filter(
-                (item) =>
-                    item.symbol &&
-                    (item.shortname || item.longname)
-            )
-            .slice(0, 20)
-            .map((item) => ({
-                symbol: item.symbol,
-                name: item.shortname,
-                exchange: item.exchange,
-                market: getMarket(item.exchange),
-                assetType: item.quoteType,
-            }));
-
-        res.json(stocks);
-
-    } catch (error) {
-        console.log(error);
-
-        res.status(500).json({
-            message: "Search failed",
-        });
-    }
-});
-
 
 // =======================
 // Create Watchlist
@@ -835,67 +731,54 @@ app.delete("/api/watchlists/:id", requireAuth, async (req, res) => {
 
 app.post("/api/watchlists/:id/stocks", requireAuth, async (req, res) => {
     try {
-        const { symbol, name, exchange, market, assetType } = req.body;
-        const quote = await fetchQuote(symbol);
+        const {
+            symbol,
+            name,
+            instrumentKey,
+            exchange,
+            instrumentType,
+            type,
+            market,
+            assetType,
+            sector,
+            segment,
+        } = req.body;
 
-        let profile = {};
-        try {
-            const summary = await fetchQuoteSummary(symbol, ["assetProfile"]);
-            profile = summary.assetProfile || {};
-        } catch (error) {
-            console.log("Asset Profile Error:", symbol);
+        if (!symbol || !instrumentKey) {
+            return res.status(400).json({
+                message: "symbol and instrumentKey are required",
+            });
         }
 
         const watchlist = await Watchlist.findById(req.params.id);
         if (!watchlist) return res.status(404).json({ message: "Watchlist not found" });
         if (watchlist.userId && watchlist.userId.toString() !== req.user.mongoId) return res.status(403).json({ message: "Forbidden" });
 
-        const exists = watchlist.stocks.find((stock) => stock.symbol === symbol);
+        const exists = watchlist.stocks.find((stock) => stock.instrumentKey === instrumentKey);
         if (!exists) {
             watchlist.stocks.push({
                 symbol,
                 name,
-                longName: quote.longName || "",
+                longName: name || "",
+                instrumentKey,
+                instrumentType: instrumentType || type || assetType || "",
                 exchange,
-                market,
-                assetType,
-                sector: profile.sector || "",
-                industry: profile.industry || "",
-                marketCap: quote.marketCap || 0,
-                sharesOutstanding: quote.sharesOutstanding || 0,
-                trailingPE: quote.trailingPE || 0,
-                forwardPE: quote.forwardPE || 0,
-                priceToBook: quote.priceToBook || 0,
-                bookValue: quote.bookValue || 0,
-                epsTrailingTwelveMonths: quote.epsTrailingTwelveMonths || 0,
-                epsForward: quote.epsForward || 0,
-                dividendYield: quote.dividendYield || 0,
-                dividendRate: quote.dividendRate || 0,
-                fiftyTwoWeekHigh: quote.fiftyTwoWeekHigh || 0,
-                fiftyTwoWeekLow: quote.fiftyTwoWeekLow || 0,
-                averageAnalystRating: quote.averageAnalystRating || "",
-                averageDailyVolume3Month: quote.averageDailyVolume3Month || 0,
-                averageDailyVolume10Day: quote.averageDailyVolume10Day || 0,
-                beta: quote.beta || 0,
-                currency: quote.currency || "",
-                website: profile.website || "",
-                country: profile.country || "",
-                city: profile.city || "",
-                fullTimeEmployees: profile.fullTimeEmployees || 0,
-                longBusinessSummary: profile.longBusinessSummary || "",
+                market: exchange || market,
+                assetType: instrumentType || type || assetType || "",
+                sector:
+                    sector ||
+                    segment ||
+                    (exchange && (instrumentType || type)
+                        ? `${exchange} · ${instrumentType || type || assetType}`
+                        : exchange || "Other"),
+                trailingPE: 0,
                 updatedAt: new Date(),
             });
 
             await watchlist.save();
             deleteCache(`market:${watchlist._id}`);
-            marketEngine.trackSymbols(
-                watchlist.stocks.map((s) => ({
-                    symbol: s.symbol,
-                    yahooSymbol: ensureYahooSymbol(s.symbol, s.market),
-                    market: s.market || "",
-                    displaySymbol: s.symbol,
-                    name: s.name,
-                })),
+            upstoxMarketData.subscribe(
+                watchlist.stocks.map((stock) => stock.instrumentKey),
             );
         }
 
@@ -918,15 +801,18 @@ app.delete("/api/watchlists/:id/stocks/:symbol", requireAuth, async (req, res) =
             return res.status(403).json({ message: "Forbidden" });
         }
 
-        const symbol = decodeURIComponent(req.params.symbol);
+        const stockId = decodeURIComponent(req.params.symbol);
 
-        const updated = await Watchlist.findByIdAndUpdate(
-            req.params.id,
-            { $pull: { stocks: { symbol } } },
-            { new: true },
+        watchlist.stocks = watchlist.stocks.filter(
+            (stock) => stock.symbol !== stockId && stock.instrumentKey !== stockId,
         );
 
+        const updated = await watchlist.save();
+
         deleteCache(`market:${watchlist._id}`);
+        upstoxMarketData.subscribe(
+            (updated?.stocks || []).map((stock) => stock.instrumentKey),
+        );
 
         res.json(updated);
     } catch (error) {
@@ -948,13 +834,19 @@ app.post("/api/watchlists/:id/stocks/bulk-remove", requireAuth, async (req, res)
             return res.status(403).json({ message: "Forbidden" });
         }
 
-        const updated = await Watchlist.findByIdAndUpdate(
-            req.params.id,
-            { $pull: { stocks: { symbol: { $in: symbols } } } },
-            { new: true },
+        const symbolSet = new Set(symbols.map(String));
+        watchlist.stocks = watchlist.stocks.filter(
+            (stock) =>
+                !symbolSet.has(stock.symbol) &&
+                !symbolSet.has(stock.instrumentKey),
         );
 
+        const updated = await watchlist.save();
+
         deleteCache(`market:${watchlist._id}`);
+        upstoxMarketData.subscribe(
+            (updated?.stocks || []).map((stock) => stock.instrumentKey),
+        );
 
         res.json(updated);
     } catch (error) {
@@ -1251,6 +1143,10 @@ async function startServer() {
     });
 
     marketEngine.init(io);
+    console.log("Yahoo market engine enabled (strategies & backtests)");
+
+    upstoxMarketData.init(io);
+    console.log("Upstox market data enabled (stock analysis)");
 
     server.listen(PORT, () => {
         console.log(`Server running on port ${PORT} (Socket.IO enabled)`);
