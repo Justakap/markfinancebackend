@@ -1,4 +1,11 @@
 const axios = require("axios");
+const { enqueue } = require("../utils/upstoxRequestQueue");
+const {
+    isInstrumentKeyBlocked,
+    isInvalidInstrumentMessage,
+    markInstrumentKeyInvalid,
+    canFetchCandles,
+} = require("../utils/instrumentKeyResolver");
 
 const candleCache = new Map();
 const CANDLE_TTL_MS = Number(process.env.UPSTOX_CANDLE_TTL_MS || 5 * 60 * 1000);
@@ -7,6 +14,7 @@ const INTRADAY_CANDLE_TTL_MS = Number(
 );
 
 const RSI_CANDLE_CONFIGS = [
+    { interval: "minutes", unit: "1" },
     { interval: "minutes", unit: "5" },
     { interval: "minutes", unit: "15" },
     { interval: "hours", unit: "1" },
@@ -16,6 +24,28 @@ const RSI_CANDLE_CONFIGS = [
 function getAccessToken() {
     return process.env.UPSTOX_ACCESS_TOKEN || process.env.UPSTOX_TOKEN || "";
 }
+
+function extractUpstoxErrorMessage(error) {
+    return (
+        error.response?.data?.errors?.[0]?.message ||
+        error.response?.data?.message ||
+        error.message ||
+        ""
+    );
+}
+
+function handleCandleApiError(instrumentKey, error) {
+    const message = extractUpstoxErrorMessage(error);
+
+    if (isInvalidInstrumentMessage(message)) {
+        markInstrumentKeyInvalid(instrumentKey, message);
+        return true;
+    }
+
+    return false;
+}
+
+const assertCandleInstrumentKey = canFetchCandles;
 
 function formatDate(date) {
     return date.toISOString().slice(0, 10);
@@ -46,30 +76,41 @@ function getDateRangeForUnit(unit) {
 
 async function fetchIntradayCandles(instrumentKey, options = {}) {
     const token = getAccessToken();
-    if (!token) return [];
+    if (!token || !(await assertCandleInstrumentKey(instrumentKey))) return [];
 
     const rawUnit = options.interval || "minutes";
     const rawInterval = options.unit || "1";
     const unit = rawUnit === "hours" ? "minutes" : rawUnit;
-    const interval = rawUnit === "hours" ? String(Number(rawInterval) * 60) : rawInterval;
+    const interval =
+        rawUnit === "hours" ? String(Number(rawInterval) * 60) : rawInterval;
     const encodedKey = encodeURIComponent(instrumentKey);
     const url = `https://api.upstox.com/v3/historical-candle/intraday/${encodedKey}/${unit}/${interval}`;
+    const maxBars = options.maxBars || 250;
 
-    const response = await axios.get(url, {
-        headers: {
-            Accept: "application/json",
-            Authorization: `Bearer ${token}`,
-        },
-        timeout: 15000,
-    });
+    try {
+        const response = await enqueue(() =>
+            axios.get(url, {
+                headers: {
+                    Accept: "application/json",
+                    Authorization: `Bearer ${token}`,
+                },
+                timeout: 20000,
+            }),
+        );
 
-    const candles = response.data?.data?.candles || response.data?.candles || [];
+        const candles = response.data?.data?.candles || response.data?.candles || [];
 
-    return candles
-        .map(normalizeCandle)
-        .filter((candle) => Number.isFinite(candle.close))
-        .reverse()
-        .slice(-250);
+        return candles
+            .map(normalizeCandle)
+            .filter((candle) => Number.isFinite(candle.close))
+            .reverse()
+            .slice(-maxBars);
+    } catch (error) {
+        if (handleCandleApiError(instrumentKey, error)) {
+            return [];
+        }
+        throw error;
+    }
 }
 
 function normalizeCandle(raw) {
@@ -103,27 +144,38 @@ async function fetchHistoricalCandlesByRange(
     interval,
     fromDate,
     toDate,
+    options = {},
 ) {
+    const maxBars = options.maxBars || 500;
     const token = getAccessToken();
-    if (!token) return [];
+    if (!token || !(await assertCandleInstrumentKey(instrumentKey))) return [];
 
     const encodedKey = encodeURIComponent(instrumentKey);
     const url = `https://api.upstox.com/v3/historical-candle/${encodedKey}/${unit}/${interval}/${toDate}/${fromDate}`;
 
-    const response = await axios.get(url, {
-        headers: {
-            Accept: "application/json",
-            Authorization: `Bearer ${token}`,
-        },
-        timeout: 15000,
-    });
+    try {
+        const response = await enqueue(() =>
+            axios.get(url, {
+                headers: {
+                    Accept: "application/json",
+                    Authorization: `Bearer ${token}`,
+                },
+                timeout: 20000,
+            }),
+        );
 
-    const candles = response.data?.data?.candles || response.data?.candles || [];
-    return candles
-        .map(normalizeCandle)
-        .filter((candle) => Number.isFinite(candle.close))
-        .reverse()
-        .slice(-500);
+        const candles = response.data?.data?.candles || response.data?.candles || [];
+        return candles
+            .map(normalizeCandle)
+            .filter((candle) => Number.isFinite(candle.close))
+            .reverse()
+            .slice(-maxBars);
+    } catch (error) {
+        if (handleCandleApiError(instrumentKey, error)) {
+            return [];
+        }
+        throw error;
+    }
 }
 
 function bucketHourTimestamp(value) {
@@ -177,94 +229,95 @@ function aggregateToHourlyCandles(candles = []) {
     );
 }
 
+function getDateRangeForPeriodDays(unit, periodDays = 365) {
+    const toDate = formatDate(new Date());
+    const days = Math.max(1, Number(periodDays) || 365);
+    const fromDate = formatDate(new Date(Date.now() - days * 24 * 60 * 60 * 1000));
+    return { toDate, fromDate };
+}
+
 async function fetchHistoricalCandles(instrumentKey, options = {}) {
     const token = getAccessToken();
-    if (!token) return [];
+    if (!token || !(await assertCandleInstrumentKey(instrumentKey))) return [];
 
     const requestedUnit = options.interval || "days";
     const requestedInterval = options.unit || "1";
+    const periodDays = options.periodDays;
+    const maxBars = options.maxBars || 500;
+
+    if (isInstrumentKeyBlocked(instrumentKey)) {
+        return [];
+    }
 
     if (requestedUnit === "hours") {
-        try {
-            const { toDate, fromDate } = getDateRangeForUnit("hours");
-            const directHourly = await fetchHistoricalCandlesByRange(
-                instrumentKey,
-                "minutes",
-                "60",
-                fromDate,
-                toDate,
-            );
-            if (directHourly.length) {
-                return directHourly.slice(-250);
-            }
-        } catch (error) {
-            console.log(
-                `Upstox direct hourly candles ${instrumentKey}:`,
-                error.response?.data?.errors?.[0]?.message || error.message,
-            );
+        const { toDate, fromDate } = getDateRangeForUnit("hours");
+        const directHourly = await fetchHistoricalCandlesByRange(
+            instrumentKey,
+            "minutes",
+            "60",
+            fromDate,
+            toDate,
+        );
+        if (directHourly.length) {
+            return directHourly.slice(-maxBars);
         }
 
-        try {
-            const minuteCandles = await fetchIntradayCandles(instrumentKey, {
-                interval: "minutes",
-                unit: "1",
-            });
-            const hourly = aggregateToHourlyCandles(minuteCandles);
-            if (hourly.length) return hourly.slice(-250);
-        } catch (error) {
-            console.log(
-                `Upstox hourly aggregate candles ${instrumentKey}:`,
-                error.response?.data?.errors?.[0]?.message || error.message,
-            );
-        }
+        const minuteCandles = await fetchIntradayCandles(instrumentKey, {
+            interval: "minutes",
+            unit: "1",
+        });
+        const hourly = aggregateToHourlyCandles(minuteCandles);
+        if (hourly.length) return hourly.slice(-maxBars);
     }
 
     const unit = requestedUnit;
     const interval = requestedInterval;
 
     if (unit === "minutes" || unit === "hours") {
-        try {
-            const intraday = await fetchIntradayCandles(instrumentKey, {
-                interval: unit,
-                unit: interval,
-            });
-            if (intraday.length) return intraday;
-        } catch (error) {
-            console.log(
-                `Upstox intraday candles ${instrumentKey} ${unit}/${interval}:`,
-                error.response?.data?.errors?.[0]?.message || error.message,
-            );
-        }
+        const intraday = await fetchIntradayCandles(instrumentKey, {
+            interval: unit,
+            unit: interval,
+            maxBars,
+        });
+        if (intraday.length) return intraday;
     }
 
-    const { toDate, fromDate } = getDateRangeForUnit(unit);
-    try {
-        const candles = await fetchHistoricalCandlesByRange(
-            instrumentKey,
-            unit,
-            interval,
-            fromDate,
-            toDate,
-        );
-        return candles.slice(-250);
-    } catch (error) {
-        console.log(
-            `Upstox historical candles ${instrumentKey}:`,
-            error.response?.data?.errors?.[0]?.message || error.message,
-        );
+    if (isInstrumentKeyBlocked(instrumentKey)) {
         return [];
     }
+
+    const range =
+        periodDays != null
+            ? getDateRangeForPeriodDays(unit, periodDays)
+            : getDateRangeForUnit(unit);
+    const { toDate, fromDate } = range;
+
+    const candles = await fetchHistoricalCandlesByRange(
+        instrumentKey,
+        unit,
+        interval,
+        fromDate,
+        toDate,
+        { maxBars },
+    );
+    return candles.slice(-maxBars);
 }
 
 async function getCandles(instrumentKey, options = {}) {
-    if (!instrumentKey) return [];
+    if (!instrumentKey || isInstrumentKeyBlocked(instrumentKey)) return [];
+
+    if (!(await assertCandleInstrumentKey(instrumentKey))) {
+        return [];
+    }
 
     const requestedUnit = options.interval || "days";
     const requestedInterval = options.unit || "1";
+    const periodDays = options.periodDays;
+    const maxBars = options.maxBars;
     const normalizedUnit = requestedUnit;
     const normalizedInterval = requestedInterval;
 
-    const key = `${instrumentKey}:${normalizedUnit}:${normalizedInterval}`;
+    const key = `${instrumentKey}:${normalizedUnit}:${normalizedInterval}:${periodDays || ""}:${maxBars || ""}`;
     const cached = candleCache.get(key);
 
     const ttlMs =
@@ -277,7 +330,12 @@ async function getCandles(instrumentKey, options = {}) {
     }
 
     try {
-        const candles = await fetchHistoricalCandles(instrumentKey, options);
+        const candles = await fetchHistoricalCandles(instrumentKey, {
+            interval: requestedUnit,
+            unit: requestedInterval,
+            periodDays,
+            maxBars,
+        });
         candleCache.set(key, {
             updatedAt: Date.now(),
             candles,
@@ -289,10 +347,20 @@ async function getCandles(instrumentKey, options = {}) {
 }
 
 async function warmCandles(instrumentKeys = []) {
-    const uniqueKeys = [...new Set(instrumentKeys.filter(Boolean))];
+    const uniqueKeys = [
+        ...new Set(instrumentKeys.filter(Boolean)),
+    ];
+    const validKeys = [];
+
+    for (const key of uniqueKeys) {
+        if (await canFetchCandles(key)) {
+            validKeys.push(key);
+        }
+    }
+
     const jobs = [];
 
-    uniqueKeys.forEach((key) => {
+    validKeys.forEach((key) => {
         RSI_CANDLE_CONFIGS.forEach((cfg) => {
             jobs.push(getCandles(key, cfg).catch(() => []));
         });
@@ -301,8 +369,21 @@ async function warmCandles(instrumentKeys = []) {
     await Promise.allSettled(jobs);
 }
 
+function toBacktestQuote(candle) {
+    return {
+        date: new Date(candle.timestamp),
+        open: candle.open ?? candle.close,
+        high: candle.high ?? candle.close,
+        low: candle.low ?? candle.close,
+        close: candle.close,
+        volume: candle.volume ?? 0,
+    };
+}
+
 module.exports = {
     getCandles,
     warmCandles,
     RSI_CANDLE_CONFIGS,
+    toBacktestQuote,
+    normalizeCandle,
 };

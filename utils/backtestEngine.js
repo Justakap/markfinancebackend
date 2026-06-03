@@ -1,16 +1,27 @@
+const { getCandles, toBacktestQuote } = require("../services/candleService");
 const {
-    calculateWilderRsi,
-    calculateEma,
-    getLatestRsi,
-    round2,
-} = require("./indicators");
-const { fetchChart } = require("./yahooClient");
+    calculateRSISeries,
+    calculateEMASeries,
+} = require("../services/indicatorService");
+const { getCachedPe, getPeForInstrument } = require("../services/fundamentalService");
+const { isDerivativeType } = require("./instrumentKeyResolver");
+const { dropFormingCandle } = require("./rsiCandles");
 const {
     evaluateStrategy,
-    evaluateCondition,
     getBacktestStartIndex,
 } = require("./strategyEvaluator");
 const { normalizeIndicatorLabel } = require("./indicatorCatalog");
+
+const COMMISSION_PCT = Number(process.env.BACKTEST_COMMISSION_PCT || 0.03);
+const SLIPPAGE_PCT = Number(process.env.BACKTEST_SLIPPAGE_PCT || 0.05);
+
+const INTERVAL_TO_UPSTOX = {
+    "1m": { unit: "minutes", interval: "1" },
+    "5m": { unit: "minutes", interval: "5" },
+    "15m": { unit: "minutes", interval: "15" },
+    "1h": { unit: "hours", interval: "1" },
+    "1d": { unit: "days", interval: "1" },
+};
 
 const PERIOD_DAYS = {
     "1mo": 30,
@@ -22,12 +33,24 @@ const PERIOD_DAYS = {
 };
 
 const INTERVAL_CONFIG = {
-    "1m": { yahoo: "1m", maxDays: 6, label: "1 Minute" },
-    "5m": { yahoo: "5m", maxDays: 28, label: "5 Minute" },
-    "15m": { yahoo: "15m", maxDays: 55, label: "15 Minute" },
-    "1h": { yahoo: "1h", maxDays: 700, label: "1 Hour" },
-    "1d": { yahoo: "1d", maxDays: 1825, label: "Daily" },
+    "1m": { maxDays: 6, label: "1 Minute", barsPerDay: 375 },
+    "5m": { maxDays: 28, label: "5 Minute", barsPerDay: 75 },
+    "15m": { maxDays: 55, label: "15 Minute", barsPerDay: 25 },
+    "1h": { maxDays: 90, label: "1 Hour", barsPerDay: 7 },
+    "1d": { maxDays: 1825, label: "Daily", barsPerDay: 1 },
 };
+
+/** F&O contracts: cap history to contract life and Upstox intraday limits */
+const DERIVATIVE_MAX_DAYS = 90;
+const DERIVATIVE_INTERVAL_CONFIG = {
+    "1m": { maxDays: 5 },
+    "5m": { maxDays: 20 },
+    "15m": { maxDays: 45 },
+    "1h": { maxDays: 60 },
+    "1d": { maxDays: 90 },
+};
+
+const UPSTOX_INTERVAL_CONFIG = INTERVAL_CONFIG;
 
 const INTERVAL_RANK = { "1m": 1, "5m": 2, "15m": 3, "1h": 4, "1d": 5 };
 
@@ -87,18 +110,37 @@ function getStrategyInterval(strategy) {
     return finest;
 }
 
-function resolveBacktestConfig(strategy, period) {
+function resolveBacktestConfig(strategy, period, instrumentMeta = null) {
     const interval = getStrategyInterval(strategy);
     const requiredIntervals = getRequiredRsiIntervals(strategy);
     const config = INTERVAL_CONFIG[interval];
+    const derivative = isDerivativeType(
+        instrumentMeta?.instrumentType ||
+            instrumentMeta?.type ||
+            instrumentMeta?.assetType ||
+            "",
+    );
+    const derivativeCap = derivative
+        ? DERIVATIVE_INTERVAL_CONFIG[interval]?.maxDays || DERIVATIVE_MAX_DAYS
+        : config.maxDays;
+
+    const intervalMaxDays = derivative
+        ? Math.min(config.maxDays, derivativeCap)
+        : config.maxDays;
+
     const requestedDays = PERIOD_DAYS[period] || 365;
-    const effectiveDays = Math.min(requestedDays, config.maxDays);
-    const capped = requestedDays > config.maxDays;
+    const effectiveDays = Math.min(requestedDays, intervalMaxDays);
+    const capped = requestedDays > intervalMaxDays;
 
     let message = null;
 
+    if (derivative) {
+        message = `F&O instrument: backtest window capped to ~${effectiveDays} days (contract / Upstox history limits).`;
+    }
+
     if (capped) {
-        message = `${config.label} backtests are limited to ~${config.maxDays} days of history (Yahoo Finance). Using ${effectiveDays} days instead of ${requestedDays} for this run.`;
+        const capNote = `${config.label} backtests are limited to ~${intervalMaxDays} days of Upstox history. Using ${effectiveDays} days instead of ${requestedDays} for this run.`;
+        message = message ? `${message} ${capNote}` : capNote;
     }
 
     if (requiredIntervals.length > 1) {
@@ -110,23 +152,29 @@ function resolveBacktestConfig(strategy, period) {
 
     return {
         interval,
-        yahooInterval: config.yahoo,
         requestedDays,
         effectiveDays,
         capped,
         message,
         label: config.label,
         requiredIntervals,
+        derivative,
     };
 }
 
+function asIndicatorCandles(candles = []) {
+    return candles.map((candle) => ({
+        close: candle.close,
+        timestamp: candle.date,
+    }));
+}
+
 function computeRsiOnCandles(candles) {
-    const closes = candles.map((c) => c.close);
-    const rsiValues = calculateWilderRsi(closes, 14);
+    const series = calculateRSISeries(asIndicatorCandles(candles), 14);
 
     return candles.map((candle, index) => ({
         time: new Date(candle.date).getTime(),
-        rsi: rsiValues[index] ?? null,
+        rsi: series[index] ?? null,
     }));
 }
 
@@ -203,15 +251,33 @@ function applyRsiInterval(row, interval, rsiData) {
     row[mapping.prev] = rsiData.prevRsi;
 }
 
+function compute52WeekMetrics(primaryCandles, index) {
+    const window = primaryCandles.slice(Math.max(0, index - 251), index + 1);
+    if (!window.length) return { high52Pct: null, low52Pct: null };
+
+    const close = primaryCandles[index].close;
+    const high52 = Math.max(...window.map((c) => c.high ?? c.close));
+    const low52 = Math.min(...window.map((c) => c.low ?? c.close));
+
+    return {
+        high52Pct:
+            high52 > 0 ? Number((((close - high52) / high52) * 100).toFixed(2)) : null,
+        low52Pct:
+            low52 > 0 ? Number((((close - low52) / low52) * 100).toFixed(2)) : null,
+    };
+}
+
 function buildBacktestIndicators(
     primaryCandles,
     primaryInterval = "1d",
     auxiliaryCandles = {},
+    options = {},
 ) {
-    const closes = primaryCandles.map((c) => c.close);
-    const ema20Values = calculateEma(closes, 20);
-    const ema50Values = calculateEma(closes, 50);
-    const ema200Values = calculateEma(closes, 200);
+    const indicatorCandles = asIndicatorCandles(primaryCandles);
+    const ema20Values = calculateEMASeries(indicatorCandles, 20);
+    const ema50Values = calculateEMASeries(indicatorCandles, 50);
+    const ema200Values = calculateEMASeries(indicatorCandles, 200);
+    const staticPe = options.pe ?? null;
 
     const intervalsNeeded = new Set([
         primaryInterval,
@@ -244,6 +310,8 @@ function buildBacktestIndicators(
                 ? ((candle.volume - prev.volume) / prev.volume) * 100
                 : null;
 
+        const weekMetrics = compute52WeekMetrics(primaryCandles, index);
+
         const row = {
             ...emptyRsiRow(),
             date: candle.date,
@@ -253,9 +321,9 @@ function buildBacktestIndicators(
             volume: candle.volume,
             change: priceChange,
             volumeChange,
-            pe: 0,
-            high52Pct: 0,
-            low52Pct: 0,
+            pe: staticPe,
+            high52Pct: weekMetrics.high52Pct,
+            low52Pct: weekMetrics.low52Pct,
             ema20: ema20Values[index] ?? null,
             prevEma20: index > 0 ? ema20Values[index - 1] ?? null : null,
             ema50: ema50Values[index] ?? null,
@@ -272,34 +340,49 @@ function buildBacktestIndicators(
     });
 }
 
-async function fetchBacktestCandles(symbol, period, strategy) {
-    const config = resolveBacktestConfig(strategy, period);
-
-    const primaryChart = await fetchChart(
-        symbol,
-        config.yahooInterval,
-        config.effectiveDays,
+async function fetchCandleSeriesForBacktest(instrumentKey, intervalKey, effectiveDays) {
+    const upstox = INTERVAL_TO_UPSTOX[intervalKey] || INTERVAL_TO_UPSTOX["1d"];
+    const intConfig = INTERVAL_CONFIG[intervalKey] || INTERVAL_CONFIG["1d"];
+    const periodDays = Math.min(effectiveDays, intConfig.maxDays);
+    const maxBars = Math.min(
+        2500,
+        Math.max(250, periodDays * (intConfig.barsPerDay || 1)),
     );
 
-    const candles = primaryChart.quotes.filter(
-        (q) => q.close !== null && q.close !== undefined,
+    const raw = await getCandles(instrumentKey, {
+        interval: upstox.unit,
+        unit: upstox.interval,
+        periodDays,
+        maxBars,
+    });
+
+    const closed = dropFormingCandle(raw, upstox.unit, upstox.interval);
+
+    return closed.map(toBacktestQuote).filter((q) => q.close != null);
+}
+
+async function fetchBacktestCandles(instrumentKey, period, strategy, instrumentMeta = null) {
+    if (!instrumentKey) {
+        throw new Error("instrumentKey is required");
+    }
+
+    const config = resolveBacktestConfig(strategy, period, instrumentMeta);
+    const candles = await fetchCandleSeriesForBacktest(
+        instrumentKey,
+        config.interval,
+        config.effectiveDays,
     );
 
     const auxiliaryCandles = {};
 
-    await Promise.all(
-        config.requiredIntervals
-            .filter((interval) => interval !== config.interval)
-            .map(async (interval) => {
-                const intConfig = INTERVAL_CONFIG[interval];
-                const days = Math.min(config.effectiveDays, intConfig.maxDays);
-                const chart = await fetchChart(symbol, intConfig.yahoo, days);
-
-                auxiliaryCandles[interval] = chart.quotes.filter(
-                    (q) => q.close !== null && q.close !== undefined,
-                );
-            }),
-    );
+    for (const interval of config.requiredIntervals) {
+        if (interval === config.interval) continue;
+        auxiliaryCandles[interval] = await fetchCandleSeriesForBacktest(
+            instrumentKey,
+            interval,
+            config.effectiveDays,
+        );
+    }
 
     return { candles, auxiliaryCandles, config };
 }
@@ -448,6 +531,17 @@ function trimEquityCurveToTradeWindow(equityCurve, trades) {
     return equityCurve.slice(startIdx, endIdx + 1);
 }
 
+function applySlippage(price, side) {
+    if (!Number.isFinite(price) || price <= 0) return price;
+    const slip = SLIPPAGE_PCT / 100;
+    return side === "buy" ? price * (1 + slip) : price * (1 - slip);
+}
+
+function applyRoundTripCosts(equity) {
+    const costPct = (COMMISSION_PCT * 2) / 100;
+    return equity * (1 - costPct);
+}
+
 function runBacktestSimulation({
     strategy,
     candles,
@@ -455,8 +549,11 @@ function runBacktestSimulation({
     interval = "1d",
     auxiliaryCandles = {},
     validationMode = false,
+    pe = null,
 }) {
-    const data = buildBacktestIndicators(candles, interval, auxiliaryCandles);
+    const data = buildBacktestIndicators(candles, interval, auxiliaryCandles, {
+        pe,
+    });
     const trades = [];
     const auditLog = [];
     const signalLogs = [];
@@ -493,7 +590,7 @@ function runBacktestSimulation({
         const candle = candles[i];
 
         if (pendingEntryFromBar !== null && i === pendingEntryFromBar + 1) {
-            entryPrice = candle.open ?? candle.close;
+            entryPrice = applySlippage(candle.open ?? candle.close, "buy");
             entryDate = candle.date;
             inPosition = true;
             signalStats.entriesExecuted += 1;
@@ -512,12 +609,13 @@ function runBacktestSimulation({
             i === pendingExitFromBar + 1 &&
             inPosition
         ) {
-            const exitPrice = candle.open ?? candle.close;
+            const exitPrice = applySlippage(candle.open ?? candle.close, "sell");
             const exitDate = candle.date;
             const reason = pendingExitReason;
             const returnPct = ((exitPrice - entryPrice) / entryPrice) * 100;
             const profit = equity * (returnPct / 100);
             equity += profit;
+            equity = applyRoundTripCosts(equity);
 
             const entryVerification = verifyTradeSignal(
                 data,
@@ -675,6 +773,43 @@ function runBacktestSimulation({
         }
     }
 
+    if (inPosition && candles.length) {
+        const lastCandle = candles[candles.length - 1];
+        const exitPrice = applySlippage(
+            lastCandle.close ?? lastCandle.open,
+            "sell",
+        );
+        const exitDate = lastCandle.date;
+        const returnPct = ((exitPrice - entryPrice) / entryPrice) * 100;
+        const profit = equity * (returnPct / 100);
+        equity += profit;
+        equity = applyRoundTripCosts(equity);
+
+        trades.push({
+            entryDate,
+            exitDate,
+            signalEntryDate: data[entrySignalIndex]?.date,
+            signalExitDate: lastCandle.date,
+            entryPrice: Number(entryPrice.toFixed(2)),
+            exitPrice: Number(exitPrice.toFixed(2)),
+            returnPct: Number(returnPct.toFixed(2)),
+            pnl: Number(profit.toFixed(2)),
+            pnlPercent: Number(returnPct.toFixed(2)),
+            profit: Number(profit.toFixed(2)),
+            reason: "End of Period",
+            holdingDays: Math.max(
+                0,
+                Math.round(
+                    (new Date(exitDate) - new Date(entryDate)) /
+                        (1000 * 60 * 60 * 24),
+                ),
+            ),
+            entryConfirmed: true,
+            exitConfirmed: true,
+        });
+        signalStats.exitsExecuted += 1;
+    }
+
     if (validationMode && signalStats.entrySignalsFound > signalStats.entriesExecuted) {
         signalStats.skippedEntryNoNextBar =
             signalStats.entrySignalsFound - signalStats.entriesExecuted;
@@ -737,13 +872,6 @@ function runBacktestSimulation({
                   ),
               )
             : 0,
-        averageTrade: trades.length
-            ? Number(
-                  (returns.reduce((a, b) => a + b, 0) / trades.length).toFixed(
-                      2,
-                  ),
-              )
-            : 0,
         bestTrade: returns.length ? Math.max(...returns) : 0,
         worstTrade: returns.length ? Math.min(...returns) : 0,
         finalCapital: Number(equity.toFixed(2)),
@@ -792,7 +920,17 @@ function runBacktestSimulation({
                 : totalReturn,
         candleCount: candles.length,
         startingCapital: capital,
+        commissionPct: COMMISSION_PCT,
+        slippagePct: SLIPPAGE_PCT,
+        dataSource: "upstox",
     };
+
+    if (trades.length < 3) {
+        summary.backtestHint =
+            signalStats.entrySignalsFound === 0
+                ? "No entry signals in this period. Try the sample strategy “RSI Mean Reversion (Daily)” on RELIANCE or INFY with period 1y."
+                : `Only ${trades.length} trade(s) completed. Entry signals found: ${signalStats.entrySignalsFound}. Loosen entry rules, add exit conditions, or use a shorter RSI timeframe (5m) for more signals.`;
+    }
 
     if (validationMode) {
         // auditLog populated per trade above
@@ -830,10 +968,44 @@ function runBacktestSimulation({
 module.exports = {
     buildBacktestIndicators,
     fetchBacktestCandles,
+    fetchCandleSeriesForBacktest,
     runBacktestSimulation,
     trimEquityCurveToTradeWindow,
     getStrategyInterval,
     getRequiredRsiIntervals,
     resolveBacktestConfig,
     INTERVAL_CONFIG,
+    UPSTOX_INTERVAL_CONFIG,
+    dataRowToEvaluatorSnapshot,
 };
+
+function dataRowToEvaluatorSnapshot(row) {
+    if (!row) return null;
+
+    return {
+        price: row.price,
+        prevPrice: row.prevPrice ?? row.price,
+        change: row.change,
+        volume: row.volume,
+        volumeChange: row.volumeChange,
+        pe: row.pe,
+        high52Pct: row.high52Pct,
+        low52Pct: row.low52Pct,
+        rsi: row.rsi,
+        prevRsi: row.prevRsi,
+        rsi1m: row.rsi1m,
+        prevRsi1m: row.prevRsi1m,
+        rsi5m: row.rsi5m,
+        prevRsi5m: row.prevRsi5m,
+        rsi15m: row.rsi15m,
+        prevRsi15m: row.prevRsi15m,
+        hourlyRsi: row.hourlyRsi,
+        prevHourlyRsi: row.prevHourlyRsi,
+        ema20: row.ema20,
+        prevEma20: row.prevEma20,
+        ema50: row.ema50,
+        prevEma50: row.prevEma50,
+        ema200: row.ema200,
+        prevEma200: row.prevEma200,
+    };
+}

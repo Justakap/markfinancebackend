@@ -1,5 +1,5 @@
 const stats = {
-    yahooRequests: 0,
+    upstoxApiCalls: 0,
     cacheHits: 0,
     cacheMisses: 0,
     scanTimes: [],
@@ -10,8 +10,13 @@ const stats = {
     startedAt: Date.now(),
 };
 
+function recordUpstoxApiCall() {
+    stats.upstoxApiCalls += 1;
+}
+
+/** @deprecated use recordUpstoxApiCall */
 function recordYahooRequest() {
-    stats.yahooRequests += 1;
+    recordUpstoxApiCall();
 }
 
 function recordCacheHit() {
@@ -59,10 +64,12 @@ function getMetrics() {
         avgMarketDataTimeMs: average(stats.marketDataTimes),
         avgBacktestTimeMs: average(stats.backtestTimes),
         uptimeSeconds: Math.floor((Date.now() - stats.startedAt) / 1000),
+        dataSource: "upstox",
     };
 }
 
 module.exports = {
+    recordUpstoxApiCall,
     recordYahooRequest,
     recordCacheHit,
     recordCacheMiss,

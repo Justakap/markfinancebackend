@@ -11,7 +11,7 @@ function createStockAnalysisRoutes({
     const router = express.Router();
 
     router.get("/market-data/:watchlistId", requireAuth, async (req, res) => {
-        if (!rateLimit(`market:${req.ip}`, 30, 60)) {
+        if (!rateLimit(`market:${req.ip}`, 60, 60)) {
             return res.status(429).json({
                 message: "Too many market data requests. Wait a moment and retry.",
             });

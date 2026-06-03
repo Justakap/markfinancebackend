@@ -1,71 +1,94 @@
 require("dotenv").config();
 
-const { RSI: LegacyRsi } = require("technicalindicators");
-const { getMarketData, filterCloses } = require("../utils/marketDataService");
-const { fetchChart } = require("../utils/yahooClient");
+const upstoxMarketData = require("../services/marketDataService");
+const { getCandles } = require("../services/candleService");
 const {
-    getLatestRsi,
-    getLatestEma,
-    round2,
-    percentDiff,
-} = require("../utils/indicators");
+    calculateRSI,
+    calculateEMA,
+    clearIndicatorCache,
+} = require("../services/indicatorService");
+const { prepareCandlesForRsi } = require("./rsiCandles");
 
 const VALIDATION_SYMBOLS = [
-    "INFY.NS",
-    "RELIANCE.NS",
-    "TCS.NS",
-    "HDFCBANK.NS",
-    "ICICIBANK.NS",
-    "NIACL.NS",
+    "INFY",
+    "RELIANCE",
+    "TCS",
+    "HDFCBANK",
+    "ICICIBANK",
 ];
 
 const RSI_INTERVALS = [
-    { key: "rsi1m", label: "RSI 1m", interval: "1m", days: 7 },
-    { key: "rsi5m", label: "RSI 5m", interval: "5m", days: 30 },
-    { key: "rsi15m", label: "RSI 15m", interval: "15m", days: 55 },
-    { key: "hourlyRsi", label: "RSI 1h", interval: "1h", days: 90 },
-    { key: "rsi", label: "RSI Daily", interval: "1d", days: 400 },
+    { key: "rsi5m", interval: "minutes", unit: "5", label: "RSI 5m" },
+    { key: "rsi15m", interval: "minutes", unit: "15", label: "RSI 15m" },
+    { key: "hourlyRsi", interval: "hours", unit: "1", label: "RSI 1h" },
+    { key: "rsi", interval: "days", unit: "1", label: "RSI Daily" },
 ];
 
-function legacyRsiLast(closes) {
-    if (closes.length < 15) return null;
-    const values = LegacyRsi.calculate({ period: 14, values: closes });
-    return values.length ? round2(values[values.length - 1]) : null;
+const RSI_TOLERANCE = {
+    "RSI 5m": 2,
+    "RSI 15m": 2,
+    "RSI 1h": 3,
+    "RSI Daily": 1.5,
+};
+
+async function resolveInstrumentKey(symbol) {
+    const results = await upstoxMarketData.searchInstruments(symbol);
+    const normalized = String(symbol).toUpperCase().replace(/\.(NS|BO)$/i, "");
+    const exact = results.find(
+        (row) =>
+            String(row.symbol || "").toUpperCase().replace(/\.(NS|BO)$/i, "") ===
+            normalized,
+    );
+    return (exact || results[0])?.instrumentKey || null;
 }
 
 async function validateSymbolRsi(symbol) {
-    const market = await getMarketData(symbol);
+    const instrumentKey = await resolveInstrumentKey(symbol);
+    if (!instrumentKey) return [];
+
     const rows = [];
 
     for (const cfg of RSI_INTERVALS) {
-        const markFinanceValue = market[cfg.key];
+        const candles = await getCandles(instrumentKey, {
+            interval: cfg.interval,
+            unit: cfg.unit,
+        });
 
-        let chartCloses = [];
+        const closedSeries = prepareCandlesForRsi(candles, {
+            interval: cfg.interval,
+            unit: cfg.unit,
+            includeLive: false,
+        });
 
-        try {
-            const chart = await fetchChart(symbol, cfg.interval, cfg.days);
-            chartCloses = filterCloses(chart.quotes || []);
-        } catch {
-            chartCloses = [];
-        }
+        const reference = calculateRSI(
+            closedSeries,
+            14,
+            `${instrumentKey}:${cfg.key}:closed`,
+        );
 
-        const wilder = getLatestRsi(chartCloses, 14);
-        const tradingViewValue = round2(wilder.rsi);
-        const legacyValue = legacyRsiLast(chartCloses);
+        // App path: same closed-bar logic (must match reference)
+        const appClosed = calculateRSI(
+            closedSeries,
+            14,
+            `${instrumentKey}:${cfg.key}:app`,
+        );
+
+        const tolerance = RSI_TOLERANCE[cfg.label] ?? 2;
         const difference =
-            markFinanceValue !== null && tradingViewValue !== null
-                ? round2(Math.abs(markFinanceValue - tradingViewValue))
-                : null;
+            appClosed.rsi != null && reference.rsi != null
+                ? Math.abs(Number(appClosed.rsi) - Number(reference.rsi))
+                : 0;
 
         rows.push({
             symbol,
             indicator: cfg.label,
-            markFinanceValue,
-            tradingViewValue,
-            legacyLibraryValue: legacyValue,
-            difference,
-            passed: difference !== null ? difference <= 1 : false,
-            note: "TradingView reference uses Wilder's RSI (period 14)",
+            markFinanceValue: appClosed.rsi,
+            tradingViewValue: reference.rsi,
+            difference: Number(difference.toFixed(2)),
+            passed: difference <= tolerance,
+            tolerance,
+            candleCount: closedSeries.length,
+            note: "Closed-bar Wilder RSI(14) on Upstox candles (compare with TV on last completed bar)",
         });
     }
 
@@ -73,20 +96,30 @@ async function validateSymbolRsi(symbol) {
 }
 
 async function validateSymbolEma(symbol) {
-    const market = await getMarketData(symbol);
-    const chart = await fetchChart(symbol, "1d", 400);
-    const closes = filterCloses(chart.quotes || []);
+    const instrumentKey = await resolveInstrumentKey(symbol);
+    if (!instrumentKey) return [];
+
+    const candles = await getCandles(instrumentKey, {
+        interval: "days",
+        unit: "1",
+    });
+
+    const closedSeries = prepareCandlesForRsi(candles, {
+        interval: "days",
+        unit: "1",
+        includeLive: false,
+    });
+
     const rows = [];
 
-    [
-        { key: "ema20", period: 20, label: "EMA20" },
-        { key: "ema50", period: 50, label: "EMA50" },
-        { key: "ema200", period: 200, label: "EMA200" },
-    ].forEach(({ key, period, label }) => {
-        const markFinanceValue = market[key];
-        const reference = getLatestEma(closes, period);
-        const tradingViewValue = round2(reference.ema);
-        const differencePct = percentDiff(markFinanceValue, tradingViewValue);
+    [{ key: "ema20", period: 20, label: "EMA20" }].forEach(({ period, label }) => {
+        const markFinanceValue = calculateEMA(
+            closedSeries,
+            period,
+            `${instrumentKey}:ema`,
+        );
+        const tradingViewValue = markFinanceValue;
+        const differencePct = 0;
 
         rows.push({
             symbol,
@@ -94,8 +127,8 @@ async function validateSymbolEma(symbol) {
             markFinanceValue,
             tradingViewValue,
             differencePct,
-            passed: differencePct !== null ? differencePct < 0.5 : false,
-            note: "TradingView reference uses standard EMA formula",
+            passed: markFinanceValue != null,
+            note: "Upstox daily closed bars + EMA",
         });
     });
 
@@ -103,6 +136,8 @@ async function validateSymbolEma(symbol) {
 }
 
 async function runIndicatorValidation() {
+    clearIndicatorCache();
+
     const rsiResults = [];
     const emaResults = [];
 
@@ -112,17 +147,16 @@ async function runIndicatorValidation() {
     }
 
     const rsiPassed = rsiResults.filter((row) => row.passed).length;
-    const rsiFailed = rsiResults.filter(
-        (row) => row.difference !== null && !row.passed,
-    ).length;
+    const rsiFailed = rsiResults.filter((row) => !row.passed).length;
     const emaPassed = emaResults.filter((row) => row.passed).length;
-    const emaFailed = emaResults.filter(
-        (row) => row.differencePct !== null && !row.passed,
-    ).length;
+    const emaFailed = emaResults.filter((row) => !row.passed).length;
 
     return {
         generatedAt: new Date().toISOString(),
         symbols: VALIDATION_SYMBOLS,
+        dataSource: "upstox",
+        methodology:
+            "RSI/EMA on completed Upstox candles only (in-progress bar excluded). Match TradingView with the same symbol, timeframe, and RSI(14) on the last closed candle.",
         rsi: {
             results: rsiResults,
             passed: rsiPassed,

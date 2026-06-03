@@ -8,17 +8,10 @@ const User = require("./models/User");
 const Strategy = require("./models/Strategy");
 const Backtest = require("./models/Backtest");
 const jwt = require("jsonwebtoken");
-const evaluator = require("./utils/strategyEvaluator");
 const { requireAuth } = require("./middleware/auth");
 const { getJwtSecret } = require("./config/jwt");
 const { connectDatabase, isDatabaseConnected } = require("./config/database");
 const { requireDatabase } = require("./middleware/dbReady");
-const {
-    deleteCache,
-    fetchQuote,
-    fetchQuoteSummary,
-    searchSymbols,
-} = require("./utils/yahooClient");
 const {
     runBacktestSimulation,
     fetchBacktestCandles,
@@ -27,10 +20,11 @@ const {
     INTERVAL_CONFIG,
 } = require("./utils/backtestEngine");
 const { runIndicatorValidation } = require("./utils/validationService");
-const { ensureYahooSymbol } = require("./utils/symbols");
-const marketEngine = require("./services/marketEngine");
+const { runStrategyScan } = require("./services/strategyScanService");
 const upstoxMarketData = require("./services/marketDataService");
-const marketCache = require("./services/marketCache");
+const { resolveInstrumentKey: resolveUpstoxInstrumentKey } = require("./utils/instrumentKeyResolver");
+const { SAMPLE_STRATEGIES } = require("./utils/sampleStrategies");
+const { getPeForInstrument } = require("./services/fundamentalService");
 const { getMetrics, recordScanTime, recordBacktestTime } = require("./utils/metrics");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -129,33 +123,8 @@ function getMarket(exchange) {
 }
 
 
-// use unified evaluator for condition and strategy evaluation
-const { evaluateStrategy } = evaluator;
-
-function buildPreviousFromCurrent(current) {
-    return {
-        price: current.prevPrice ?? null,
-        change: null,
-        volume: null,
-        pe: null,
-
-        rsi: current.prevRsi ?? null,
-        hourlyRsi: current.prevHourlyRsi ?? null,
-        rsi15m: current.prevRsi15m ?? null,
-        rsi5m: current.prevRsi5m ?? null,
-        rsi1m: current.prevRsi1m ?? null,
-
-        ema20: current.prevEma20 ?? null,
-        ema50: current.prevEma50 ?? null,
-        ema200: current.prevEma200 ?? null,
-
-        sma20: current.prevSma20 ?? null,
-        sma50: current.prevSma50 ?? null,
-
-        volumeChange: null,
-        high52Pct: null,
-        low52Pct: null,
-    };
+async function resolveInstrumentKey(symbol, instrumentKey) {
+    return resolveUpstoxInstrumentKey(symbol, instrumentKey);
 }
 
 
@@ -165,7 +134,11 @@ app.post(
     "/api/strategies/run",
     requireAuth,
     async (req, res) => {
-        if (!rateLimit(req.ip, 8, 60)) return res.status(429).json({ message: "Too many requests" });
+        if (!rateLimit(req.ip, 20, 60)) {
+            return res.status(429).json({
+                message: "Too many scan requests. Wait a moment and retry.",
+            });
+        }
         try {
             const {
                 strategyId,
@@ -204,45 +177,26 @@ app.post(
                 return res.status(403).json({ message: "Forbidden" });
             }
 
-            const stocks = watchlist.stocks.map((stock) => ({
-                symbol: stock.symbol,
-                yahooSymbol: ensureYahooSymbol(
-                    stock.symbol,
-                    stock.market || stock.exchange,
-                ),
-                name: stock.name,
-                market: stock.market || stock.exchange || "",
-                displaySymbol: stock.symbol,
-            }));
+            const scanResult = await runStrategyScan(strategy, watchlist);
+            recordScanTime(scanResult.scanTimeMs);
 
-            marketEngine.trackSymbols(stocks);
-
-            const scanStart = Date.now();
-            await marketEngine.warmQuotesFast(stocks, 6);
-            await marketEngine.warmIndicators(stocks, 4);
-            const cachedRows = marketEngine.getScanData(stocks).rows;
-            recordScanTime(Date.now() - scanStart);
-
-            const conditions =
-                strategy.entryConditions?.length
-                    ? strategy.entryConditions
-                    : strategy.conditions ||
-                    [];
-
-            const matches = cachedRows.filter((stock) => {
-                const previous = buildPreviousFromCurrent(stock);
-
-                return evaluateStrategy(stock, previous, conditions, strategy.logic || "AND");
-            });
+            if (!scanResult.evaluated && scanResult.skipped?.length) {
+                return res.status(400).json({
+                    message:
+                        "No valid Upstox instrument keys on this watchlist. Remove expired F&O contracts and re-add symbols from search.",
+                    skipped: scanResult.skipped,
+                });
+            }
 
             return res.json({
-                strategy:
-                    strategy.name,
-                matched:
-                    matches.length,
-                matches,
-                scanTimeMs: Date.now() - scanStart,
-                cacheOnly: false,
+                strategy: strategy.name,
+                matched: scanResult.matches.length,
+                matches: scanResult.matches,
+                scanMode: scanResult.scanMode,
+                scanTimeMs: scanResult.scanTimeMs,
+                dataSource: scanResult.dataSource,
+                skipped: scanResult.skipped || [],
+                evaluated: scanResult.evaluated,
             });
         } catch (error) {
             console.log(error);
@@ -263,28 +217,37 @@ app.post(
 
 app.get("/api/debug/:symbol", async (req, res) => {
     try {
-        const yahooSymbol = ensureYahooSymbol(req.params.symbol);
-        await marketEngine.refreshSymbol(yahooSymbol);
-        const data = marketCache.get(yahooSymbol) || {};
+        const instrumentKey = await resolveInstrumentKey(req.params.symbol);
+        if (!instrumentKey) {
+            return res.status(404).json({ message: "Instrument not found on Upstox" });
+        }
+
+        const row = await upstoxMarketData
+            .getRowsForWatchlist({
+                stocks: [
+                    {
+                        symbol: req.params.symbol,
+                        instrumentKey,
+                        name: req.params.symbol,
+                    },
+                ],
+            })
+            .then((result) => result.data[0]);
 
         res.json({
             availableIndicators: {
-                Price: data.price,
-                "Price Change %": data.change,
-                Volume: data.volume,
-                "Volume Change %": data.volumeChange,
-                "PE Ratio": data.pe,
-                "RSI (Daily)": data.rsi,
-                "RSI (1 Hour)": data.hourlyRsi,
-                "RSI (15 Minute)": data.rsi15m,
-                "RSI (5 Minute)": data.rsi5m,
-                "RSI (1 Minute)": data.rsi1m,
-                EMA20: data.ema20,
-                EMA50: data.ema50,
-                EMA200: data.ema200,
+                Price: row?.price,
+                "Price Change %": row?.change,
+                Volume: row?.volume,
+                "PE Ratio": row?.pe,
+                "RSI (Daily)": row?.rsi,
+                "RSI (1 Hour)": row?.hourlyRsi,
+                "RSI (15 Minute)": row?.rsi15m,
+                "RSI (5 Minute)": row?.rsi5m,
+                EMA20: row?.ema20,
             },
-            rawData: data,
-            note: "RSI uses Wilder's smoothing (TradingView compatible). EMA uses standard formula.",
+            rawData: row,
+            dataSource: "upstox",
         });
     } catch (error) {
         res.status(500).json({
@@ -312,10 +275,21 @@ app.get("/api/validation/debug/:symbol", async (req, res) => {
     }
 
     try {
-        const yahooSymbol = ensureYahooSymbol(req.params.symbol);
-        await marketEngine.refreshSymbol(yahooSymbol);
-        const data = marketCache.get(yahooSymbol) || {};
-        res.json({ symbol: req.params.symbol, rawData: data });
+        const instrumentKey = await resolveInstrumentKey(req.params.symbol);
+        const data = instrumentKey
+            ? (
+                  await upstoxMarketData.getRowsForWatchlist({
+                      stocks: [
+                          {
+                              symbol: req.params.symbol,
+                              instrumentKey,
+                              name: req.params.symbol,
+                          },
+                      ],
+                  })
+              ).data[0]
+            : null;
+        res.json({ symbol: req.params.symbol, rawData: data, dataSource: "upstox" });
     } catch (error) {
         res.status(500).json({ message: error.message });
     }
@@ -406,11 +380,16 @@ app.post("/api/auth/google", async (req, res) => {
 
 app.get("/test", async (req, res) => {
     try {
-        const quote = await fetchQuote("TCS.NS");
+        const instrumentKey = await resolveInstrumentKey("TCS");
+        if (!instrumentKey) {
+            return res.status(404).json({ message: "TCS not found on Upstox" });
+        }
 
-        console.log(quote);
+        const result = await upstoxMarketData.getRowsForWatchlist({
+            stocks: [{ symbol: "TCS", instrumentKey, name: "TCS" }],
+        });
 
-        res.json(quote);
+        res.json(result.data[0] || null);
     } catch (error) {
         console.log(error);
 
@@ -497,6 +476,44 @@ app.put("/api/strategies/:id", requireAuth, async (req, res) => {
 });
 
 
+app.post("/api/strategies/seed-samples", requireAuth, async (req, res) => {
+    try {
+        const userId = req.user.mongoId;
+        const created = [];
+        const existing = [];
+
+        for (const sample of SAMPLE_STRATEGIES) {
+            const found = await Strategy.findOne({
+                userId,
+                name: sample.name,
+            });
+
+            if (found) {
+                existing.push(found.name);
+                continue;
+            }
+
+            const doc = await Strategy.create({
+                userId,
+                ...sample,
+            });
+            created.push(doc.name);
+        }
+
+        res.json({
+            message:
+                created.length > 0
+                    ? `Added ${created.length} sample strateg${created.length === 1 ? "y" : "ies"}`
+                    : "Sample strategies already exist",
+            created,
+            existing,
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: "Failed to seed sample strategies" });
+    }
+});
+
 app.delete("/api/strategies/:id", requireAuth, async (req, res) => {
     try {
         const strategy = await Strategy.findById(req.params.id);
@@ -578,29 +595,16 @@ app.post("/api/watchlists/:id/refresh-fundamentals", requireAuth, async (req, re
 
         for (const stock of watchlist.stocks) {
             try {
-                const quote = await fetchQuote(stock.symbol);
+                if (!stock.instrumentKey) continue;
 
-                const summary = await fetchQuoteSummary(stock.symbol, [
-                    "assetProfile",
-                ]);
+                const pe = await getPeForInstrument(
+                    stock.instrumentKey,
+                    stock.instrumentType || stock.assetType,
+                );
 
-                const profile = summary.assetProfile || {};
-
-                stock.longName = quote.longName || stock.longName;
-
-                stock.sector = profile.sector || "";
-                stock.industry = profile.industry || "";
-
-                stock.website = profile.website || "";
-
-                stock.country = profile.country || "";
-                stock.city = profile.city || "";
-
-                stock.fullTimeEmployees =
-                    profile.fullTimeEmployees || 0;
-
-                stock.longBusinessSummary =
-                    profile.longBusinessSummary || "";
+                if (pe != null) {
+                    stock.trailingPE = pe;
+                }
 
                 stock.updatedAt = new Date();
             } catch (err) {
@@ -776,7 +780,6 @@ app.post("/api/watchlists/:id/stocks", requireAuth, async (req, res) => {
             });
 
             await watchlist.save();
-            deleteCache(`market:${watchlist._id}`);
             upstoxMarketData.subscribe(
                 watchlist.stocks.map((stock) => stock.instrumentKey),
             );
@@ -809,7 +812,6 @@ app.delete("/api/watchlists/:id/stocks/:symbol", requireAuth, async (req, res) =
 
         const updated = await watchlist.save();
 
-        deleteCache(`market:${watchlist._id}`);
         upstoxMarketData.subscribe(
             (updated?.stocks || []).map((stock) => stock.instrumentKey),
         );
@@ -843,7 +845,6 @@ app.post("/api/watchlists/:id/stocks/bulk-remove", requireAuth, async (req, res)
 
         const updated = await watchlist.save();
 
-        deleteCache(`market:${watchlist._id}`);
         upstoxMarketData.subscribe(
             (updated?.stocks || []).map((stock) => stock.instrumentKey),
         );
@@ -892,12 +893,16 @@ app.post("/api/backtest/run", requireAuth, async (req, res) => {
         const {
             strategyId,
             symbol,
+            instrumentKey: bodyInstrumentKey,
             period,
             capital = 10000,
             validationMode = false,
+            saveResult = true,
         } = req.body;
 
-        if (!symbol) return res.status(400).json({ message: "Symbol required" });
+        if (!symbol && !bodyInstrumentKey) {
+            return res.status(400).json({ message: "Symbol or instrumentKey required" });
+        }
 
         const strategy = await Strategy.findById(strategyId);
         if (!strategy) return res.status(404).json({ message: "Strategy not found" });
@@ -906,14 +911,45 @@ app.post("/api/backtest/run", requireAuth, async (req, res) => {
             return res.status(403).json({ message: "Forbidden" });
         }
 
-        const yahooSymbol = ensureYahooSymbol(symbol);
+        const instrumentKey = await resolveInstrumentKey(
+            symbol,
+            bodyInstrumentKey,
+        );
+
+        if (!instrumentKey) {
+            return res.status(400).json({
+                message: `No Upstox instrument found for ${symbol}. Search and pick a symbol from the list.`,
+            });
+        }
+
+        const instrumentMeta = upstoxMarketData.getInstrumentMeta(instrumentKey);
+
         const { candles, auxiliaryCandles, config: backtestConfig } =
-            await fetchBacktestCandles(yahooSymbol, period, strategy);
+            await fetchBacktestCandles(
+                instrumentKey,
+                period,
+                strategy,
+                instrumentMeta,
+            );
 
         if (!candles.length) {
+            const derivativeHint = instrumentMeta &&
+                String(instrumentMeta.instrumentType || instrumentMeta.type || "")
+                    .toUpperCase()
+                    .match(/FUT|OPT|CE|PE/)
+                ? " For F&O, use the current contract from search (expired keys return no history)."
+                : "";
+
             return res.status(400).json({
-                message: `No price history found for ${yahooSymbol}. Use symbols like INFY.NS or TCS.NS.`,
+                message: `No Upstox candle history for ${symbol}. Try a shorter period or re-add from search.${derivativeHint}`,
             });
+        }
+
+        let pe = null;
+        try {
+            pe = await getPeForInstrument(instrumentKey);
+        } catch {
+            pe = null;
         }
 
         const simulation = runBacktestSimulation({
@@ -924,6 +960,7 @@ app.post("/api/backtest/run", requireAuth, async (req, res) => {
             auxiliaryCandles,
             validationMode:
                 validationMode && VALIDATION_MODE,
+            pe,
         });
 
         const {
@@ -949,11 +986,12 @@ app.post("/api/backtest/run", requireAuth, async (req, res) => {
 
         try {
             const userId = req.user?.mongoId;
-            if (userId) {
+            if (userId && saveResult !== false) {
                 await Backtest.create({
                     userId,
                     strategyId,
-                    symbol,
+                    symbol: symbol || bodyInstrumentKey,
+                    instrumentKey,
                     period,
                     capital,
                     metrics: summary,
@@ -1112,8 +1150,8 @@ app.get("/api/metrics", requireAuth, async (req, res) => {
     try {
         res.json({
             ...getMetrics(),
-            marketStatus: marketEngine.getMarketStatus(),
-            cacheSize: marketCache.size(),
+            dataSource: "upstox",
+            subscribedInstruments: upstoxMarketData.subscribedInstruments?.size || 0,
         });
     } catch (error) {
         res.status(500).json({ message: error.message });
@@ -1142,11 +1180,8 @@ async function startServer() {
         },
     });
 
-    marketEngine.init(io);
-    console.log("Yahoo market engine enabled (strategies & backtests)");
-
     upstoxMarketData.init(io);
-    console.log("Upstox market data enabled (stock analysis)");
+    console.log("Upstox market data enabled (live quotes, strategies & backtests)");
 
     server.listen(PORT, () => {
         console.log(`Server running on port ${PORT} (Socket.IO enabled)`);

@@ -22,7 +22,6 @@
     "protobufjs": "^8.5.0",
     "socket.io": "^4.8.3",
     "technicalindicators": "^3.1.0",
-    "ws": "^8.21.0",
-    "yahoo-finance2": "^3.14.3"
+    "ws": "^8.21.0"
   }
 }

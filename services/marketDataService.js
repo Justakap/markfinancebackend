@@ -14,6 +14,7 @@ const {
     getPeForInstrument,
     warmPeForInstruments,
 } = require("./fundamentalService");
+const { prepareCandlesForRsi } = require("../utils/rsiCandles");
 
 const INSTRUMENT_MASTER_URL =
     process.env.UPSTOX_INSTRUMENT_MASTER_URL ||
@@ -130,7 +131,7 @@ function resolveStockSector(stock) {
 }
 
 async function computeAllRsiFields(instrumentKey) {
-    if (!instrumentKey) return {};
+    if (!instrumentKey || !isValidInstrumentKey(instrumentKey)) return {};
 
     const fields = {};
     const live = liveData.get(instrumentKey) || {};
@@ -141,12 +142,14 @@ async function computeAllRsiFields(instrumentKey) {
             unit: cfg.unit,
         }).catch(() => []);
 
-        const candlesWithLive =
-            cfg.tf === "1d"
-                ? appendLivePriceAsCurrentCandle(candles, live.ltp)
-                : mergeLivePriceIntoLatestCandle(candles, live.ltp);
+        const candlesForRsi = prepareCandlesForRsi(candles, {
+            interval: cfg.interval,
+            unit: cfg.unit,
+            includeLive: isValidLtp(live.ltp),
+            ltp: live.ltp,
+        });
         const result = calculateRSI(
-            candlesWithLive,
+            candlesForRsi,
             14,
             `${instrumentKey}:${cfg.tf}`,
         );
@@ -707,7 +710,7 @@ async function refreshRealtimeIndicatorsForKey(instrumentKey) {
 }
 
 function scheduleRealtimeIndicatorRefresh(instrumentKey) {
-    if (!instrumentKey) return;
+    if (!instrumentKey || !isValidInstrumentKey(instrumentKey)) return;
 
     const existingTimer = pendingRealtimeIndicatorTimers.get(instrumentKey);
     if (existingTimer) {
@@ -788,6 +791,32 @@ function pickIndicatorSnapshot(row = {}) {
 async function buildRow(stock, options = {}) {
     const { includePe = false } = options;
     const instrumentKey = stock.instrumentKey;
+
+    if (instrumentKey && !isValidInstrumentKey(instrumentKey)) {
+        return {
+            symbol: stock.symbol,
+            name: stock.name || stock.longName || stock.symbol,
+            instrumentKey,
+            exchange: stock.exchange || stock.market || "",
+            market: stock.exchange || stock.market || "",
+            instrumentType:
+                stock.instrumentType || stock.assetType || stock.type || "",
+            assetType: stock.instrumentType || stock.assetType || stock.type || "",
+            ltp: null,
+            price: null,
+            changePercent: 0,
+            change: 0,
+            volume: 0,
+            timestamp: null,
+            ema20: null,
+            rsi: null,
+            prevRsi: null,
+            rsiChange: null,
+            pe: stock.trailingPE ?? null,
+            dataError:
+                "Invalid or expired Upstox instrument key — remove and re-add from search",
+        };
+    }
 
     if (!instrumentKey) {
         return {
@@ -968,14 +997,20 @@ async function warmLiveQuotes(instrumentKeys = []) {
 
 async function getRowsForWatchlist(watchlist) {
     const stocks = watchlist.stocks || [];
-    const keys = stocks.map((stock) => stock.instrumentKey).filter(Boolean);
 
     await loadInstruments().catch(() => []);
+
+    const keys = filterSubscribableKeys(
+        stocks.map((stock) => stock.instrumentKey).filter(Boolean),
+    );
+
     await warmLiveQuotes(keys);
     subscribe(keys);
-    warmCandles(keys).catch((error) =>
-        console.log("Upstox candle warm failed:", error.message),
-    );
+    if (keys.length) {
+        warmCandles(keys).catch((error) =>
+            console.log("Upstox candle warm failed:", error.message),
+        );
+    }
     warmPeForInstruments(stocks).catch((error) =>
         console.log("Upstox PE warm failed:", error.message),
     );
@@ -1000,17 +1035,47 @@ async function getRowsForWatchlist(watchlist) {
     };
 }
 
+function isValidInstrumentKey(instrumentKey) {
+    if (!instrumentKey) return false;
+    return instrumentMeta.has(instrumentKey);
+}
+
+function getInstrumentMeta(instrumentKey) {
+    return instrumentMeta.get(instrumentKey) || null;
+}
+
+function filterSubscribableKeys(instrumentKeys = []) {
+    return [...new Set(instrumentKeys.filter(Boolean))].filter((key) =>
+        isValidInstrumentKey(key),
+    );
+}
+
 function subscribe(instrumentKeys = []) {
-    const next = new Set(instrumentKeys.filter(Boolean));
-    const toSubscribe = [...next].filter((key) => !subscribedInstruments.has(key));
-    const toUnsubscribe = [...subscribedInstruments].filter((key) => !next.has(key));
+    const applySubscription = () => {
+        const next = new Set(filterSubscribableKeys(instrumentKeys));
+        const toSubscribe = [...next].filter(
+            (key) => !subscribedInstruments.has(key),
+        );
+        const toUnsubscribe = [...subscribedInstruments].filter(
+            (key) => !next.has(key),
+        );
 
-    toSubscribe.forEach((key) => subscribedInstruments.add(key));
-    toUnsubscribe.forEach((key) => subscribedInstruments.delete(key));
+        toSubscribe.forEach((key) => subscribedInstruments.add(key));
+        toUnsubscribe.forEach((key) => subscribedInstruments.delete(key));
 
-    connectFeed();
-    sendSubscription(toSubscribe, "sub");
-    sendSubscription(toUnsubscribe, "unsub");
+        connectFeed();
+        sendSubscription(toSubscribe, "sub");
+        sendSubscription(toUnsubscribe, "unsub");
+    };
+
+    if (instrumentsCache) {
+        applySubscription();
+        return;
+    }
+
+    loadInstruments()
+        .then(applySubscription)
+        .catch(() => applySubscription());
 }
 
 function init(socketIo) {
@@ -1030,4 +1095,7 @@ module.exports = {
     searchInstruments,
     getRowsForWatchlist,
     subscribe,
+    isValidInstrumentKey,
+    getInstrumentMeta,
+    loadInstruments,
 };
