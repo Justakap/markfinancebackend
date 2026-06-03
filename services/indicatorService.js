@@ -86,6 +86,42 @@ function calculateMACD(candles = [], instrumentKey = "unknown") {
     });
 }
 
+function calculateRSISeries(candles = [], period = 14) {
+    const closes = closesFromCandles(candles);
+    if (closes.length < period + 1) {
+        return new Array(candles.length).fill(null);
+    }
+
+    const values = RSI.calculate({ values: closes, period });
+    const offset = candles.length - values.length;
+    const series = new Array(candles.length).fill(null);
+
+    values.forEach((value, index) => {
+        series[offset + index] =
+            value == null ? null : Number(Number(value).toFixed(2));
+    });
+
+    return series;
+}
+
+function calculateEMASeries(candles = [], period = 20) {
+    const closes = closesFromCandles(candles);
+    if (closes.length < period) {
+        return new Array(candles.length).fill(null);
+    }
+
+    const values = EMA.calculate({ values: closes, period });
+    const offset = candles.length - values.length;
+    const series = new Array(candles.length).fill(null);
+
+    values.forEach((value, index) => {
+        series[offset + index] =
+            value == null ? null : Number(Number(value).toFixed(2));
+    });
+
+    return series;
+}
+
 function calculateVolumeAverage(candles = [], period = 20, instrumentKey = "unknown") {
     const key = cacheKey("volumeAvg", instrumentKey, period, candles);
 
@@ -105,7 +141,9 @@ function clearIndicatorCache() {
 
 module.exports = {
     calculateRSI,
+    calculateRSISeries,
     calculateEMA,
+    calculateEMASeries,
     calculateSMA,
     calculateMACD,
     calculateVolumeAverage,

@@ -2,22 +2,15 @@ function normalizeSymbol(symbol = "") {
     return String(symbol).trim().toUpperCase();
 }
 
-/** Ensure Indian NSE-style symbols work with Yahoo (e.g. INFY -> INFY.NS). */
-function ensureYahooSymbol(symbol, exchange) {
-    const value = normalizeSymbol(symbol);
+/** Normalize NSE equity symbols for search (no Yahoo suffix). */
+function normalizeNseSymbol(symbol, exchange) {
+    const value = normalizeSymbol(symbol).replace(/\.(NS|BO)$/i, "");
 
     if (!value) return value;
-    if (value.includes(".")) return value;
 
     const ex = String(exchange || "").toUpperCase();
-
     if (ex === "NSI" || ex === "NSE" || ex === "BSE" || ex === "BOM") {
-        return `${value}.NS`;
-    }
-
-    // Bare tickers from search (no suffix) — treat as NSE when short alphabetic
-    if (/^[A-Z]{2,12}$/.test(value)) {
-        return `${value}.NS`;
+        return value;
     }
 
     return value;
@@ -25,5 +18,5 @@ function ensureYahooSymbol(symbol, exchange) {
 
 module.exports = {
     normalizeSymbol,
-    ensureYahooSymbol,
+    normalizeNseSymbol,
 };

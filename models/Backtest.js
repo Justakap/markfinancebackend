@@ -26,6 +26,7 @@ const backtestSchema = new mongoose.Schema(
         userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: false },
         strategyId: { type: mongoose.Schema.Types.ObjectId, ref: "Strategy", required: true },
         symbol: { type: String, required: true },
+        instrumentKey: { type: String, default: "" },
         period: { type: String, required: true },
         capital: { type: Number, required: true },
         metrics: { type: Object, default: {} },
