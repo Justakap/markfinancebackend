@@ -273,6 +273,27 @@ async function fetchHistoricalCandles(instrumentKey, options = {}) {
     const unit = requestedUnit;
     const interval = requestedInterval;
 
+    if (unit === "minutes") {
+        const range =
+            periodDays != null
+                ? getDateRangeForPeriodDays(unit, periodDays)
+                : getDateRangeForUnit(unit);
+        const { toDate, fromDate } = range;
+        try {
+            const historical = await fetchHistoricalCandlesByRange(
+                instrumentKey,
+                unit,
+                interval,
+                fromDate,
+                toDate,
+                { maxBars },
+            );
+            if (historical.length) return historical.slice(-maxBars);
+        } catch {
+            // Fall back to current-day intraday candles below.
+        }
+    }
+
     if (unit === "minutes" || unit === "hours") {
         const intraday = await fetchIntradayCandles(instrumentKey, {
             interval: unit,
@@ -280,6 +301,7 @@ async function fetchHistoricalCandles(instrumentKey, options = {}) {
             maxBars,
         });
         if (intraday.length) return intraday;
+        if (unit === "minutes") return [];
     }
 
     if (isInstrumentKeyBlocked(instrumentKey)) {
