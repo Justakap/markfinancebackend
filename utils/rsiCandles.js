@@ -24,7 +24,7 @@ function dropFormingCandle(candles = [], interval = "days", unit = "1") {
     }
 
     // Bar still open — exclude it (TradingView "last closed bar" mode)
-    if (Date.now() - lastTs < ms * 0.9) {
+    if (Date.now() < lastTs + ms) {
         return candles.slice(0, -1);
     }
 
@@ -74,24 +74,57 @@ function appendLiveAsNewBar(candles = [], ltp) {
     return next.slice(-500);
 }
 
+function appendFormingBarFromLive(closedSeries = [], sourceCandles = [], ltp) {
+    const price = Number(ltp);
+    if (!Array.isArray(closedSeries) || !closedSeries.length || !Number.isFinite(price) || price <= 0) {
+        return closedSeries;
+    }
+
+    const lastClosed = closedSeries[closedSeries.length - 1];
+    const baseClose = Number.isFinite(lastClosed?.close) ? lastClosed.close : price;
+    const sourceLast = sourceCandles[sourceCandles.length - 1] || {};
+
+    return [
+        ...closedSeries,
+        {
+            timestamp: sourceLast.timestamp || new Date().toISOString(),
+            open: Number.isFinite(sourceLast.open) ? sourceLast.open : baseClose,
+            high: Math.max(
+                Number.isFinite(sourceLast.high) ? sourceLast.high : baseClose,
+                price,
+            ),
+            low: Math.min(
+                Number.isFinite(sourceLast.low) ? sourceLast.low : baseClose,
+                price,
+            ),
+            close: price,
+            volume: Number(sourceLast.volume || 0),
+            oi: Number.isFinite(sourceLast.oi) ? sourceLast.oi : 0,
+        },
+    ];
+}
+
 /**
  * @param {object} opts
- * @param {boolean} opts.includeLive - merge LTP into forming bar (live watchlist only)
+ * @param {boolean} opts.includeLive - include forming bar with live LTP (Zerodha/Kite style)
  */
 function prepareCandlesForRsi(candles = [], opts = {}) {
     const { interval = "days", unit = "1", includeLive = false, ltp = null } = opts;
-
-    let series = dropFormingCandle(candles, interval, unit);
+    const closedSeries = dropFormingCandle(candles, interval, unit);
 
     if (!includeLive || !Number.isFinite(Number(ltp)) || Number(ltp) <= 0) {
-        return series;
+        return closedSeries;
     }
 
-    if (interval === "days") {
-        return appendLiveAsNewBar(series, ltp);
+    const price = Number(ltp);
+
+    // Forming bar was dropped — rebuild it with live LTP for current RSI.
+    if (closedSeries.length < candles.length) {
+        return appendFormingBarFromLive(closedSeries, candles, price);
     }
 
-    return mergeLiveIntoLatest(series, ltp);
+    // All bars are closed (e.g. after hours) — refresh last close with latest LTP.
+    return mergeLiveIntoLatest(closedSeries, price);
 }
 
 module.exports = {
@@ -100,4 +133,5 @@ module.exports = {
     prepareCandlesForRsi,
     mergeLiveIntoLatest,
     appendLiveAsNewBar,
+    appendFormingBarFromLive,
 };

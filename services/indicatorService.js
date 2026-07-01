@@ -1,4 +1,6 @@
-const { EMA, RSI, SMA, MACD } = require("technicalindicators");
+const { EMA, SMA, MACD } = require("technicalindicators");
+const { calculateWilderRsi } = require("../utils/indicators");
+const { prepareCandlesForRsi } = require("../utils/rsiCandles");
 
 const indicatorCache = new Map();
 
@@ -26,24 +28,73 @@ function getCached(key, compute) {
     return value;
 }
 
+function roundRsi(value) {
+    return value == null ? null : Number(Number(value).toFixed(2));
+}
+
 function calculateRSI(candles = [], period = 14, instrumentKey = "unknown") {
     const key = cacheKey("rsi", instrumentKey, period, candles);
 
     return getCached(key, () => {
         const closes = closesFromCandles(candles);
-        const values = RSI.calculate({ values: closes, period });
+        const values = calculateWilderRsi(closes, period).filter(
+            (value) => value !== null,
+        );
         const rsi = values.at(-1) ?? null;
         const prevRsi = values.at(-2) ?? null;
 
         return {
-            rsi: rsi == null ? null : Number(rsi.toFixed(2)),
-            prevRsi: prevRsi == null ? null : Number(prevRsi.toFixed(2)),
+            rsi: roundRsi(rsi),
+            prevRsi: roundRsi(prevRsi),
             rsiChange:
                 rsi == null || prevRsi == null
                     ? null
                     : Number((rsi - prevRsi).toFixed(2)),
         };
     });
+}
+
+/**
+ * Zerodha/Kite-style RSI pair for a timeframe:
+ * - current: Wilder RSI(14) on the forming bar with live LTP (when available)
+ * - prev: Wilder RSI(14) on the last completed bar
+ */
+function calculateRsiForTimeframe(
+    candles = [],
+    period = 14,
+    instrumentKey = "unknown",
+    opts = {},
+) {
+    const { interval = "days", unit = "1", ltp = null, includeLive = false } = opts;
+    const closedSeries = prepareCandlesForRsi(candles, {
+        interval,
+        unit,
+        includeLive: false,
+    });
+    const closed = calculateRSI(closedSeries, period, `${instrumentKey}:closed`);
+
+    if (!includeLive || ltp == null || !Number.isFinite(Number(ltp)) || Number(ltp) <= 0) {
+        return closed;
+    }
+
+    const liveSeries = prepareCandlesForRsi(candles, {
+        interval,
+        unit,
+        includeLive: true,
+        ltp: Number(ltp),
+    });
+    const live = calculateRSI(liveSeries, period, `${instrumentKey}:live`);
+    const current = live.rsi;
+    const prev = closed.rsi;
+
+    return {
+        rsi: current,
+        prevRsi: prev,
+        rsiChange:
+            current == null || prev == null
+                ? null
+                : Number((current - prev).toFixed(2)),
+    };
 }
 
 function calculateEMA(candles = [], period = 20, instrumentKey = "unknown") {
@@ -92,11 +143,12 @@ function calculateRSISeries(candles = [], period = 14) {
         return new Array(candles.length).fill(null);
     }
 
-    const values = RSI.calculate({ values: closes, period });
-    const offset = candles.length - values.length;
+    const values = calculateWilderRsi(closes, period);
+    const validValues = values.filter((value) => value !== null);
+    const offset = candles.length - validValues.length;
     const series = new Array(candles.length).fill(null);
 
-    values.forEach((value, index) => {
+    validValues.forEach((value, index) => {
         series[offset + index] =
             value == null ? null : Number(Number(value).toFixed(2));
     });
@@ -141,6 +193,7 @@ function clearIndicatorCache() {
 
 module.exports = {
     calculateRSI,
+    calculateRsiForTimeframe,
     calculateRSISeries,
     calculateEMA,
     calculateEMASeries,
