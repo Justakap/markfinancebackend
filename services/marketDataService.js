@@ -7,14 +7,14 @@ const zlib = require("zlib");
 const { getCandles, warmCandles } = require("./candleService");
 const {
     calculateEMA,
-    calculateRSI,
+    calculateRsiForTimeframe,
+    calculateVolumeAverage,
 } = require("./indicatorService");
 const {
     getCachedPe,
     getPeForInstrument,
     warmPeForInstruments,
 } = require("./fundamentalService");
-const { prepareCandlesForRsi } = require("../utils/rsiCandles");
 
 const INSTRUMENT_MASTER_URL =
     process.env.UPSTOX_INSTRUMENT_MASTER_URL ||
@@ -130,11 +130,11 @@ function resolveStockSector(stock) {
     return exchange || type || "Other";
 }
 
-async function computeAllRsiFields(instrumentKey) {
+async function computeAllRsiFields(instrumentKey, ltp = null) {
     if (!instrumentKey || !isValidInstrumentKey(instrumentKey)) return {};
 
+    const includeLive = isValidLtp(ltp);
     const fields = {};
-    const live = liveData.get(instrumentKey) || {};
 
     await mapWithLimit(RSI_TF_CONFIG, 2, async (cfg) => {
         const candles = await getCandles(instrumentKey, {
@@ -142,16 +142,16 @@ async function computeAllRsiFields(instrumentKey) {
             unit: cfg.unit,
         }).catch(() => []);
 
-        const candlesForRsi = prepareCandlesForRsi(candles, {
-            interval: cfg.interval,
-            unit: cfg.unit,
-            includeLive: isValidLtp(live.ltp),
-            ltp: live.ltp,
-        });
-        const result = calculateRSI(
-            candlesForRsi,
+        const result = calculateRsiForTimeframe(
+            candles,
             14,
             `${instrumentKey}:${cfg.tf}`,
+            {
+                interval: cfg.interval,
+                unit: cfg.unit,
+                ltp: includeLive ? ltp : null,
+                includeLive,
+            },
         );
         fields[cfg.rsi] = result.rsi;
         fields[cfg.prev] = result.prevRsi;
@@ -598,6 +598,7 @@ function emitMarketTick(tick, snapshot = {}) {
         hourlyRsi: snapshot.hourlyRsi ?? null,
         prevHourlyRsi: snapshot.prevHourlyRsi ?? null,
         hourlyRsiChange: snapshot.hourlyRsiChange ?? null,
+        volAvg: snapshot.volAvg ?? null,
         pe: snapshot.pe ?? getCachedPe(tick.instrumentKey),
     });
 }
@@ -679,7 +680,7 @@ async function refreshRealtimeIndicatorsForKey(instrumentKey) {
         }).catch(() => []);
         const dailyWithLive = mergeLivePriceIntoLatestCandle(dailyCandles, live.ltp);
         const ema20 = calculateEMA(dailyWithLive, 20, instrumentKey);
-        const rsiFields = await computeAllRsiFields(instrumentKey);
+        const rsiFields = await computeAllRsiFields(instrumentKey, live.ltp);
 
         const previousSnapshot = indicatorSnapshot.get(instrumentKey) || {};
         const nextSnapshot = {
@@ -784,6 +785,7 @@ function pickIndicatorSnapshot(row = {}) {
         hourlyRsi: row.hourlyRsi,
         prevHourlyRsi: row.prevHourlyRsi,
         hourlyRsiChange: row.hourlyRsiChange,
+        volAvg: row.volAvg,
         pe: row.pe,
     };
 }
@@ -848,10 +850,12 @@ async function buildRow(stock, options = {}) {
         unit: "1",
     }).catch(() => []);
     const lastCandle = dailyCandles[dailyCandles.length - 1];
+    const liveLtp = isValidLtp(live.ltp) ? live.ltp : null;
     const [rsiFields, ema20] = await Promise.all([
-        computeAllRsiFields(instrumentKey),
+        computeAllRsiFields(instrumentKey, liveLtp),
         Promise.resolve(calculateEMA(dailyCandles, 20, instrumentKey)),
     ]);
+    const volAvg = calculateVolumeAverage(dailyCandles, 20, instrumentKey);
     const volume =
         live.volume ??
         (lastCandle?.volume != null ? Number(lastCandle.volume) : null);
@@ -883,6 +887,7 @@ async function buildRow(stock, options = {}) {
         volume: volume ?? 0,
         timestamp: live.timestamp || null,
         ema20,
+        volAvg,
         ...rsiFields,
         pe,
     };
