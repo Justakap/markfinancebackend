@@ -1,7 +1,10 @@
 /**
- * Prepare Upstox candle series for RSI so values align with TradingView
- * (Wilder RSI on completed bars, not a partial in-progress bar).
+ * Candle series for Wilder RSI aligned with Zerodha/Kite:
+ * - Current RSI: forming bar (synthesized from LTP when API has not caught up)
+ * - Prev RSI: last fully closed bar for that timeframe
  */
+
+const IST = "Asia/Kolkata";
 
 function periodMs(interval, unit = "1") {
     if (interval === "days") return 24 * 60 * 60 * 1000;
@@ -10,25 +13,111 @@ function periodMs(interval, unit = "1") {
     return 24 * 60 * 60 * 1000;
 }
 
-function dropFormingCandle(candles = [], interval = "days", unit = "1") {
-    if (!Array.isArray(candles) || candles.length < 2) {
-        return candles || [];
-    }
+function candleOpenMs(candle) {
+    const ts = new Date(candle?.timestamp).getTime();
+    return Number.isFinite(ts) ? ts : null;
+}
 
-    const ms = periodMs(interval, unit);
-    const last = candles[candles.length - 1];
-    const lastTs = new Date(last.timestamp).getTime();
+function inferStepMs(candles = [], interval = "days", unit = "1") {
+    if (interval === "days") return periodMs("days", "1");
 
-    if (!Number.isFinite(lastTs)) {
-        return candles;
-    }
+    const fallback = periodMs(interval, unit);
+    if (!Array.isArray(candles) || candles.length < 2) return fallback;
 
-    // Bar still open — exclude it (TradingView "last closed bar" mode)
-    if (Date.now() < lastTs + ms) {
-        return candles.slice(0, -1);
-    }
+    const last = candleOpenMs(candles[candles.length - 1]);
+    const prev = candleOpenMs(candles[candles.length - 2]);
+    if (last == null || prev == null) return fallback;
 
-    return candles;
+    const diff = last - prev;
+    if (diff > 0) return diff;
+    return fallback;
+}
+
+function getTodayStartMs(nowMs = Date.now()) {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+        timeZone: IST,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+    }).formatToParts(new Date(nowMs));
+
+    const y = parts.find((p) => p.type === "year")?.value;
+    const m = parts.find((p) => p.type === "month")?.value;
+    const d = parts.find((p) => p.type === "day")?.value;
+    return new Date(`${y}-${m}-${d}T00:00:00+05:30`).getTime();
+}
+
+function getIstMinutesFromMidnight(nowMs = Date.now()) {
+    const parts = new Intl.DateTimeFormat("en-GB", {
+        timeZone: IST,
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+    }).formatToParts(new Date(nowMs));
+
+    const hour = Number(parts.find((p) => p.type === "hour")?.value || 0);
+    const minute = Number(parts.find((p) => p.type === "minute")?.value || 0);
+    return hour * 60 + minute;
+}
+
+/** NSE/BSE regular cash session (IST). */
+function isEquitySessionOpen(nowMs = Date.now()) {
+    const minutes = getIstMinutesFromMidnight(nowMs);
+    const open = 9 * 60 + 15;
+    const close = 15 * 60 + 30;
+    return minutes >= open && minutes < close;
+}
+
+function isSameIstDay(aMs, bMs) {
+    if (aMs == null || bMs == null) return false;
+    return getTodayStartMs(aMs) === getTodayStartMs(bMs);
+}
+
+function formatIstTimestamp(ms) {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+        timeZone: IST,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+    }).formatToParts(new Date(ms));
+
+    const pick = (type) => parts.find((p) => p.type === type)?.value || "00";
+    return `${pick("year")}-${pick("month")}-${pick("day")}T${pick("hour")}:${pick("minute")}:${pick("second")}+05:30`;
+}
+
+function candlesAsOf(candles = [], nowMs = Date.now()) {
+    return (candles || []).filter((candle) => {
+        const open = candleOpenMs(candle);
+        return open != null && open <= nowMs;
+    });
+}
+
+function cloneCandles(candles = []) {
+    return (candles || []).map((c) => ({ ...c }));
+}
+
+function isBarForming(openMs, stepMs, nowMs = Date.now()) {
+    if (openMs == null || !Number.isFinite(stepMs) || stepMs <= 0) return false;
+    return nowMs < openMs + stepMs;
+}
+
+function makeSyntheticBar(openMs, openPrice, ltp, source = {}) {
+    const price = Number(ltp);
+    const open = Number.isFinite(Number(openPrice)) ? Number(openPrice) : price;
+
+    return {
+        timestamp: formatIstTimestamp(openMs),
+        open,
+        high: Math.max(open, price, Number(source.high) || open),
+        low: Math.min(open, price, Number(source.low) || open),
+        close: price,
+        volume: Number(source.volume || 0),
+        oi: Number.isFinite(source.oi) ? source.oi : 0,
+    };
 }
 
 function mergeLiveIntoLatest(candles = [], ltp) {
@@ -37,7 +126,7 @@ function mergeLiveIntoLatest(candles = [], ltp) {
         return candles;
     }
 
-    const next = candles.map((c) => ({ ...c }));
+    const next = cloneCandles(candles);
     const lastIndex = next.length - 1;
     const last = next[lastIndex];
 
@@ -51,87 +140,144 @@ function mergeLiveIntoLatest(candles = [], ltp) {
     return next;
 }
 
-function appendLiveAsNewBar(candles = [], ltp) {
-    const price = Number(ltp);
-    if (!Array.isArray(candles) || !candles.length || !Number.isFinite(price) || price <= 0) {
-        return candles;
+/** Completed bars only — strips a forming bar if the feed includes one. */
+function dropFormingCandle(candles = [], interval = "days", unit = "1", nowMs = Date.now()) {
+    if (!Array.isArray(candles) || candles.length < 2) {
+        return cloneCandles(candles);
     }
 
-    const next = candles.map((c) => ({ ...c }));
-    const last = next[next.length - 1];
-    const baseClose = Number.isFinite(last.close) ? last.close : price;
+    const stepMs = inferStepMs(candles, interval, unit);
+    const lastOpen = candleOpenMs(candles[candles.length - 1]);
 
-    next.push({
-        timestamp: new Date().toISOString(),
-        open: baseClose,
-        high: Math.max(baseClose, price),
-        low: Math.min(baseClose, price),
-        close: price,
-        volume: 0,
-        oi: Number.isFinite(last.oi) ? last.oi : 0,
-    });
+    if (lastOpen == null) return cloneCandles(candles);
 
-    return next.slice(-500);
+    if (isBarForming(lastOpen, stepMs, nowMs)) {
+        return cloneCandles(candles.slice(0, -1));
+    }
+
+    return cloneCandles(candles);
 }
 
-function appendFormingBarFromLive(closedSeries = [], sourceCandles = [], ltp) {
-    const price = Number(ltp);
-    if (!Array.isArray(closedSeries) || !closedSeries.length || !Number.isFinite(price) || price <= 0) {
-        return closedSeries;
+function resolveCurrentBarOpenMs(lastClosedOpenMs, stepMs, nowMs, interval) {
+    if (lastClosedOpenMs == null || !Number.isFinite(stepMs) || stepMs <= 0) {
+        return null;
     }
 
-    const lastClosed = closedSeries[closedSeries.length - 1];
-    const baseClose = Number.isFinite(lastClosed?.close) ? lastClosed.close : price;
-    const sourceLast = sourceCandles[sourceCandles.length - 1] || {};
+    if (interval === "days") {
+        const todayStart = getTodayStartMs(nowMs);
+        const lastDayStart = getTodayStartMs(lastClosedOpenMs);
+        if (todayStart > lastDayStart) return todayStart;
 
-    return [
-        ...closedSeries,
-        {
-            timestamp: sourceLast.timestamp || new Date().toISOString(),
-            open: Number.isFinite(sourceLast.open) ? sourceLast.open : baseClose,
-            high: Math.max(
-                Number.isFinite(sourceLast.high) ? sourceLast.high : baseClose,
-                price,
-            ),
-            low: Math.min(
-                Number.isFinite(sourceLast.low) ? sourceLast.low : baseClose,
-                price,
-            ),
-            close: price,
-            volume: Number(sourceLast.volume || 0),
-            oi: Number.isFinite(sourceLast.oi) ? sourceLast.oi : 0,
-        },
-    ];
+        if (isBarForming(lastClosedOpenMs, stepMs, nowMs)) {
+            return lastClosedOpenMs;
+        }
+
+        return null;
+    }
+
+    if (!isSameIstDay(lastClosedOpenMs, nowMs) || !isEquitySessionOpen(nowMs)) {
+        return null;
+    }
+
+    let currentOpen = lastClosedOpenMs + stepMs;
+    while (currentOpen + stepMs <= nowMs) {
+        currentOpen += stepMs;
+    }
+
+    if (nowMs >= currentOpen && nowMs < currentOpen + stepMs) {
+        return currentOpen;
+    }
+
+    if (isBarForming(lastClosedOpenMs, stepMs, nowMs)) {
+        return lastClosedOpenMs;
+    }
+
+    return null;
+}
+
+/**
+ * All fully closed bars (API data minus any in-progress bar in the feed).
+ */
+function buildClosedSeries(candles = [], interval = "days", unit = "1", nowMs = Date.now()) {
+    return dropFormingCandle(candlesAsOf(candles, nowMs), interval, unit, nowMs);
+}
+
+/**
+ * Live series for current RSI: closed history + forming bar updated with LTP.
+ * Synthesizes the current bar when the API has not yet returned it.
+ */
+function buildLiveSeries(candles = [], opts = {}) {
+    const {
+        interval = "days",
+        unit = "1",
+        ltp = null,
+        nowMs = Date.now(),
+    } = opts;
+
+    const price = Number(ltp);
+    const asOf = candlesAsOf(candles, nowMs);
+
+    if (!Array.isArray(asOf) || !asOf.length || !Number.isFinite(price) || price <= 0) {
+        return buildClosedSeries(candles, interval, unit, nowMs);
+    }
+
+    const stepMs = inferStepMs(asOf, interval, unit);
+    const closed = buildClosedSeries(candles, interval, unit, nowMs);
+
+    if (!closed.length) return closed;
+
+    const lastClosed = closed[closed.length - 1];
+    const lastClosedOpen = candleOpenMs(lastClosed);
+    const feedLast = asOf[asOf.length - 1];
+    const feedLastOpen = candleOpenMs(feedLast);
+
+    const currentOpen = resolveCurrentBarOpenMs(lastClosedOpen, stepMs, nowMs, interval);
+
+    if (currentOpen == null) {
+        return mergeLiveIntoLatest(closed, price);
+    }
+
+    if (feedLastOpen === currentOpen && isBarForming(feedLastOpen, stepMs, nowMs)) {
+        return mergeLiveIntoLatest(cloneCandles(asOf), price);
+    }
+
+    if (feedLastOpen === currentOpen) {
+        return mergeLiveIntoLatest(closed.concat([{ ...feedLast }]), price);
+    }
+
+    const seedOpen = Number.isFinite(lastClosed.close) ? lastClosed.close : price;
+    return [...closed, makeSyntheticBar(currentOpen, seedOpen, price, feedLast)];
 }
 
 /**
  * @param {object} opts
- * @param {boolean} opts.includeLive - include forming bar with live LTP (Zerodha/Kite style)
+ * @param {boolean} opts.includeLive
  */
 function prepareCandlesForRsi(candles = [], opts = {}) {
-    const { interval = "days", unit = "1", includeLive = false, ltp = null } = opts;
-    const closedSeries = dropFormingCandle(candles, interval, unit);
+    const { interval = "days", unit = "1", includeLive = false, ltp = null, nowMs = Date.now() } =
+        opts;
 
     if (!includeLive || !Number.isFinite(Number(ltp)) || Number(ltp) <= 0) {
-        return closedSeries;
+        return buildClosedSeries(candles, interval, unit, nowMs);
     }
 
-    const price = Number(ltp);
-
-    // Forming bar was dropped — rebuild it with live LTP for current RSI.
-    if (closedSeries.length < candles.length) {
-        return appendFormingBarFromLive(closedSeries, candles, price);
-    }
-
-    // All bars are closed (e.g. after hours) — refresh last close with latest LTP.
-    return mergeLiveIntoLatest(closedSeries, price);
+    return buildLiveSeries(candles, {
+        interval,
+        unit,
+        ltp: Number(ltp),
+        nowMs,
+    });
 }
 
 module.exports = {
     periodMs,
+    inferStepMs,
+    candlesAsOf,
     dropFormingCandle,
+    buildClosedSeries,
+    buildLiveSeries,
     prepareCandlesForRsi,
     mergeLiveIntoLatest,
-    appendLiveAsNewBar,
-    appendFormingBarFromLive,
+    isBarForming,
+    getTodayStartMs,
 };

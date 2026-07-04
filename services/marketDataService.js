@@ -30,7 +30,7 @@ const INDICATOR_REFRESH_MS = Number(
     process.env.UPSTOX_INDICATOR_REFRESH_MS || 8 * 1000,
 );
 const TICK_INDICATOR_DEBOUNCE_MS = Number(
-    process.env.UPSTOX_TICK_INDICATOR_DEBOUNCE_MS || 200,
+    process.env.UPSTOX_TICK_INDICATOR_DEBOUNCE_MS || 50,
 );
 
 const RSI_TF_CONFIG = [
@@ -130,10 +130,25 @@ function resolveStockSector(stock) {
     return exchange || type || "Other";
 }
 
+async function resolveRsiLtp(instrumentKey, ltp = null) {
+    if (isValidLtp(ltp)) return ltp;
+
+    const live = liveData.get(instrumentKey) || {};
+    if (isValidLtp(live.ltp)) return live.ltp;
+
+    const dailyCandles = await getCandles(instrumentKey, {
+        interval: "days",
+        unit: "1",
+    }).catch(() => []);
+    const lastClose = Number(dailyCandles.at(-1)?.close);
+    return isValidLtp(lastClose) ? lastClose : null;
+}
+
 async function computeAllRsiFields(instrumentKey, ltp = null) {
     if (!instrumentKey || !isValidInstrumentKey(instrumentKey)) return {};
 
-    const includeLive = isValidLtp(ltp);
+    const price = await resolveRsiLtp(instrumentKey, ltp);
+    const includeLive = isValidLtp(price);
     const fields = {};
 
     await mapWithLimit(RSI_TF_CONFIG, 2, async (cfg) => {
@@ -149,7 +164,7 @@ async function computeAllRsiFields(instrumentKey, ltp = null) {
             {
                 interval: cfg.interval,
                 unit: cfg.unit,
-                ltp: includeLive ? ltp : null,
+                ltp: includeLive ? price : null,
                 includeLive,
             },
         );
@@ -363,7 +378,7 @@ async function connectFeed() {
             connecting = false;
             socketConnected = true;
             console.log("Upstox V3 feed connected (socket)");
-            sendSubscription([...subscribedInstruments], "sub");
+            sendGroupedSubscriptions([...subscribedInstruments], "sub");
         });
 
         ws.on("message", (data) => {
@@ -399,7 +414,7 @@ async function connectFeed() {
     }
 }
 
-function sendSubscription(instrumentKeys, method = "sub") {
+function sendSubscription(instrumentKeys, method = "sub", mode = null) {
     if (!instrumentKeys.length || ws?.readyState !== WebSocket.OPEN) return;
 
     // full_d5 includes MarketFullFeed.vtt (day volume). ltpc mode only sends LTPC (no volume) per proto.
@@ -407,12 +422,56 @@ function sendSubscription(instrumentKeys, method = "sub") {
         guid: crypto.randomUUID(),
         method,
         data: {
-            mode: process.env.UPSTOX_FEED_MODE || "ltpc",
+            mode: mode || process.env.UPSTOX_FEED_MODE || "ltpc",
             instrumentKeys,
         },
     };
 
     ws.send(Buffer.from(JSON.stringify(payload)));
+}
+
+function getFeedModeForInstrumentKey(instrumentKey) {
+    const meta = instrumentMeta.get(instrumentKey) || {};
+    const type = String(meta.instrumentType || meta.type || "").toUpperCase();
+    const segment = String(meta.segment || "").toUpperCase();
+
+    if (
+        type.includes("OPT") ||
+        type === "CE" ||
+        type === "PE" ||
+        type === "CALL" ||
+        type === "PUT"
+    ) {
+        return process.env.UPSTOX_OPTION_FEED_MODE || "option_greeks";
+    }
+
+    if (type.includes("FUT")) {
+        return process.env.UPSTOX_FUTURES_FEED_MODE || "full_d5";
+    }
+
+    if (segment.includes("FO")) {
+        return process.env.UPSTOX_FUTURES_FEED_MODE || "full_d5";
+    }
+
+    return process.env.UPSTOX_FEED_MODE || "ltpc";
+}
+
+function sendGroupedSubscriptions(instrumentKeys = [], method = "sub") {
+    if (!instrumentKeys.length) return;
+
+    const groups = new Map();
+
+    instrumentKeys.forEach((instrumentKey) => {
+        const mode = getFeedModeForInstrumentKey(instrumentKey);
+        if (!groups.has(mode)) {
+            groups.set(mode, []);
+        }
+        groups.get(mode).push(instrumentKey);
+    });
+
+    groups.forEach((keys, mode) => {
+        sendSubscription(keys, method, mode);
+    });
 }
 
 function toNum(value) {
@@ -519,6 +578,33 @@ function extractVolumeFromFeedItem(item, ltpc) {
     return toNum(marketFF.vtt || first.vtt || 0);
 }
 
+function extractGreeksFromFeedItem(item) {
+    const full = item.fullFeed || item.fullfeed || {};
+    const first = item.firstLevelWithGreeks || {};
+    const marketFF = full.marketFF || full.marketFf || item.marketFF || item.marketFf || {};
+    const optionGreeks =
+        marketFF.optionGreeks || first.optionGreeks || item.optionGreeks || {};
+
+    return {
+        delta: optionGreeks.delta != null ? toNum(optionGreeks.delta) : undefined,
+        gamma: optionGreeks.gamma != null ? toNum(optionGreeks.gamma) : undefined,
+        theta: optionGreeks.theta != null ? toNum(optionGreeks.theta) : undefined,
+        vega: optionGreeks.vega != null ? toNum(optionGreeks.vega) : undefined,
+        iv:
+            marketFF.iv != null
+                ? toNum(marketFF.iv)
+                : first.iv != null
+                  ? toNum(first.iv)
+                  : undefined,
+        oi:
+            marketFF.oi != null
+                ? toNum(marketFF.oi)
+                : first.oi != null
+                  ? toNum(first.oi)
+                  : undefined,
+    };
+}
+
 async function decodeFeed(data) {
     const FeedResponse = await loadFeedProto();
     const decoded = FeedResponse.decode(Buffer.from(data));
@@ -531,6 +617,7 @@ async function decodeFeed(data) {
     return Object.entries(feed.feeds || {})
         .map(([instrumentKey, item]) => {
             const ltpc = extractLtpcFromFeedItem(item);
+            const greeks = extractGreeksFromFeedItem(item);
             const meta = instrumentMeta.get(instrumentKey) || {};
             const cp = toNum(ltpc.cp);
             const ltp = toNum(ltpc.ltp);
@@ -551,10 +638,12 @@ async function decodeFeed(data) {
                 changePercent: isValidLtp(ltp) ? changePercent : undefined,
                 volume: volume > 0 ? volume : undefined,
                 lastTradeTime: ltpc.ltt || feed.currentTs || Date.now(),
-                oi: toNum(
-                    (item.fullFeed?.marketFF || item.fullFeed?.marketFf || {})
-                        .oi || item.firstLevelWithGreeks?.oi,
-                ),
+                delta: greeks.delta,
+                gamma: greeks.gamma,
+                theta: greeks.theta,
+                vega: greeks.vega,
+                iv: greeks.iv,
+                oi: greeks.oi,
             };
         })
         .filter(Boolean);
@@ -599,6 +688,14 @@ function emitMarketTick(tick, snapshot = {}) {
         prevHourlyRsi: snapshot.prevHourlyRsi ?? null,
         hourlyRsiChange: snapshot.hourlyRsiChange ?? null,
         volAvg: snapshot.volAvg ?? null,
+        delta: snapshot.delta ?? null,
+        gamma: snapshot.gamma ?? null,
+        theta: snapshot.theta ?? null,
+        decay: snapshot.decay ?? null,
+        vega: snapshot.vega ?? null,
+        iv: snapshot.iv ?? null,
+        oi: snapshot.oi ?? null,
+        oiChange: snapshot.oiChange ?? null,
         pe: snapshot.pe ?? getCachedPe(tick.instrumentKey),
     });
 }
@@ -647,6 +744,12 @@ function handleTick(tick) {
     if (tick.oi != null) {
         next.oi = tick.oi;
     }
+
+    if (tick.delta != null) next.delta = tick.delta;
+    if (tick.gamma != null) next.gamma = tick.gamma;
+    if (tick.theta != null) next.theta = tick.theta;
+    if (tick.vega != null) next.vega = tick.vega;
+    if (tick.iv != null) next.iv = tick.iv;
 
     liveData.set(tick.instrumentKey, next);
 
@@ -786,6 +889,14 @@ function pickIndicatorSnapshot(row = {}) {
         prevHourlyRsi: row.prevHourlyRsi,
         hourlyRsiChange: row.hourlyRsiChange,
         volAvg: row.volAvg,
+        delta: row.delta,
+        gamma: row.gamma,
+        theta: row.theta,
+        decay: row.decay,
+        vega: row.vega,
+        iv: row.iv,
+        oi: row.oi,
+        oiChange: row.oiChange,
         pe: row.pe,
     };
 }
@@ -814,6 +925,14 @@ async function buildRow(stock, options = {}) {
             rsi: null,
             prevRsi: null,
             rsiChange: null,
+            delta: null,
+            gamma: null,
+            theta: null,
+            decay: null,
+            vega: null,
+            iv: null,
+            oi: null,
+            oiChange: null,
             pe: stock.trailingPE ?? null,
             dataError:
                 "Invalid or expired Upstox instrument key — remove and re-add from search",
@@ -840,6 +959,14 @@ async function buildRow(stock, options = {}) {
             rsi: null,
             prevRsi: null,
             rsiChange: null,
+            delta: null,
+            gamma: null,
+            theta: null,
+            decay: null,
+            vega: null,
+            iv: null,
+            oi: null,
+            oiChange: null,
             pe: stock.trailingPE ?? null,
         };
     }
@@ -850,12 +977,26 @@ async function buildRow(stock, options = {}) {
         unit: "1",
     }).catch(() => []);
     const lastCandle = dailyCandles[dailyCandles.length - 1];
-    const liveLtp = isValidLtp(live.ltp) ? live.ltp : null;
+    const previousOiCandle =
+        dailyCandles.length > 1 ? dailyCandles[dailyCandles.length - 2] : lastCandle;
     const [rsiFields, ema20] = await Promise.all([
-        computeAllRsiFields(instrumentKey, liveLtp),
+        computeAllRsiFields(instrumentKey, live.ltp),
         Promise.resolve(calculateEMA(dailyCandles, 20, instrumentKey)),
     ]);
     const volAvg = calculateVolumeAverage(dailyCandles, 20, instrumentKey);
+    const optionPremium = isValidLtp(live.ltp) ? live.ltp : null;
+    const openInterest = Number.isFinite(Number(live.oi))
+        ? Number(live.oi)
+        : Number.isFinite(Number(lastCandle?.oi))
+          ? Number(lastCandle.oi)
+          : null;
+    const prevOpenInterest = Number.isFinite(Number(previousOiCandle?.oi))
+        ? Number(previousOiCandle.oi)
+        : null;
+    const oiChange =
+        Number.isFinite(openInterest) && Number.isFinite(prevOpenInterest)
+            ? Number((openInterest - prevOpenInterest).toFixed(2))
+            : null;
     const volume =
         live.volume ??
         (lastCandle?.volume != null ? Number(lastCandle.volume) : null);
@@ -881,6 +1022,7 @@ async function buildRow(stock, options = {}) {
         assetType: stock.instrumentType || stock.assetType || stock.type || "",
         ltp: isValidLtp(live.ltp) ? live.ltp : null,
         price: isValidLtp(live.ltp) ? live.ltp : null,
+        optionPremium,
         changeAmount: isValidLtp(live.ltp) ? live.changeAmount ?? 0 : 0,
         changePercent: isValidLtp(live.ltp) ? live.changePercent ?? 0 : 0,
         change: isValidLtp(live.ltp) ? live.changePercent ?? 0 : 0,
@@ -888,6 +1030,16 @@ async function buildRow(stock, options = {}) {
         timestamp: live.timestamp || null,
         ema20,
         volAvg,
+        delta: Number.isFinite(Number(live.delta)) ? Number(live.delta) : null,
+        gamma: Number.isFinite(Number(live.gamma)) ? Number(live.gamma) : null,
+        theta: Number.isFinite(Number(live.theta)) ? Number(live.theta) : null,
+        decay: Number.isFinite(Number(live.theta))
+            ? Number(Number(live.theta).toFixed(2))
+            : null,
+        vega: Number.isFinite(Number(live.vega)) ? Number(live.vega) : null,
+        iv: Number.isFinite(Number(live.iv)) ? Number(live.iv) : null,
+        oi: openInterest,
+        oiChange,
         ...rsiFields,
         pe,
     };
@@ -1069,8 +1221,8 @@ function subscribe(instrumentKeys = []) {
         toUnsubscribe.forEach((key) => subscribedInstruments.delete(key));
 
         connectFeed();
-        sendSubscription(toSubscribe, "sub");
-        sendSubscription(toUnsubscribe, "unsub");
+        sendGroupedSubscriptions(toSubscribe, "sub");
+        sendGroupedSubscriptions(toUnsubscribe, "unsub");
     };
 
     if (instrumentsCache) {

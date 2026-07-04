@@ -32,10 +32,16 @@ function roundRsi(value) {
     return value == null ? null : Number(Number(value).toFixed(2));
 }
 
-function calculateRSI(candles = [], period = 14, instrumentKey = "unknown") {
+function calculateRSI(
+    candles = [],
+    period = 14,
+    instrumentKey = "unknown",
+    options = {},
+) {
+    const { skipCache = false } = options;
     const key = cacheKey("rsi", instrumentKey, period, candles);
 
-    return getCached(key, () => {
+    const compute = () => {
         const closes = closesFromCandles(candles);
         const values = calculateWilderRsi(closes, period).filter(
             (value) => value !== null,
@@ -51,13 +57,17 @@ function calculateRSI(candles = [], period = 14, instrumentKey = "unknown") {
                     ? null
                     : Number((rsi - prevRsi).toFixed(2)),
         };
-    });
+    };
+
+    if (skipCache) return compute();
+
+    return getCached(key, compute);
 }
 
 /**
  * Zerodha/Kite-style RSI pair for a timeframe:
- * - current: Wilder RSI(14) on the forming bar with live LTP (when available)
- * - prev: Wilder RSI(14) on the last completed bar
+ * - current: Wilder RSI(14) on the forming bar (live LTP, updates every tick)
+ * - prev: Wilder RSI(14) on the last fully closed bar (e.g. 5m@12:05 → prev is 12:00 close)
  */
 function calculateRsiForTimeframe(
     candles = [],
@@ -65,13 +75,25 @@ function calculateRsiForTimeframe(
     instrumentKey = "unknown",
     opts = {},
 ) {
-    const { interval = "days", unit = "1", ltp = null, includeLive = false } = opts;
+    const {
+        interval = "days",
+        unit = "1",
+        ltp = null,
+        includeLive = false,
+        nowMs = Date.now(),
+    } = opts;
+
     const closedSeries = prepareCandlesForRsi(candles, {
         interval,
         unit,
         includeLive: false,
+        nowMs,
     });
-    const closed = calculateRSI(closedSeries, period, `${instrumentKey}:closed`);
+    const closed = calculateRSI(
+        closedSeries,
+        period,
+        `${instrumentKey}:closed:${closedSeries.length}`,
+    );
 
     if (!includeLive || ltp == null || !Number.isFinite(Number(ltp)) || Number(ltp) <= 0) {
         return closed;
@@ -82,18 +104,25 @@ function calculateRsiForTimeframe(
         unit,
         includeLive: true,
         ltp: Number(ltp),
+        nowMs,
     });
-    const live = calculateRSI(liveSeries, period, `${instrumentKey}:live`);
-    const current = live.rsi;
+
+    const live = calculateRSI(
+        liveSeries,
+        period,
+        `${instrumentKey}:live:${liveSeries.length}:${Number(ltp).toFixed(4)}`,
+        { skipCache: true },
+    );
+
     const prev = closed.rsi;
 
     return {
-        rsi: current,
+        rsi: live.rsi,
         prevRsi: prev,
         rsiChange:
-            current == null || prev == null
+            live.rsi == null || prev == null
                 ? null
-                : Number((current - prev).toFixed(2)),
+                : Number((live.rsi - prev).toFixed(2)),
     };
 }
 
