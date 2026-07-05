@@ -10,6 +10,7 @@ const {
     calculateRsiForTimeframe,
     calculateVolumeAverage,
 } = require("./indicatorService");
+const { prepareCandlesForRsi } = require("../utils/rsiCandles");
 const {
     getCachedPe,
     getPeForInstrument,
@@ -41,6 +42,7 @@ const RSI_TF_CONFIG = [
         rsi: "rsi5m",
         prev: "prevRsi5m",
         change: "rsi5mChange",
+        prevPrice: "prevPrice5m",
     },
     {
         tf: "15m",
@@ -49,6 +51,7 @@ const RSI_TF_CONFIG = [
         rsi: "rsi15m",
         prev: "prevRsi15m",
         change: "rsi15mChange",
+        prevPrice: "prevPrice15m",
     },
     {
         tf: "1h",
@@ -57,6 +60,7 @@ const RSI_TF_CONFIG = [
         rsi: "hourlyRsi",
         prev: "prevHourlyRsi",
         change: "hourlyRsiChange",
+        prevPrice: "prevPrice1h",
     },
     {
         tf: "1d",
@@ -65,6 +69,7 @@ const RSI_TF_CONFIG = [
         rsi: "rsi",
         prev: "prevRsi",
         change: "rsiChange",
+        prevPrice: "prevPrice",
     },
 ];
 
@@ -156,6 +161,12 @@ async function computeAllRsiFields(instrumentKey, ltp = null) {
             interval: cfg.interval,
             unit: cfg.unit,
         }).catch(() => []);
+        const priceSeries = prepareCandlesForRsi(candles, {
+            interval: cfg.interval,
+            unit: cfg.unit,
+            includeLive,
+            ltp: includeLive ? price : null,
+        });
 
         const result = calculateRsiForTimeframe(
             candles,
@@ -171,6 +182,10 @@ async function computeAllRsiFields(instrumentKey, ltp = null) {
         fields[cfg.rsi] = result.rsi;
         fields[cfg.prev] = result.prevRsi;
         fields[cfg.change] = result.rsiChange;
+        const previousPrice = priceSeries.at(-2)?.close;
+        fields[cfg.prevPrice] = Number.isFinite(Number(previousPrice))
+            ? Number(Number(previousPrice).toFixed(2))
+            : null;
     });
 
     return fields;
@@ -675,9 +690,14 @@ function emitMarketTick(tick, snapshot = {}) {
         volume,
         timestamp: tick.timestamp || previous.timestamp,
         ema20: snapshot.ema20 ?? null,
+        ema75: snapshot.ema75 ?? null,
         rsi: snapshot.rsi ?? null,
         prevRsi: snapshot.prevRsi ?? null,
         rsiChange: snapshot.rsiChange ?? null,
+        prevPrice5m: snapshot.prevPrice5m ?? null,
+        prevPrice15m: snapshot.prevPrice15m ?? null,
+        prevPrice1h: snapshot.prevPrice1h ?? null,
+        prevPrice: snapshot.prevPrice ?? null,
         rsi5m: snapshot.rsi5m ?? null,
         prevRsi5m: snapshot.prevRsi5m ?? null,
         rsi5mChange: snapshot.rsi5mChange ?? null,
@@ -783,6 +803,7 @@ async function refreshRealtimeIndicatorsForKey(instrumentKey) {
         }).catch(() => []);
         const dailyWithLive = mergeLivePriceIntoLatestCandle(dailyCandles, live.ltp);
         const ema20 = calculateEMA(dailyWithLive, 20, instrumentKey);
+        const ema75 = calculateEMA(dailyWithLive, 75, instrumentKey);
         const rsiFields = await computeAllRsiFields(instrumentKey, live.ltp);
 
         const previousSnapshot = indicatorSnapshot.get(instrumentKey) || {};
@@ -791,6 +812,7 @@ async function refreshRealtimeIndicatorsForKey(instrumentKey) {
             symbol: stock.symbol,
             name: stock.name || previousSnapshot.name || "",
             ema20,
+            ema75,
             ...rsiFields,
         };
 
@@ -876,9 +898,14 @@ function pickIndicatorSnapshot(row = {}) {
         symbol: row.symbol,
         name: row.name,
         ema20: row.ema20,
+        ema75: row.ema75,
         rsi: row.rsi,
         prevRsi: row.prevRsi,
         rsiChange: row.rsiChange,
+        prevPrice5m: row.prevPrice5m,
+        prevPrice15m: row.prevPrice15m,
+        prevPrice1h: row.prevPrice1h,
+        prevPrice: row.prevPrice,
         rsi5m: row.rsi5m,
         prevRsi5m: row.prevRsi5m,
         rsi5mChange: row.rsi5mChange,
@@ -922,9 +949,14 @@ async function buildRow(stock, options = {}) {
             volume: 0,
             timestamp: null,
             ema20: null,
+            ema75: null,
             rsi: null,
             prevRsi: null,
             rsiChange: null,
+            prevPrice5m: null,
+            prevPrice15m: null,
+            prevPrice1h: null,
+            prevPrice: null,
             delta: null,
             gamma: null,
             theta: null,
@@ -956,9 +988,14 @@ async function buildRow(stock, options = {}) {
             volume: 0,
             timestamp: null,
             ema20: null,
+            ema75: null,
             rsi: null,
             prevRsi: null,
             rsiChange: null,
+            prevPrice5m: null,
+            prevPrice15m: null,
+            prevPrice1h: null,
+            prevPrice: null,
             delta: null,
             gamma: null,
             theta: null,
@@ -976,12 +1013,14 @@ async function buildRow(stock, options = {}) {
         interval: "days",
         unit: "1",
     }).catch(() => []);
+    const dailyWithLive = mergeLivePriceIntoLatestCandle(dailyCandles, live.ltp);
     const lastCandle = dailyCandles[dailyCandles.length - 1];
     const previousOiCandle =
         dailyCandles.length > 1 ? dailyCandles[dailyCandles.length - 2] : lastCandle;
-    const [rsiFields, ema20] = await Promise.all([
+    const [rsiFields, ema20, ema75] = await Promise.all([
         computeAllRsiFields(instrumentKey, live.ltp),
-        Promise.resolve(calculateEMA(dailyCandles, 20, instrumentKey)),
+        Promise.resolve(calculateEMA(dailyWithLive, 20, instrumentKey)),
+        Promise.resolve(calculateEMA(dailyWithLive, 75, instrumentKey)),
     ]);
     const volAvg = calculateVolumeAverage(dailyCandles, 20, instrumentKey);
     const optionPremium = isValidLtp(live.ltp) ? live.ltp : null;
@@ -1029,7 +1068,12 @@ async function buildRow(stock, options = {}) {
         volume: volume ?? 0,
         timestamp: live.timestamp || null,
         ema20,
+        ema75,
         volAvg,
+        prevPrice5m: rsiFields.prevPrice5m ?? null,
+        prevPrice15m: rsiFields.prevPrice15m ?? null,
+        prevPrice1h: rsiFields.prevPrice1h ?? null,
+        prevPrice: rsiFields.prevPrice ?? null,
         delta: Number.isFinite(Number(live.delta)) ? Number(live.delta) : null,
         gamma: Number.isFinite(Number(live.gamma)) ? Number(live.gamma) : null,
         theta: Number.isFinite(Number(live.theta)) ? Number(live.theta) : null,
