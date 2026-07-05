@@ -70,6 +70,8 @@ const INTERVAL_TO_RSI = {
     "1d": { field: "rsi", prev: "prevRsi" },
 };
 
+const backtestSeriesCache = new Map();
+
 function collectStrategyIndicators(strategy) {
     const entry = strategy.entryConditions?.length
         ? strategy.entryConditions
@@ -341,6 +343,12 @@ function buildBacktestIndicators(
 }
 
 async function fetchCandleSeriesForBacktest(instrumentKey, intervalKey, effectiveDays) {
+    const cacheKey = `${instrumentKey}|${intervalKey}|${effectiveDays}`;
+    const cached = backtestSeriesCache.get(cacheKey);
+    if (cached) {
+        return Array.isArray(cached) ? cached.map((candle) => ({ ...candle })) : cached;
+    }
+
     const upstox = INTERVAL_TO_UPSTOX[intervalKey] || INTERVAL_TO_UPSTOX["1d"];
     const intConfig = INTERVAL_CONFIG[intervalKey] || INTERVAL_CONFIG["1d"];
     const periodDays = Math.min(effectiveDays, intConfig.maxDays);
@@ -349,16 +357,29 @@ async function fetchCandleSeriesForBacktest(instrumentKey, intervalKey, effectiv
         Math.max(250, periodDays * (intConfig.barsPerDay || 1)),
     );
 
-    const raw = await getCandles(instrumentKey, {
-        interval: upstox.unit,
-        unit: upstox.interval,
-        periodDays,
-        maxBars,
-    });
+    const load = (async () => {
+        const raw = await getCandles(instrumentKey, {
+            interval: upstox.unit,
+            unit: upstox.interval,
+            periodDays,
+            maxBars,
+        });
 
-    const closed = dropFormingCandle(raw, upstox.unit, upstox.interval);
+        const closed = dropFormingCandle(raw, upstox.unit, upstox.interval);
 
-    return closed.map(toBacktestQuote).filter((q) => q.close != null);
+        return closed.map(toBacktestQuote).filter((q) => q.close != null);
+    })();
+
+    backtestSeriesCache.set(cacheKey, load);
+
+    try {
+        const series = await load;
+        backtestSeriesCache.set(cacheKey, series);
+        return series.map((candle) => ({ ...candle }));
+    } catch (error) {
+        backtestSeriesCache.delete(cacheKey);
+        throw error;
+    }
 }
 
 async function fetchBacktestCandles(instrumentKey, period, strategy, instrumentMeta = null) {
@@ -375,14 +396,17 @@ async function fetchBacktestCandles(instrumentKey, period, strategy, instrumentM
 
     const auxiliaryCandles = {};
 
-    for (const interval of config.requiredIntervals) {
-        if (interval === config.interval) continue;
-        auxiliaryCandles[interval] = await fetchCandleSeriesForBacktest(
-            instrumentKey,
-            interval,
-            config.effectiveDays,
-        );
-    }
+    await Promise.all(
+        config.requiredIntervals
+            .filter((interval) => interval !== config.interval)
+            .map(async (interval) => {
+                auxiliaryCandles[interval] = await fetchCandleSeriesForBacktest(
+                    instrumentKey,
+                    interval,
+                    config.effectiveDays,
+                );
+            }),
+    );
 
     return { candles, auxiliaryCandles, config };
 }
