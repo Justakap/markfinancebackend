@@ -38,7 +38,7 @@ function createStockAnalysisRoutes({
                 total: result.total,
                 offset: 0,
                 limit: result.total,
-                fromCache: true,
+                fromCache: false,
                 marketStatus: result.marketStatus,
                 updatedAt: result.updatedAt,
                 responseTimeMs: Date.now() - start,

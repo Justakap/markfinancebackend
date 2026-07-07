@@ -4,7 +4,7 @@ const { recordUpstoxApiCall } = require("./metrics");
 let chain = Promise.resolve();
 let lastRequestAt = 0;
 
-const MIN_GAP_MS = Number(process.env.UPSTOX_REQUEST_GAP_MS || 150);
+const MIN_GAP_MS = Number(process.env.UPSTOX_REQUEST_GAP_MS || 50);
 
 function enqueue(task) {
     const run = chain.then(async () => {

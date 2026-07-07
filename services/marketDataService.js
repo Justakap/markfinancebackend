@@ -4,16 +4,13 @@ const path = require("path");
 const protobuf = require("protobufjs");
 const WebSocket = require("ws");
 const zlib = require("zlib");
-const { getCandles, warmCandles } = require("./candleService");
 const {
-    calculateEMA,
-    calculateRsiForTimeframe,
-    calculateVolumeAverage,
-} = require("./indicatorService");
-const {
-    getPriceAtLookback,
-    getPreviousDailyClose,
-} = require("../utils/rsiCandles");
+    loadInstrumentBundle,
+    getCachedBundle,
+    computeRsiFieldsFromBundle,
+    computePriceVelocityFromBundle,
+    computeEmasFromBundle,
+} = require("./instrumentIndicatorBundle");
 const {
     getCachedPe,
     getPeForInstrument,
@@ -31,46 +28,9 @@ const instrumentMeta = new Map();
 const searchResultCache = new Map();
 const SEARCH_CACHE_TTL_MS = 30 * 1000;
 const INDICATOR_REFRESH_MS = Number(
-    process.env.UPSTOX_INDICATOR_REFRESH_MS || 8 * 1000,
+    process.env.UPSTOX_INDICATOR_REFRESH_MS || 15 * 1000,
 );
-const TICK_INDICATOR_DEBOUNCE_MS = Number(
-    process.env.UPSTOX_TICK_INDICATOR_DEBOUNCE_MS || 50,
-);
-
-const RSI_TF_CONFIG = [
-    {
-        tf: "5m",
-        interval: "minutes",
-        unit: "5",
-        rsi: "rsi5m",
-        prev: "prevRsi5m",
-        change: "rsi5mChange",
-    },
-    {
-        tf: "15m",
-        interval: "minutes",
-        unit: "15",
-        rsi: "rsi15m",
-        prev: "prevRsi15m",
-        change: "rsi15mChange",
-    },
-    {
-        tf: "1h",
-        interval: "hours",
-        unit: "1",
-        rsi: "hourlyRsi",
-        prev: "prevHourlyRsi",
-        change: "hourlyRsiChange",
-    },
-    {
-        tf: "1d",
-        interval: "days",
-        unit: "1",
-        rsi: "rsi",
-        prev: "prevRsi",
-        change: "rsiChange",
-    },
-];
+const TICK_INDICATOR_DEBOUNCE_MS = 0;
 
 let io = null;
 let ws = null;
@@ -84,6 +44,7 @@ let ltpPollTimer = null;
 let socketConnected = false;
 const pendingRealtimeIndicatorTimers = new Map();
 const realtimeIndicatorInFlight = new Map();
+const pendingTickRefresh = new Set();
 const LTP_POLL_MS = Number(process.env.UPSTOX_LTP_POLL_MS || 2 * 1000);
 const WS_RECONNECT_MS = Number(process.env.UPSTOX_WS_RECONNECT_MS || 5 * 1000);
 
@@ -134,85 +95,37 @@ function resolveStockSector(stock) {
     return exchange || type || "Other";
 }
 
-async function resolveRsiLtp(instrumentKey, ltp = null) {
-    if (isValidLtp(ltp)) return ltp;
-
-    const live = liveData.get(instrumentKey) || {};
-    if (isValidLtp(live.ltp)) return live.ltp;
-
-    const dailyCandles = await getCandles(instrumentKey, {
-        interval: "days",
-        unit: "1",
-    }).catch(() => []);
-    const lastClose = Number(dailyCandles.at(-1)?.close);
-    return isValidLtp(lastClose) ? lastClose : null;
-}
-
-async function computeAllRsiFields(instrumentKey, ltp = null) {
+async function computeIndicatorsFromBundle(instrumentKey, ltp = null, nowMs = Date.now()) {
     if (!instrumentKey || !isValidInstrumentKey(instrumentKey)) return {};
 
-    const price = await resolveRsiLtp(instrumentKey, ltp);
-    const includeLive = isValidLtp(price);
-    const fields = {};
+    const bundle = await loadInstrumentBundle(instrumentKey);
+    if (!bundle) return {};
 
-    await mapWithLimit(RSI_TF_CONFIG, 2, async (cfg) => {
-        const candles = await getCandles(instrumentKey, {
-            interval: cfg.interval,
-            unit: cfg.unit,
-        }).catch(() => []);
-
-        const result = calculateRsiForTimeframe(
-            candles,
-            14,
-            `${instrumentKey}:${cfg.tf}`,
-            {
-                interval: cfg.interval,
-                unit: cfg.unit,
-                ltp: includeLive ? price : null,
-                includeLive,
-            },
-        );
-        fields[cfg.rsi] = result.rsi;
-        fields[cfg.prev] = result.prevRsi;
-        fields[cfg.change] = result.rsiChange;
-    });
-
-    return fields;
-}
-
-function roundPrice(value) {
-    return Number.isFinite(Number(value)) ? Number(Number(value).toFixed(2)) : null;
-}
-
-async function computePriceVelocityFields(instrumentKey, asOfMs = Date.now()) {
-    if (!instrumentKey || !isValidInstrumentKey(instrumentKey)) return {};
-
-    const referenceMs = Number.isFinite(asOfMs) ? asOfMs : Date.now();
-
-    const [minuteCandles, dailyCandles] = await Promise.all([
-        getCandles(instrumentKey, {
-            interval: "minutes",
-            unit: "1",
-            periodDays: 5,
-            maxBars: 2500,
-        }).catch(() => []),
-        getCandles(instrumentKey, {
-            interval: "days",
-            unit: "1",
-        }).catch(() => []),
-    ]);
+    const liveLtp = isValidLtp(ltp) ? ltp : null;
+    const { ema20, ema75, volAvg } = computeEmasFromBundle(bundle, liveLtp);
 
     return {
-        prevPrice5m: roundPrice(
-            getPriceAtLookback(minuteCandles, referenceMs, 5 * 60 * 1000),
-        ),
-        prevPrice15m: roundPrice(
-            getPriceAtLookback(minuteCandles, referenceMs, 15 * 60 * 1000),
-        ),
-        prevPrice1h: roundPrice(
-            getPriceAtLookback(minuteCandles, referenceMs, 60 * 60 * 1000),
-        ),
-        prevPrice: roundPrice(getPreviousDailyClose(dailyCandles, referenceMs)),
+        ...computeRsiFieldsFromBundle(bundle, instrumentKey, liveLtp, nowMs),
+        ...computePriceVelocityFromBundle(bundle, nowMs),
+        ema20,
+        ema75,
+        volAvg,
+    };
+}
+
+function computeIndicatorsFromCachedBundle(instrumentKey, ltp = null, nowMs = Date.now()) {
+    const bundle = getCachedBundle(instrumentKey);
+    if (!bundle) return null;
+
+    const liveLtp = isValidLtp(ltp) ? ltp : null;
+    const { ema20, ema75, volAvg } = computeEmasFromBundle(bundle, liveLtp);
+
+    return {
+        ...computeRsiFieldsFromBundle(bundle, instrumentKey, liveLtp, nowMs),
+        ...computePriceVelocityFromBundle(bundle, nowMs),
+        ema20,
+        ema75,
+        volAvg,
     };
 }
 
@@ -804,60 +717,63 @@ function handleTick(tick) {
 }
 
 async function refreshRealtimeIndicatorsForKey(instrumentKey) {
-    const existing = realtimeIndicatorInFlight.get(instrumentKey);
-    if (existing) {
-        return existing;
+    if (realtimeIndicatorInFlight.has(instrumentKey)) {
+        pendingTickRefresh.add(instrumentKey);
+        return realtimeIndicatorInFlight.get(instrumentKey);
     }
 
     const task = (async () => {
-        const live = liveData.get(instrumentKey) || {};
-        if (!isValidLtp(live.ltp)) {
-            return indicatorSnapshot.get(instrumentKey) || {};
-        }
+        do {
+            pendingTickRefresh.delete(instrumentKey);
 
-        const meta = instrumentMeta.get(instrumentKey) || {};
-        const stock = {
-            ...meta,
-            instrumentKey,
-            symbol: meta.symbol || instrumentKey,
-        };
+            const live = liveData.get(instrumentKey) || {};
+            if (!isValidLtp(live.ltp)) {
+                return indicatorSnapshot.get(instrumentKey) || {};
+            }
 
-        const dailyCandles = await getCandles(instrumentKey, {
-            interval: "days",
-            unit: "1",
-        }).catch(() => []);
-        const dailyWithLive = mergeLivePriceIntoLatestCandle(dailyCandles, live.ltp);
-        const ema20 = calculateEMA(dailyWithLive, 20, instrumentKey);
-        const ema75 = calculateEMA(dailyWithLive, 75, instrumentKey);
-        const [rsiFields, priceFields] = await Promise.all([
-            computeAllRsiFields(instrumentKey, live.ltp),
-            computePriceVelocityFields(instrumentKey, Date.now()),
-        ]);
+            const meta = instrumentMeta.get(instrumentKey) || {};
+            const nowMs = Date.now();
 
-        const previousSnapshot = indicatorSnapshot.get(instrumentKey) || {};
-        const nextSnapshot = {
-            ...previousSnapshot,
-            symbol: stock.symbol,
-            name: stock.name || previousSnapshot.name || "",
-            ema20,
-            ema75,
-            ...rsiFields,
-            ...priceFields,
-        };
+            let indicatorFields = computeIndicatorsFromCachedBundle(
+                instrumentKey,
+                live.ltp,
+                nowMs,
+            );
 
-        indicatorSnapshot.set(instrumentKey, nextSnapshot);
-        emitMarketTick(live, nextSnapshot);
-        return nextSnapshot;
+            if (!indicatorFields) {
+                indicatorFields = await computeIndicatorsFromBundle(
+                    instrumentKey,
+                    live.ltp,
+                    nowMs,
+                );
+            }
+
+            const previousSnapshot = indicatorSnapshot.get(instrumentKey) || {};
+            const nextSnapshot = {
+                ...previousSnapshot,
+                symbol: meta.symbol || previousSnapshot.symbol || instrumentKey,
+                name: meta.name || previousSnapshot.name || "",
+                ...indicatorFields,
+            };
+
+            indicatorSnapshot.set(instrumentKey, nextSnapshot);
+            emitMarketTick(live, nextSnapshot);
+        } while (pendingTickRefresh.has(instrumentKey));
+
+        return indicatorSnapshot.get(instrumentKey) || {};
     })()
         .catch((error) => {
             console.log(
-                `Realtime RSI refresh failed for ${instrumentKey}:`,
+                `Realtime indicator refresh failed for ${instrumentKey}:`,
                 error.message,
             );
             return indicatorSnapshot.get(instrumentKey) || {};
         })
         .finally(() => {
             realtimeIndicatorInFlight.delete(instrumentKey);
+            if (pendingTickRefresh.has(instrumentKey)) {
+                refreshRealtimeIndicatorsForKey(instrumentKey);
+            }
         });
 
     realtimeIndicatorInFlight.set(instrumentKey, task);
@@ -866,6 +782,11 @@ async function refreshRealtimeIndicatorsForKey(instrumentKey) {
 
 function scheduleRealtimeIndicatorRefresh(instrumentKey) {
     if (!instrumentKey || !isValidInstrumentKey(instrumentKey)) return;
+
+    if (TICK_INDICATOR_DEBOUNCE_MS <= 0) {
+        refreshRealtimeIndicatorsForKey(instrumentKey);
+        return;
+    }
 
     const existingTimer = pendingRealtimeIndicatorTimers.get(instrumentKey);
     if (existingTimer) {
@@ -1038,21 +959,17 @@ async function buildRow(stock, options = {}) {
     }
 
     const live = liveData.get(instrumentKey) || {};
-    const dailyCandles = await getCandles(instrumentKey, {
-        interval: "days",
-        unit: "1",
-    }).catch(() => []);
-    const dailyWithLive = mergeLivePriceIntoLatestCandle(dailyCandles, live.ltp);
-    const lastCandle = dailyCandles[dailyCandles.length - 1];
+    const lastCandle = getCachedBundle(instrumentKey)?.daily?.at(-1);
     const previousOiCandle =
-        dailyCandles.length > 1 ? dailyCandles[dailyCandles.length - 2] : lastCandle;
-    const [rsiFields, priceFields, ema20, ema75] = await Promise.all([
-        computeAllRsiFields(instrumentKey, live.ltp),
-        computePriceVelocityFields(instrumentKey, Date.now()),
-        Promise.resolve(calculateEMA(dailyWithLive, 20, instrumentKey)),
-        Promise.resolve(calculateEMA(dailyWithLive, 75, instrumentKey)),
-    ]);
-    const volAvg = calculateVolumeAverage(dailyCandles, 20, instrumentKey);
+        getCachedBundle(instrumentKey)?.daily?.length > 1
+            ? getCachedBundle(instrumentKey).daily.at(-2)
+            : lastCandle;
+
+    const indicatorFields = await computeIndicatorsFromBundle(
+        instrumentKey,
+        live.ltp,
+        Date.now(),
+    );
     const optionPremium = isValidLtp(live.ltp) ? live.ltp : null;
     const openInterest = Number.isFinite(Number(live.oi))
         ? Number(live.oi)
@@ -1097,13 +1014,13 @@ async function buildRow(stock, options = {}) {
         change: isValidLtp(live.ltp) ? live.changePercent ?? 0 : 0,
         volume: volume ?? 0,
         timestamp: live.timestamp || null,
-        ema20,
-        ema75,
-        volAvg,
-        prevPrice5m: priceFields.prevPrice5m ?? null,
-        prevPrice15m: priceFields.prevPrice15m ?? null,
-        prevPrice1h: priceFields.prevPrice1h ?? null,
-        prevPrice: priceFields.prevPrice ?? null,
+        ema20: indicatorFields.ema20 ?? null,
+        ema75: indicatorFields.ema75 ?? null,
+        volAvg: indicatorFields.volAvg ?? null,
+        prevPrice5m: indicatorFields.prevPrice5m ?? null,
+        prevPrice15m: indicatorFields.prevPrice15m ?? null,
+        prevPrice1h: indicatorFields.prevPrice1h ?? null,
+        prevPrice: indicatorFields.prevPrice ?? null,
         delta: Number.isFinite(Number(live.delta)) ? Number(live.delta) : null,
         gamma: Number.isFinite(Number(live.gamma)) ? Number(live.gamma) : null,
         theta: Number.isFinite(Number(live.theta)) ? Number(live.theta) : null,
@@ -1114,7 +1031,18 @@ async function buildRow(stock, options = {}) {
         iv: Number.isFinite(Number(live.iv)) ? Number(live.iv) : null,
         oi: openInterest,
         oiChange,
-        ...rsiFields,
+        rsi: indicatorFields.rsi ?? null,
+        prevRsi: indicatorFields.prevRsi ?? null,
+        rsiChange: indicatorFields.rsiChange ?? null,
+        rsi5m: indicatorFields.rsi5m ?? null,
+        prevRsi5m: indicatorFields.prevRsi5m ?? null,
+        rsi5mChange: indicatorFields.rsi5mChange ?? null,
+        rsi15m: indicatorFields.rsi15m ?? null,
+        prevRsi15m: indicatorFields.prevRsi15m ?? null,
+        rsi15mChange: indicatorFields.rsi15mChange ?? null,
+        hourlyRsi: indicatorFields.hourlyRsi ?? null,
+        prevHourlyRsi: indicatorFields.prevHourlyRsi ?? null,
+        hourlyRsiChange: indicatorFields.hourlyRsiChange ?? null,
         pe,
     };
 
@@ -1226,6 +1154,71 @@ async function warmLiveQuotes(instrumentKeys = []) {
     }
 }
 
+function buildQuickRow(stock) {
+    const instrumentKey = stock.instrumentKey;
+    const meta = instrumentMeta.get(instrumentKey) || {};
+    const live = liveData.get(instrumentKey) || {};
+    const snapshot = indicatorSnapshot.get(instrumentKey) || {};
+    const liveLtp = isValidLtp(live.ltp) ? live.ltp : null;
+    const nowMs = Date.now();
+
+    const cachedIndicators =
+        instrumentKey && liveLtp
+            ? computeIndicatorsFromCachedBundle(instrumentKey, liveLtp, nowMs)
+            : null;
+
+    return {
+        symbol: stock.symbol || meta.symbol,
+        name: stock.name || stock.longName || meta.name || stock.symbol,
+        instrumentKey,
+        exchange: stock.exchange || meta.exchange || "",
+        market: stock.exchange || stock.market || meta.exchange || "",
+        instrumentType: stock.instrumentType || stock.assetType || stock.type || meta.instrumentType || "",
+        assetType: stock.instrumentType || stock.assetType || stock.type || meta.instrumentType || "",
+        ltp: liveLtp,
+        price: liveLtp,
+        changeAmount: isValidLtp(live.ltp) ? live.changeAmount ?? 0 : 0,
+        changePercent: isValidLtp(live.ltp) ? live.changePercent ?? 0 : 0,
+        change: isValidLtp(live.ltp) ? live.changePercent ?? 0 : 0,
+        volume: live.volume ?? 0,
+        timestamp: live.timestamp || null,
+        ema20: cachedIndicators?.ema20 ?? snapshot.ema20 ?? null,
+        ema75: cachedIndicators?.ema75 ?? snapshot.ema75 ?? null,
+        volAvg: cachedIndicators?.volAvg ?? snapshot.volAvg ?? null,
+        prevPrice5m: cachedIndicators?.prevPrice5m ?? snapshot.prevPrice5m ?? null,
+        prevPrice15m: cachedIndicators?.prevPrice15m ?? snapshot.prevPrice15m ?? null,
+        prevPrice1h: cachedIndicators?.prevPrice1h ?? snapshot.prevPrice1h ?? null,
+        prevPrice: cachedIndicators?.prevPrice ?? snapshot.prevPrice ?? null,
+        rsi: cachedIndicators?.rsi ?? snapshot.rsi ?? null,
+        prevRsi: cachedIndicators?.prevRsi ?? snapshot.prevRsi ?? null,
+        rsiChange: cachedIndicators?.rsiChange ?? snapshot.rsiChange ?? null,
+        rsi5m: cachedIndicators?.rsi5m ?? snapshot.rsi5m ?? null,
+        prevRsi5m: cachedIndicators?.prevRsi5m ?? snapshot.prevRsi5m ?? null,
+        rsi5mChange: cachedIndicators?.rsi5mChange ?? snapshot.rsi5mChange ?? null,
+        rsi15m: cachedIndicators?.rsi15m ?? snapshot.rsi15m ?? null,
+        prevRsi15m: cachedIndicators?.prevRsi15m ?? snapshot.prevRsi15m ?? null,
+        rsi15mChange: cachedIndicators?.rsi15mChange ?? snapshot.rsi15mChange ?? null,
+        hourlyRsi: cachedIndicators?.hourlyRsi ?? snapshot.hourlyRsi ?? null,
+        prevHourlyRsi: cachedIndicators?.prevHourlyRsi ?? snapshot.prevHourlyRsi ?? null,
+        hourlyRsiChange: cachedIndicators?.hourlyRsiChange ?? snapshot.hourlyRsiChange ?? null,
+        pe: snapshot.pe ?? getCachedPe(instrumentKey) ?? stock.trailingPE ?? null,
+    };
+}
+
+async function refreshWatchlistIndicatorsInBackground(stocks = []) {
+    await mapWithLimit(stocks, 8, async (stock) => {
+        if (!stock?.instrumentKey) return;
+        try {
+            await refreshIndicatorsForKey(stock.instrumentKey);
+        } catch (error) {
+            console.log(
+                `Background indicator refresh failed for ${stock.instrumentKey}:`,
+                error.message,
+            );
+        }
+    });
+}
+
 async function getRowsForWatchlist(watchlist) {
     const stocks = watchlist.stocks || [];
 
@@ -1237,25 +1230,28 @@ async function getRowsForWatchlist(watchlist) {
 
     await warmLiveQuotes(keys);
     subscribe(keys);
-    if (keys.length) {
-        warmCandles(keys).catch((error) =>
-            console.log("Upstox candle warm failed:", error.message),
-        );
-    }
-    warmPeForInstruments(stocks).catch((error) =>
-        console.log("Upstox PE warm failed:", error.message),
+
+    keys.forEach((key) => {
+        loadInstrumentBundle(key).catch(() => {});
+    });
+
+    const quickRows = stocks.map((stock) => buildQuickRow(stock));
+
+    refreshWatchlistIndicatorsInBackground(stocks).catch((error) =>
+        console.log("Watchlist indicator refresh failed:", error.message),
     );
 
-    const rows = (await mapWithLimit(stocks, 5, (stock) => buildRow(stock))).map(
-        applyLivePriceToRow,
+    warmPeForInstruments(stocks).catch((error) =>
+        console.log("Upstox PE warm failed:", error.message),
     );
 
     broadcastLivePrices(keys);
 
     return {
-        data: rows,
-        total: rows.length,
+        data: quickRows,
+        total: quickRows.length,
         updatedAt: new Date(),
+        partial: true,
         marketStatus: {
             label: socketConnected
                 ? "Upstox Live (WebSocket)"

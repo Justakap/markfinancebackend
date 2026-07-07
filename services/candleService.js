@@ -7,11 +7,7 @@ const {
     canFetchCandles,
 } = require("../utils/instrumentKeyResolver");
 
-const candleCache = new Map();
-const CANDLE_TTL_MS = Number(process.env.UPSTOX_CANDLE_TTL_MS || 5 * 60 * 1000);
-const INTRADAY_CANDLE_TTL_MS = Number(
-    process.env.UPSTOX_INTRADAY_CANDLE_TTL_MS || 60 * 1000,
-);
+const { dedupe } = require("../utils/requestDedup");
 
 const RSI_CANDLE_CONFIGS = [
     { interval: "minutes", unit: "1" },
@@ -371,32 +367,19 @@ async function getCandles(instrumentKey, options = {}) {
     const normalizedInterval = requestedInterval;
 
     const key = `${instrumentKey}:${normalizedUnit}:${normalizedInterval}:${periodDays || ""}:${maxBars || ""}`;
-    const cached = candleCache.get(key);
 
-    const ttlMs =
-        requestedUnit === "minutes" || requestedUnit === "hours"
-            ? INTRADAY_CANDLE_TTL_MS
-            : CANDLE_TTL_MS;
-
-    if (cached && Date.now() - cached.updatedAt < ttlMs) {
-        return cached.candles;
-    }
-
-    try {
-        const candles = await fetchHistoricalCandles(instrumentKey, {
-            interval: requestedUnit,
-            unit: requestedInterval,
-            periodDays,
-            maxBars,
-        });
-        candleCache.set(key, {
-            updatedAt: Date.now(),
-            candles,
-        });
-        return candles;
-    } catch {
-        return [];
-    }
+    return dedupe(`candles:${key}`, async () => {
+        try {
+            return await fetchHistoricalCandles(instrumentKey, {
+                interval: requestedUnit,
+                unit: requestedInterval,
+                periodDays,
+                maxBars,
+            });
+        } catch {
+            return [];
+        }
+    });
 }
 
 async function warmCandles(instrumentKeys = []) {
