@@ -269,6 +269,74 @@ function prepareCandlesForRsi(candles = [], opts = {}) {
     });
 }
 
+function floorToMinuteMs(value) {
+    if (!Number.isFinite(value)) return null;
+    return Math.floor(value / (60 * 1000)) * (60 * 1000);
+}
+
+/**
+ * Price at a wall-clock lookback (e.g. tick at 12:06 → 5m prev uses the 12:01 bar).
+ * Uses the 1-min candle close for the target minute; falls back to the nearest prior bar.
+ */
+function getPriceAtLookback(candles = [], asOfMs, lookbackMs) {
+    if (!Array.isArray(candles) || !candles.length || !Number.isFinite(asOfMs)) {
+        return null;
+    }
+
+    const targetMs = asOfMs - lookbackMs;
+    if (!Number.isFinite(targetMs)) return null;
+
+    const targetMinuteMs = floorToMinuteMs(targetMs);
+    if (targetMinuteMs == null) return null;
+
+    let nearestBefore = null;
+    let nearestBeforeMs = -Infinity;
+
+    for (let index = candles.length - 1; index >= 0; index -= 1) {
+        const openMs = candleOpenMs(candles[index]);
+        if (openMs == null) continue;
+
+        if (openMs === targetMinuteMs) {
+            const close = Number(candles[index].close);
+            if (Number.isFinite(close)) return close;
+            const open = Number(candles[index].open);
+            if (Number.isFinite(open)) return open;
+            return null;
+        }
+
+        if (openMs < targetMinuteMs && openMs > nearestBeforeMs) {
+            nearestBeforeMs = openMs;
+            nearestBefore = candles[index];
+        }
+    }
+
+    if (nearestBefore) {
+        const close = Number(nearestBefore.close);
+        return Number.isFinite(close) ? close : null;
+    }
+
+    return null;
+}
+
+/** Previous trading session daily close (excludes today's bar). */
+function getPreviousDailyClose(candles = [], asOfMs = Date.now()) {
+    if (!Array.isArray(candles) || !candles.length) return null;
+
+    const todayStart = getTodayStartMs(asOfMs);
+
+    for (let index = candles.length - 1; index >= 0; index -= 1) {
+        const openMs = candleOpenMs(candles[index]);
+        if (openMs == null) continue;
+
+        if (getTodayStartMs(openMs) >= todayStart) continue;
+
+        const close = Number(candles[index].close);
+        return Number.isFinite(close) ? close : null;
+    }
+
+    return null;
+}
+
 module.exports = {
     periodMs,
     inferStepMs,
@@ -280,4 +348,7 @@ module.exports = {
     mergeLiveIntoLatest,
     isBarForming,
     getTodayStartMs,
+    floorToMinuteMs,
+    getPriceAtLookback,
+    getPreviousDailyClose,
 };

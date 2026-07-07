@@ -10,7 +10,10 @@ const {
     calculateRsiForTimeframe,
     calculateVolumeAverage,
 } = require("./indicatorService");
-const { prepareCandlesForRsi } = require("../utils/rsiCandles");
+const {
+    getPriceAtLookback,
+    getPreviousDailyClose,
+} = require("../utils/rsiCandles");
 const {
     getCachedPe,
     getPeForInstrument,
@@ -42,7 +45,6 @@ const RSI_TF_CONFIG = [
         rsi: "rsi5m",
         prev: "prevRsi5m",
         change: "rsi5mChange",
-        prevPrice: "prevPrice5m",
     },
     {
         tf: "15m",
@@ -51,7 +53,6 @@ const RSI_TF_CONFIG = [
         rsi: "rsi15m",
         prev: "prevRsi15m",
         change: "rsi15mChange",
-        prevPrice: "prevPrice15m",
     },
     {
         tf: "1h",
@@ -60,7 +61,6 @@ const RSI_TF_CONFIG = [
         rsi: "hourlyRsi",
         prev: "prevHourlyRsi",
         change: "hourlyRsiChange",
-        prevPrice: "prevPrice1h",
     },
     {
         tf: "1d",
@@ -69,7 +69,6 @@ const RSI_TF_CONFIG = [
         rsi: "rsi",
         prev: "prevRsi",
         change: "rsiChange",
-        prevPrice: "prevPrice",
     },
 ];
 
@@ -161,12 +160,6 @@ async function computeAllRsiFields(instrumentKey, ltp = null) {
             interval: cfg.interval,
             unit: cfg.unit,
         }).catch(() => []);
-        const priceSeries = prepareCandlesForRsi(candles, {
-            interval: cfg.interval,
-            unit: cfg.unit,
-            includeLive,
-            ltp: includeLive ? price : null,
-        });
 
         const result = calculateRsiForTimeframe(
             candles,
@@ -182,13 +175,45 @@ async function computeAllRsiFields(instrumentKey, ltp = null) {
         fields[cfg.rsi] = result.rsi;
         fields[cfg.prev] = result.prevRsi;
         fields[cfg.change] = result.rsiChange;
-        const previousPrice = priceSeries.at(-2)?.close;
-        fields[cfg.prevPrice] = Number.isFinite(Number(previousPrice))
-            ? Number(Number(previousPrice).toFixed(2))
-            : null;
     });
 
     return fields;
+}
+
+function roundPrice(value) {
+    return Number.isFinite(Number(value)) ? Number(Number(value).toFixed(2)) : null;
+}
+
+async function computePriceVelocityFields(instrumentKey, asOfMs = Date.now()) {
+    if (!instrumentKey || !isValidInstrumentKey(instrumentKey)) return {};
+
+    const referenceMs = Number.isFinite(asOfMs) ? asOfMs : Date.now();
+
+    const [minuteCandles, dailyCandles] = await Promise.all([
+        getCandles(instrumentKey, {
+            interval: "minutes",
+            unit: "1",
+            periodDays: 5,
+            maxBars: 2500,
+        }).catch(() => []),
+        getCandles(instrumentKey, {
+            interval: "days",
+            unit: "1",
+        }).catch(() => []),
+    ]);
+
+    return {
+        prevPrice5m: roundPrice(
+            getPriceAtLookback(minuteCandles, referenceMs, 5 * 60 * 1000),
+        ),
+        prevPrice15m: roundPrice(
+            getPriceAtLookback(minuteCandles, referenceMs, 15 * 60 * 1000),
+        ),
+        prevPrice1h: roundPrice(
+            getPriceAtLookback(minuteCandles, referenceMs, 60 * 60 * 1000),
+        ),
+        prevPrice: roundPrice(getPreviousDailyClose(dailyCandles, referenceMs)),
+    };
 }
 
 function isSupportedInstrument(item) {
@@ -804,7 +829,10 @@ async function refreshRealtimeIndicatorsForKey(instrumentKey) {
         const dailyWithLive = mergeLivePriceIntoLatestCandle(dailyCandles, live.ltp);
         const ema20 = calculateEMA(dailyWithLive, 20, instrumentKey);
         const ema75 = calculateEMA(dailyWithLive, 75, instrumentKey);
-        const rsiFields = await computeAllRsiFields(instrumentKey, live.ltp);
+        const [rsiFields, priceFields] = await Promise.all([
+            computeAllRsiFields(instrumentKey, live.ltp),
+            computePriceVelocityFields(instrumentKey, Date.now()),
+        ]);
 
         const previousSnapshot = indicatorSnapshot.get(instrumentKey) || {};
         const nextSnapshot = {
@@ -814,6 +842,7 @@ async function refreshRealtimeIndicatorsForKey(instrumentKey) {
             ema20,
             ema75,
             ...rsiFields,
+            ...priceFields,
         };
 
         indicatorSnapshot.set(instrumentKey, nextSnapshot);
@@ -1017,8 +1046,9 @@ async function buildRow(stock, options = {}) {
     const lastCandle = dailyCandles[dailyCandles.length - 1];
     const previousOiCandle =
         dailyCandles.length > 1 ? dailyCandles[dailyCandles.length - 2] : lastCandle;
-    const [rsiFields, ema20, ema75] = await Promise.all([
+    const [rsiFields, priceFields, ema20, ema75] = await Promise.all([
         computeAllRsiFields(instrumentKey, live.ltp),
+        computePriceVelocityFields(instrumentKey, Date.now()),
         Promise.resolve(calculateEMA(dailyWithLive, 20, instrumentKey)),
         Promise.resolve(calculateEMA(dailyWithLive, 75, instrumentKey)),
     ]);
@@ -1070,10 +1100,10 @@ async function buildRow(stock, options = {}) {
         ema20,
         ema75,
         volAvg,
-        prevPrice5m: rsiFields.prevPrice5m ?? null,
-        prevPrice15m: rsiFields.prevPrice15m ?? null,
-        prevPrice1h: rsiFields.prevPrice1h ?? null,
-        prevPrice: rsiFields.prevPrice ?? null,
+        prevPrice5m: priceFields.prevPrice5m ?? null,
+        prevPrice15m: priceFields.prevPrice15m ?? null,
+        prevPrice1h: priceFields.prevPrice1h ?? null,
+        prevPrice: priceFields.prevPrice ?? null,
         delta: Number.isFinite(Number(live.delta)) ? Number(live.delta) : null,
         gamma: Number.isFinite(Number(live.gamma)) ? Number(live.gamma) : null,
         theta: Number.isFinite(Number(live.theta)) ? Number(live.theta) : null,

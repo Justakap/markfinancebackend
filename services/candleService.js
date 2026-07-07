@@ -236,6 +236,25 @@ function getDateRangeForPeriodDays(unit, periodDays = 365) {
     return { toDate, fromDate };
 }
 
+function candleTimestampKey(candle) {
+    const ms = new Date(candle?.timestamp).getTime();
+    return Number.isFinite(ms) ? ms : null;
+}
+
+function mergeCandlesByTimestamp(primary = [], secondary = []) {
+    const byMs = new Map();
+
+    [...primary, ...secondary].forEach((candle) => {
+        const key = candleTimestampKey(candle);
+        if (key == null) return;
+        byMs.set(key, candle);
+    });
+
+    return [...byMs.values()].sort(
+        (a, b) => candleTimestampKey(a) - candleTimestampKey(b),
+    );
+}
+
 async function fetchHistoricalCandles(instrumentKey, options = {}) {
     const token = getAccessToken();
     if (!token || !(await assertCandleInstrumentKey(instrumentKey))) return [];
@@ -279,8 +298,10 @@ async function fetchHistoricalCandles(instrumentKey, options = {}) {
                 ? getDateRangeForPeriodDays(unit, periodDays)
                 : getDateRangeForUnit(unit);
         const { toDate, fromDate } = range;
+
+        let historical = [];
         try {
-            const historical = await fetchHistoricalCandlesByRange(
+            historical = await fetchHistoricalCandlesByRange(
                 instrumentKey,
                 unit,
                 interval,
@@ -288,20 +309,30 @@ async function fetchHistoricalCandles(instrumentKey, options = {}) {
                 toDate,
                 { maxBars },
             );
-            if (historical.length) return historical.slice(-maxBars);
         } catch {
-            // Fall back to current-day intraday candles below.
+            historical = [];
         }
+
+        const intraday = await fetchIntradayCandles(instrumentKey, {
+            interval: unit,
+            unit: interval,
+            maxBars,
+        }).catch(() => []);
+
+        if (historical.length && intraday.length) {
+            return mergeCandlesByTimestamp(historical, intraday).slice(-maxBars);
+        }
+        if (intraday.length) return intraday.slice(-maxBars);
+        if (historical.length) return historical.slice(-maxBars);
     }
 
-    if (unit === "minutes" || unit === "hours") {
+    if (unit === "hours") {
         const intraday = await fetchIntradayCandles(instrumentKey, {
             interval: unit,
             unit: interval,
             maxBars,
         });
         if (intraday.length) return intraday;
-        if (unit === "minutes") return [];
     }
 
     if (isInstrumentKeyBlocked(instrumentKey)) {
