@@ -60,18 +60,10 @@ async function validateSymbolRsi(symbol) {
             includeLive: false,
         });
 
-        const reference = calculateRSI(
-            closedSeries,
-            14,
-            `${instrumentKey}:${cfg.key}:closed`,
-        );
+        const reference = calculateRSI(closedSeries, 14);
 
         // App path: same closed-bar logic (must match reference)
-        const appClosed = calculateRSI(
-            closedSeries,
-            14,
-            `${instrumentKey}:${cfg.key}:app`,
-        );
+        const appClosed = calculateRSI(closedSeries, 14);
 
         const tolerance = RSI_TOLERANCE[cfg.label] ?? 2;
         const difference =
@@ -113,11 +105,7 @@ async function validateSymbolEma(symbol) {
     const rows = [];
 
     [{ key: "ema20", period: 20, label: "EMA20" }].forEach(({ period, label }) => {
-        const markFinanceValue = calculateEMA(
-            closedSeries,
-            period,
-            `${instrumentKey}:ema`,
-        );
+        const markFinanceValue = calculateEMA(closedSeries, period);
         const tradingViewValue = markFinanceValue;
         const differencePct = 0;
 

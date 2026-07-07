@@ -2,8 +2,6 @@ const { EMA, SMA, MACD } = require("technicalindicators");
 const { calculateWilderRsi } = require("../utils/indicators");
 const { prepareCandlesForRsi } = require("../utils/rsiCandles");
 
-const indicatorCache = new Map();
-
 function closesFromCandles(candles = []) {
     return candles
         .map((candle) => Number(candle.close))
@@ -16,52 +14,22 @@ function volumesFromCandles(candles = []) {
         .filter((value) => Number.isFinite(value));
 }
 
-function cacheKey(name, instrumentKey, period, candles) {
-    const last = candles[candles.length - 1];
-    return `${name}:${instrumentKey}:${period}:${candles.length}:${last?.timestamp || last?.date || ""}:${last?.close || ""}`;
-}
-
-function getCached(key, compute) {
-    if (indicatorCache.has(key)) return indicatorCache.get(key);
-    const value = compute();
-    indicatorCache.set(key, value);
-    return value;
-}
-
 function roundRsi(value) {
     return value == null ? null : Number(Number(value).toFixed(2));
 }
 
-function calculateRSI(
-    candles = [],
-    period = 14,
-    instrumentKey = "unknown",
-    options = {},
-) {
-    const { skipCache = false } = options;
-    const key = cacheKey("rsi", instrumentKey, period, candles);
+function calculateRSI(candles = [], period = 14) {
+    const closes = closesFromCandles(candles);
+    const values = calculateWilderRsi(closes, period).filter((value) => value !== null);
+    const rsi = values.at(-1) ?? null;
+    const prevRsi = values.at(-2) ?? null;
 
-    const compute = () => {
-        const closes = closesFromCandles(candles);
-        const values = calculateWilderRsi(closes, period).filter(
-            (value) => value !== null,
-        );
-        const rsi = values.at(-1) ?? null;
-        const prevRsi = values.at(-2) ?? null;
-
-        return {
-            rsi: roundRsi(rsi),
-            prevRsi: roundRsi(prevRsi),
-            rsiChange:
-                rsi == null || prevRsi == null
-                    ? null
-                    : Number((rsi - prevRsi).toFixed(2)),
-        };
+    return {
+        rsi: roundRsi(rsi),
+        prevRsi: roundRsi(prevRsi),
+        rsiChange:
+            rsi == null || prevRsi == null ? null : Number((rsi - prevRsi).toFixed(2)),
     };
-
-    if (skipCache) return compute();
-
-    return getCached(key, compute);
 }
 
 /**
@@ -89,11 +57,7 @@ function calculateRsiForTimeframe(
         includeLive: false,
         nowMs,
     });
-    const closed = calculateRSI(
-        closedSeries,
-        period,
-        `${instrumentKey}:closed:${closedSeries.length}`,
-    );
+    const closed = calculateRSI(closedSeries, period);
 
     if (!includeLive || ltp == null || !Number.isFinite(Number(ltp)) || Number(ltp) <= 0) {
         return closed;
@@ -107,12 +71,7 @@ function calculateRsiForTimeframe(
         nowMs,
     });
 
-    const live = calculateRSI(
-        liveSeries,
-        period,
-        `${instrumentKey}:live:${liveSeries.length}:${Number(ltp).toFixed(4)}`,
-        { skipCache: true },
-    );
+    const live = calculateRSI(liveSeries, period);
 
     const prev = closed.rsi;
 
@@ -126,44 +85,32 @@ function calculateRsiForTimeframe(
     };
 }
 
-function calculateEMA(candles = [], period = 20, instrumentKey = "unknown") {
-    const key = cacheKey("ema", instrumentKey, period, candles);
-
-    return getCached(key, () => {
-        const closes = closesFromCandles(candles);
-        const values = EMA.calculate({ values: closes, period });
-        const ema = values.at(-1);
-        return ema == null ? null : Number(ema.toFixed(2));
-    });
+function calculateEMA(candles = [], period = 20) {
+    const closes = closesFromCandles(candles);
+    const values = EMA.calculate({ values: closes, period });
+    const ema = values.at(-1);
+    return ema == null ? null : Number(ema.toFixed(2));
 }
 
-function calculateSMA(candles = [], period = 20, instrumentKey = "unknown") {
-    const key = cacheKey("sma", instrumentKey, period, candles);
-
-    return getCached(key, () => {
-        const closes = closesFromCandles(candles);
-        const values = SMA.calculate({ values: closes, period });
-        const sma = values.at(-1);
-        return sma == null ? null : Number(sma.toFixed(2));
-    });
+function calculateSMA(candles = [], period = 20) {
+    const closes = closesFromCandles(candles);
+    const values = SMA.calculate({ values: closes, period });
+    const sma = values.at(-1);
+    return sma == null ? null : Number(sma.toFixed(2));
 }
 
-function calculateMACD(candles = [], instrumentKey = "unknown") {
-    const key = cacheKey("macd", instrumentKey, "12-26-9", candles);
-
-    return getCached(key, () => {
-        const closes = closesFromCandles(candles);
-        const values = MACD.calculate({
-            values: closes,
-            fastPeriod: 12,
-            slowPeriod: 26,
-            signalPeriod: 9,
-            SimpleMAOscillator: false,
-            SimpleMASignal: false,
-        });
-
-        return values.at(-1) || null;
+function calculateMACD(candles = []) {
+    const closes = closesFromCandles(candles);
+    const values = MACD.calculate({
+        values: closes,
+        fastPeriod: 12,
+        slowPeriod: 26,
+        signalPeriod: 9,
+        SimpleMAOscillator: false,
+        SimpleMASignal: false,
     });
+
+    return values.at(-1) || null;
 }
 
 function calculateRSISeries(candles = [], period = 14) {
@@ -203,21 +150,15 @@ function calculateEMASeries(candles = [], period = 20) {
     return series;
 }
 
-function calculateVolumeAverage(candles = [], period = 20, instrumentKey = "unknown") {
-    const key = cacheKey("volumeAvg", instrumentKey, period, candles);
+function calculateVolumeAverage(candles = [], period = 20) {
+    const volumes = volumesFromCandles(candles).slice(-period);
+    if (!volumes.length) return null;
 
-    return getCached(key, () => {
-        const volumes = volumesFromCandles(candles).slice(-period);
-        if (!volumes.length) return null;
-
-        return Math.round(
-            volumes.reduce((sum, volume) => sum + volume, 0) / volumes.length,
-        );
-    });
+    return Math.round(volumes.reduce((sum, volume) => sum + volume, 0) / volumes.length);
 }
 
 function clearIndicatorCache() {
-    indicatorCache.clear();
+    // no-op: indicator cache removed for live accuracy
 }
 
 module.exports = {
