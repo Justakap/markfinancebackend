@@ -102,7 +102,7 @@ async function computeIndicatorsFromBundle(instrumentKey, ltp = null, nowMs = Da
     if (!bundle) return {};
 
     const liveLtp = isValidLtp(ltp) ? ltp : null;
-    const { ema20, ema75, volAvg } = computeEmasFromBundle(bundle, liveLtp);
+    const { ema20, ema75, volAvg, vwap } = computeEmasFromBundle(bundle, liveLtp);
 
     return {
         ...computeRsiFieldsFromBundle(bundle, instrumentKey, liveLtp, nowMs),
@@ -110,6 +110,7 @@ async function computeIndicatorsFromBundle(instrumentKey, ltp = null, nowMs = Da
         ema20,
         ema75,
         volAvg,
+        vwap,
     };
 }
 
@@ -118,7 +119,7 @@ function computeIndicatorsFromCachedBundle(instrumentKey, ltp = null, nowMs = Da
     if (!bundle) return null;
 
     const liveLtp = isValidLtp(ltp) ? ltp : null;
-    const { ema20, ema75, volAvg } = computeEmasFromBundle(bundle, liveLtp);
+    const { ema20, ema75, volAvg, vwap } = computeEmasFromBundle(bundle, liveLtp);
 
     return {
         ...computeRsiFieldsFromBundle(bundle, instrumentKey, liveLtp, nowMs),
@@ -126,6 +127,7 @@ function computeIndicatorsFromCachedBundle(instrumentKey, ltp = null, nowMs = Da
         ema20,
         ema75,
         volAvg,
+        vwap,
     };
 }
 
@@ -558,6 +560,25 @@ function extractGreeksFromFeedItem(item) {
     };
 }
 
+function extractVwapFromFeedItem(item, ltpc) {
+    if (ltpc?.atp != null) {
+        const atp = toNum(ltpc.atp);
+        if (Number.isFinite(atp) && atp > 0) return atp;
+    }
+
+    const full = item.fullFeed || item.fullfeed || {};
+    const first = item.firstLevelWithGreeks || {};
+    const marketFF = full.marketFF || full.marketFf || item.marketFF || item.marketFf || {};
+    const direct = [marketFF.atp, first.atp, item.atp];
+
+    for (const value of direct) {
+        const atp = toNum(value);
+        if (Number.isFinite(atp) && atp > 0) return atp;
+    }
+
+    return undefined;
+}
+
 async function decodeFeed(data) {
     const FeedResponse = await loadFeedProto();
     const decoded = FeedResponse.decode(Buffer.from(data));
@@ -574,6 +595,7 @@ async function decodeFeed(data) {
             const meta = instrumentMeta.get(instrumentKey) || {};
             const cp = toNum(ltpc.cp);
             const ltp = toNum(ltpc.ltp);
+            const vwap = extractVwapFromFeedItem(item, ltpc);
             const changeAmount = cp && ltp ? Number((ltp - cp).toFixed(2)) : 0;
             const changePercent =
                 cp && ltp ? Number((((ltp - cp) / cp) * 100).toFixed(2)) : 0;
@@ -590,6 +612,7 @@ async function decodeFeed(data) {
                 changeAmount: isValidLtp(ltp) ? changeAmount : undefined,
                 changePercent: isValidLtp(ltp) ? changePercent : undefined,
                 volume: volume > 0 ? volume : undefined,
+                vwap,
                 lastTradeTime: ltpc.ltt || feed.currentTs || Date.now(),
                 delta: greeks.delta,
                 gamma: greeks.gamma,
@@ -646,6 +669,14 @@ function emitMarketTick(tick, snapshot = {}) {
         prevHourlyRsi: snapshot.prevHourlyRsi ?? null,
         hourlyRsiChange: snapshot.hourlyRsiChange ?? null,
         volAvg: snapshot.volAvg ?? null,
+        vwap:
+            snapshot.vwap != null
+                ? snapshot.vwap
+                : tick.vwap != null
+                  ? tick.vwap
+                  : previous.vwap != null
+                    ? previous.vwap
+                    : null,
         delta: snapshot.delta ?? null,
         gamma: snapshot.gamma ?? null,
         theta: snapshot.theta ?? null,
@@ -697,6 +728,10 @@ function handleTick(tick) {
 
     if (tick.volume != null && tick.volume > 0) {
         next.volume = Math.max(Number(previous.volume || 0), Number(tick.volume));
+    }
+
+    if (tick.vwap != null && Number.isFinite(Number(tick.vwap)) && Number(tick.vwap) > 0) {
+        next.vwap = Number(tick.vwap);
     }
 
     if (tick.oi != null) {
@@ -866,6 +901,7 @@ function pickIndicatorSnapshot(row = {}) {
         prevHourlyRsi: row.prevHourlyRsi,
         hourlyRsiChange: row.hourlyRsiChange,
         volAvg: row.volAvg,
+        vwap: row.vwap,
         delta: row.delta,
         gamma: row.gamma,
         theta: row.theta,
@@ -907,6 +943,7 @@ async function buildRow(stock, options = {}) {
             prevPrice15m: null,
             prevPrice1h: null,
             prevPrice: null,
+            vwap: null,
             delta: null,
             gamma: null,
             theta: null,
@@ -946,6 +983,7 @@ async function buildRow(stock, options = {}) {
             prevPrice15m: null,
             prevPrice1h: null,
             prevPrice: null,
+            vwap: null,
             delta: null,
             gamma: null,
             theta: null,
@@ -1017,6 +1055,12 @@ async function buildRow(stock, options = {}) {
         ema20: indicatorFields.ema20 ?? null,
         ema75: indicatorFields.ema75 ?? null,
         volAvg: indicatorFields.volAvg ?? null,
+        vwap:
+            indicatorFields.vwap != null
+                ? indicatorFields.vwap
+                : Number.isFinite(Number(live.vwap)) && Number(live.vwap) > 0
+                  ? Number(live.vwap)
+                  : null,
         prevPrice5m: indicatorFields.prevPrice5m ?? null,
         prevPrice15m: indicatorFields.prevPrice15m ?? null,
         prevPrice1h: indicatorFields.prevPrice1h ?? null,
@@ -1162,10 +1206,9 @@ function buildQuickRow(stock) {
     const liveLtp = isValidLtp(live.ltp) ? live.ltp : null;
     const nowMs = Date.now();
 
-    const cachedIndicators =
-        instrumentKey && liveLtp
-            ? computeIndicatorsFromCachedBundle(instrumentKey, liveLtp, nowMs)
-            : null;
+    const cachedIndicators = instrumentKey
+        ? computeIndicatorsFromCachedBundle(instrumentKey, liveLtp, nowMs)
+        : null;
 
     return {
         symbol: stock.symbol || meta.symbol,
@@ -1185,6 +1228,14 @@ function buildQuickRow(stock) {
         ema20: cachedIndicators?.ema20 ?? snapshot.ema20 ?? null,
         ema75: cachedIndicators?.ema75 ?? snapshot.ema75 ?? null,
         volAvg: cachedIndicators?.volAvg ?? snapshot.volAvg ?? null,
+        vwap:
+            cachedIndicators?.vwap != null
+                ? cachedIndicators.vwap
+                : snapshot.vwap != null
+                  ? snapshot.vwap
+                  : Number.isFinite(Number(live.vwap)) && Number(live.vwap) > 0
+                    ? Number(live.vwap)
+                    : null,
         prevPrice5m: cachedIndicators?.prevPrice5m ?? snapshot.prevPrice5m ?? null,
         prevPrice15m: cachedIndicators?.prevPrice15m ?? snapshot.prevPrice15m ?? null,
         prevPrice1h: cachedIndicators?.prevPrice1h ?? snapshot.prevPrice1h ?? null,

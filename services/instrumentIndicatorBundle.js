@@ -1,6 +1,11 @@
 const { dedupe } = require("../utils/requestDedup");
 const { getCandles } = require("./candleService");
-const { calculateRsiForTimeframe, calculateEMA, calculateVolumeAverage } = require("./indicatorService");
+const {
+    calculateRsiForTimeframe,
+    calculateEMA,
+    calculateVolumeAverage,
+    calculateVWAP,
+} = require("./indicatorService");
 const { getPriceAtLookback, getPreviousDailyClose } = require("../utils/rsiCandles");
 
 const RSI_TF_CONFIG = [
@@ -109,8 +114,10 @@ function computePriceVelocityFromBundle(bundle, nowMs = Date.now()) {
 }
 
 function computeEmasFromBundle(bundle, ltp) {
+    const vwap = calculateVWAP(bundle?.minute1 || [], ltp);
+
     if (!bundle?.daily?.length) {
-        return { ema20: null, ema75: null, volAvg: null };
+        return { ema20: null, ema75: null, volAvg: null, vwap };
     }
 
     const daily = [...bundle.daily];
@@ -128,6 +135,7 @@ function computeEmasFromBundle(bundle, ltp) {
         ema20: calculateEMA(daily, 20),
         ema75: calculateEMA(daily, 75),
         volAvg: calculateVolumeAverage(bundle.daily, 20),
+        vwap,
     };
 }
 
