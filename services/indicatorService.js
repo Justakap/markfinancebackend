@@ -157,6 +157,64 @@ function calculateVolumeAverage(candles = [], period = 20) {
     return Math.round(volumes.reduce((sum, volume) => sum + volume, 0) / volumes.length);
 }
 
+function calculateVWAP(candles = [], ltp = null, nowMs = Date.now()) {
+    if (!Array.isArray(candles) || !candles.length) return null;
+
+    const lastTimestamp = new Date(candles[candles.length - 1]?.timestamp).getTime();
+    if (!Number.isFinite(lastTimestamp)) return null;
+
+    const sessionDate = new Date(lastTimestamp).toDateString();
+    const sessionCandles = candles
+        .filter((candle) => new Date(candle.timestamp).toDateString() === sessionDate)
+        .map((candle) => ({
+            ...candle,
+            open: Number(candle.open),
+            high: Number(candle.high),
+            low: Number(candle.low),
+            close: Number(candle.close),
+            volume: Number(candle.volume || 0),
+        }))
+        .filter(
+            (candle) =>
+                Number.isFinite(candle.close) &&
+                Number.isFinite(candle.volume) &&
+                candle.volume > 0,
+        );
+
+    if (!sessionCandles.length) return null;
+
+    const referenceMs = Number.isFinite(Number(nowMs)) ? Number(nowMs) : Date.now();
+    const currentSessionDate = new Date(referenceMs).toDateString();
+    if (
+        currentSessionDate === sessionDate &&
+        Number.isFinite(Number(ltp)) &&
+        Number(ltp) > 0
+    ) {
+        const last = sessionCandles[sessionCandles.length - 1];
+        sessionCandles[sessionCandles.length - 1] = {
+            ...last,
+            close: Number(ltp),
+            high: Number.isFinite(last.high) ? Math.max(last.high, Number(ltp)) : Number(ltp),
+            low: Number.isFinite(last.low) ? Math.min(last.low, Number(ltp)) : Number(ltp),
+        };
+    }
+
+    let totalPriceVolume = 0;
+    let totalVolume = 0;
+
+    sessionCandles.forEach((candle) => {
+        const high = Number.isFinite(candle.high) ? candle.high : candle.close;
+        const low = Number.isFinite(candle.low) ? candle.low : candle.close;
+        const typicalPrice = (high + low + candle.close) / 3;
+        totalPriceVolume += typicalPrice * candle.volume;
+        totalVolume += candle.volume;
+    });
+
+    if (totalVolume <= 0) return null;
+
+    return Number((totalPriceVolume / totalVolume).toFixed(2));
+}
+
 function clearIndicatorCache() {
     // no-op: indicator cache removed for live accuracy
 }
@@ -170,5 +228,6 @@ module.exports = {
     calculateSMA,
     calculateMACD,
     calculateVolumeAverage,
+    calculateVWAP,
     clearIndicatorCache,
 };
