@@ -1,7 +1,17 @@
 const axios = require("axios");
+const { enqueue } = require("../utils/upstoxRequestQueue");
+const { createBoundedCache } = require("../utils/boundedCache");
 
-const peCache = new Map();
 const PE_TTL_MS = Number(process.env.UPSTOX_PE_TTL_MS || 24 * 60 * 60 * 1000);
+const PE_CACHE_MAX_SIZE = Number(process.env.UPSTOX_PE_CACHE_MAX_SIZE || 2000);
+
+/** PE ratio per instrument key. Purpose: avoid refetching Upstox fundamentals
+ *  on every watchlist refresh. TTL 24h (env-tunable), max 2000 instruments,
+ *  LRU-evicted by set() and swept in the background — never grows unbounded. */
+const peCache = createBoundedCache({
+    maxSize: PE_CACHE_MAX_SIZE,
+    ttlMs: PE_TTL_MS,
+});
 const pendingPe = new Map();
 
 function getAccessToken() {
@@ -28,15 +38,14 @@ async function fetchPeByIsin(isin) {
     const token = getAccessToken();
     if (!token || !isin) return null;
 
-    const response = await axios.get(
-        `https://api.upstox.com/v2/fundamentals/${isin}/key-ratios`,
-        {
+    const response = await enqueue(() =>
+        axios.get(`https://api.upstox.com/v2/fundamentals/${isin}/key-ratios`, {
             headers: {
                 Accept: "application/json",
                 Authorization: `Bearer ${token}`,
             },
             timeout: 15000,
-        },
+        }),
     );
 
     return parsePeValue(response.data?.data || []);
@@ -51,8 +60,8 @@ async function getPeForInstrument(instrumentKey, instrumentType = "") {
     }
 
     const cached = peCache.get(instrumentKey);
-    if (cached && Date.now() - cached.updatedAt < PE_TTL_MS) {
-        return cached.value;
+    if (cached !== undefined) {
+        return cached;
     }
 
     if (pendingPe.has(instrumentKey)) {
@@ -64,18 +73,12 @@ async function getPeForInstrument(instrumentKey, instrumentType = "") {
 
     const promise = fetchPeByIsin(isin)
         .then((value) => {
-            peCache.set(instrumentKey, {
-                value,
-                updatedAt: Date.now(),
-            });
+            peCache.set(instrumentKey, value);
             return value;
         })
         .catch((error) => {
             console.log(`PE fetch failed for ${instrumentKey}:`, error.message);
-            peCache.set(instrumentKey, {
-                value: null,
-                updatedAt: Date.now(),
-            });
+            peCache.set(instrumentKey, null);
             return null;
         })
         .finally(() => {
@@ -102,10 +105,7 @@ async function warmPeForInstruments(stocks = []) {
 
 function getCachedPe(instrumentKey) {
     const cached = peCache.get(instrumentKey);
-    if (!cached || Date.now() - cached.updatedAt >= PE_TTL_MS) {
-        return null;
-    }
-    return cached.value;
+    return cached === undefined ? null : cached;
 }
 
 module.exports = {

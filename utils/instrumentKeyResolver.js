@@ -1,5 +1,14 @@
-const invalidKeyCache = new Map();
+const { createBoundedCache } = require("./boundedCache");
+
 const INVALID_KEY_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** Instrument keys Upstox has told us are invalid/expired (e.g. expired F&O
+ *  contracts). Purpose: skip pointless repeat candle/quote requests for keys
+ *  we already know will fail. TTL 24h, max 5000 keys, LRU-evicted + swept. */
+const invalidKeyCache = createBoundedCache({
+    maxSize: Number(process.env.UPSTOX_INVALID_KEY_CACHE_MAX_SIZE || 5000),
+    ttlMs: INVALID_KEY_TTL_MS,
+});
 const loggedInvalidKeys = new Set();
 
 function getUpstoxMarketData() {
@@ -25,25 +34,13 @@ function isInvalidInstrumentMessage(message = "") {
 
 function isInstrumentKeyBlocked(instrumentKey) {
     if (!instrumentKey) return true;
-
-    const entry = invalidKeyCache.get(instrumentKey);
-    if (!entry) return false;
-
-    if (Date.now() - entry.at > INVALID_KEY_TTL_MS) {
-        invalidKeyCache.delete(instrumentKey);
-        return false;
-    }
-
-    return true;
+    return invalidKeyCache.get(instrumentKey) !== undefined;
 }
 
 function markInstrumentKeyInvalid(instrumentKey, reason = "Invalid Instrument key") {
     if (!instrumentKey) return;
 
-    invalidKeyCache.set(instrumentKey, {
-        at: Date.now(),
-        reason,
-    });
+    invalidKeyCache.set(instrumentKey, reason);
 
     if (!loggedInvalidKeys.has(instrumentKey)) {
         loggedInvalidKeys.add(instrumentKey);

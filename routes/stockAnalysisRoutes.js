@@ -1,16 +1,16 @@
 const express = require("express");
+const { validateObjectId } = require("../middleware/validateObjectId");
 
 function createStockAnalysisRoutes({
     Watchlist,
     requireAuth,
-    ownsResource,
     rateLimit,
     searchRateLimit,
     upstoxMarketData,
 }) {
     const router = express.Router();
 
-    router.get("/market-data/:watchlistId", requireAuth, async (req, res) => {
+    router.get("/market-data/:watchlistId", requireAuth, validateObjectId("watchlistId"), async (req, res) => {
         if (!rateLimit(`market:${req.ip}`, 60, 60)) {
             return res.status(429).json({
                 message: "Too many market data requests. Wait a moment and retry.",
@@ -20,12 +20,11 @@ function createStockAnalysisRoutes({
         const start = Date.now();
 
         try {
-            const watchlist = await Watchlist.findById(req.params.watchlistId);
+            const watchlist = await Watchlist.findOne({
+                _id: req.params.watchlistId,
+                userId: req.user.mongoId,
+            });
             if (!watchlist) return res.status(404).json({ message: "Watchlist not found" });
-
-            if (watchlist.userId && !ownsResource(watchlist.userId, req)) {
-                return res.status(403).json({ message: "Forbidden" });
-            }
 
             if (!watchlist.stocks?.length) {
                 return res.json({ data: [], total: 0, offset: 0, limit: 0, fromCache: true });
@@ -44,9 +43,9 @@ function createStockAnalysisRoutes({
                 responseTimeMs: Date.now() - start,
             });
         } catch (error) {
-            console.log("Market data error:", error);
+            console.error("Market data error:", error);
             return res.status(500).json({
-                message: error.message || "Failed to load market data",
+                message: "Failed to load market data",
             });
         }
     });

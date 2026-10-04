@@ -30,6 +30,11 @@ function isDatabaseConnected() {
     return mongoose.connection.readyState === 1;
 }
 
+async function disconnectDatabase() {
+    if (mongoose.connection.readyState === 0) return;
+    await mongoose.disconnect();
+}
+
 function requireDatabase(req, res, next) {
     if (!isDatabaseConnected()) {
         return res.status(503).json({
@@ -43,6 +48,7 @@ function requireDatabase(req, res, next) {
 
 module.exports = {
     connectDatabase,
+    disconnectDatabase,
     isDatabaseConnected,
     requireDatabase,
     getMongoUri,

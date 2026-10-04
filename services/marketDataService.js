@@ -4,6 +4,7 @@ const path = require("path");
 const protobuf = require("protobufjs");
 const WebSocket = require("ws");
 const zlib = require("zlib");
+const { enqueue } = require("../utils/upstoxRequestQueue");
 const {
     loadInstrumentBundle,
     getCachedBundle,
@@ -16,17 +17,34 @@ const {
     getPeForInstrument,
     warmPeForInstruments,
 } = require("./fundamentalService");
+const { createBoundedCache } = require("../utils/boundedCache");
 
 const INSTRUMENT_MASTER_URL =
     process.env.UPSTOX_INSTRUMENT_MASTER_URL ||
     "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz";
 
+// liveData: latest tick (ltp/volume/change/etc) per instrument key, fed by the
+// Upstox WS feed and the REST LTP-poll fallback. indicatorSnapshot: latest
+// computed indicators (RSI/EMA/etc) per instrument key. Both are pruned the
+// moment an instrument is unsubscribed (see subscribe()) and additionally
+// capped by pruneLiveDataIfOversized() as a defensive backstop — neither has
+// a TTL because they represent "current" state for actively subscribed
+// instruments, not a lookup cache.
 const liveData = new Map();
 const indicatorSnapshot = new Map();
+const LIVE_DATA_MAX_SIZE = Number(process.env.UPSTOX_LIVE_DATA_MAX_SIZE || 3000);
 const subscribedInstruments = new Set();
 const instrumentMeta = new Map();
-const searchResultCache = new Map();
 const SEARCH_CACHE_TTL_MS = 30 * 1000;
+
+/** Instrument search results keyed by normalized query string. Purpose: avoid
+ *  re-scanning the full instrument master on every keystroke of a debounced
+ *  search box. TTL 30s, max 500 distinct queries, LRU-evicted + swept —
+ *  reachable without auth (search is public), so it's capped defensively. */
+const searchResultCache = createBoundedCache({
+    maxSize: Number(process.env.UPSTOX_SEARCH_CACHE_MAX_SIZE || 500),
+    ttlMs: SEARCH_CACHE_TTL_MS,
+});
 const INDICATOR_REFRESH_MS = Number(
     process.env.UPSTOX_INDICATOR_REFRESH_MS || 15 * 1000,
 );
@@ -241,8 +259,8 @@ async function searchInstruments(query) {
 
     const cacheKey = q;
     const cached = searchResultCache.get(cacheKey);
-    if (cached && Date.now() - cached.updatedAt < SEARCH_CACHE_TTL_MS) {
-        return cached.results;
+    if (cached !== undefined) {
+        return cached;
     }
 
     const matchInstruments = (instruments = []) =>
@@ -269,10 +287,7 @@ async function searchInstruments(query) {
 
     const results = rankSearchResults(matched, q);
 
-    searchResultCache.set(cacheKey, {
-        results,
-        updatedAt: Date.now(),
-    });
+    searchResultCache.set(cacheKey, results);
 
     return results;
 }
@@ -836,10 +851,29 @@ function scheduleRealtimeIndicatorRefresh(instrumentKey) {
     pendingRealtimeIndicatorTimers.set(instrumentKey, timer);
 }
 
+/** Defensive backstop: liveData/indicatorSnapshot should only ever hold
+ *  currently-subscribed instruments (subscribe() prunes on unsubscribe), so
+ *  this should normally be a no-op. Guards against drift if a caller ever
+ *  populates these maps outside the subscribe lifecycle. */
+function pruneLiveDataIfOversized() {
+    [liveData, indicatorSnapshot].forEach((map) => {
+        if (map.size <= LIVE_DATA_MAX_SIZE) return;
+
+        for (const key of map.keys()) {
+            if (!subscribedInstruments.has(key)) {
+                map.delete(key);
+                if (map.size <= LIVE_DATA_MAX_SIZE) break;
+            }
+        }
+    });
+}
+
 function startIndicatorRefreshLoop() {
     if (indicatorTimer) return;
 
     indicatorTimer = setInterval(async () => {
+        pruneLiveDataIfOversized();
+
         const keys = [...subscribedInstruments];
         if (!keys.length) return;
 
@@ -1154,15 +1188,17 @@ async function warmLiveQuotes(instrumentKeys = []) {
         const query = chunk.map((key) => encodeURIComponent(key)).join(",");
 
         try {
-            const response = await axios.get(
-                `https://api.upstox.com/v3/market-quote/ltp?instrument_key=${query}`,
-                {
-                    headers: {
-                        Accept: "application/json",
-                        Authorization: `Bearer ${token}`,
+            const response = await enqueue(() =>
+                axios.get(
+                    `https://api.upstox.com/v3/market-quote/ltp?instrument_key=${query}`,
+                    {
+                        headers: {
+                            Accept: "application/json",
+                            Authorization: `Bearer ${token}`,
+                        },
+                        timeout: 15000,
                     },
-                    timeout: 15000,
-                },
+                ),
             );
 
             const quotes = response.data?.data || {};
@@ -1339,7 +1375,13 @@ function subscribe(instrumentKeys = []) {
         );
 
         toSubscribe.forEach((key) => subscribedInstruments.add(key));
-        toUnsubscribe.forEach((key) => subscribedInstruments.delete(key));
+        toUnsubscribe.forEach((key) => {
+            subscribedInstruments.delete(key);
+            // Nobody is watching this instrument anymore — drop its live state
+            // so liveData/indicatorSnapshot don't grow forever as watchlists change.
+            liveData.delete(key);
+            indicatorSnapshot.delete(key);
+        });
 
         connectFeed();
         sendGroupedSubscriptions(toSubscribe, "sub");
@@ -1366,8 +1408,42 @@ function init(socketIo) {
     connectFeed();
 }
 
+/** Stop all background timers/sockets so the process can exit cleanly on SIGTERM/SIGINT. */
+function shutdown() {
+    if (indicatorTimer) {
+        clearInterval(indicatorTimer);
+        indicatorTimer = null;
+    }
+
+    if (ltpPollTimer) {
+        clearInterval(ltpPollTimer);
+        ltpPollTimer = null;
+    }
+
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+
+    pendingRealtimeIndicatorTimers.forEach((timer) => clearTimeout(timer));
+    pendingRealtimeIndicatorTimers.clear();
+
+    if (ws) {
+        try {
+            ws.removeAllListeners();
+            ws.close();
+        } catch {
+            // best-effort close during shutdown
+        }
+        ws = null;
+    }
+
+    io = null;
+}
+
 module.exports = {
     init,
+    shutdown,
     liveData,
     subscribedInstruments,
     searchInstruments,
