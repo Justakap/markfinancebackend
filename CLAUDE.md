@@ -53,7 +53,7 @@ Express API + Socket.IO server. The frontend lives in a separate repository,
 ## Production
 
 - Frontend: https://markfinance.netlify.app
-- Backend: https://markfinancebackend.onrender.com (Render free tier — expect
+- Backend: https://markfinancebackend1.onrender.com (Render free tier — expect
   a ~20-30s cold start after idle; this is a platform characteristic, not a
   bug)
 
@@ -259,7 +259,7 @@ No separate lint script is configured in this repo.
 ## Deployment
 
 - **Backend → Render**, auto-deploys from this repository's `main` branch
-  (service at https://markfinancebackend.onrender.com). This repository does
+  (service at https://markfinancebackend1.onrender.com). This repository does
   not control the frontend's Netlify deployment.
 - Render env vars (Mongo URI, JWT secret, Upstox token, CORS overrides) are
   configured in the Render dashboard, not in this repo.
@@ -341,6 +341,37 @@ IDOR fixes, CORS/Socket.IO origin restriction, debug-endpoint removal/gating,
 Helmet, auth/backtest/write rate limiting, centralized error handling,
 Upstox 429 retry/backoff/jitter/Retry-After, graceful shutdown, dead-code
 removal (`Stock` model, `/api/seed-stocks`, unused `User.password`).
+
+### 2026-10-05 (later) — Fixed missing option Greeks in watchlist data
+
+Diagnosed and fixed a real bug (unrelated to the hardening pass above,
+pre-existing since 2026-07-07): `buildQuickRow()` in
+`services/marketDataService.js` — the row builder behind
+`GET /api/market-data/:watchlistId`, the only data source for `StockTable`
+and `GreekTable` on the frontend — never read or returned
+`delta`/`gamma`/`theta`/`vega`/`iv`/`oi`/`oiChange`/`optionPremium`, even
+though those values already existed on `liveData`/`indicatorSnapshot`.
+Added the 8 missing fields with the same live-then-snapshot-then-null
+precedence already used for the other fields in that function. Purely
+additive, no other logic touched. Verified: `oi`/`oiChange` now surface
+real numeric values (sourced from candle data, independent of the Upstox
+WS feed); `delta`/`gamma`/`theta`/`vega`/`iv` correctly stay `null` while
+the separate Upstox WebSocket-connection issue (see below) is unresolved,
+since those five fields have no other data source in this codebase.
+
+**Also corrected:** production backend URL is
+`https://markfinancebackend1.onrender.com`, not
+`https://markfinancebackend.onrender.com` (both were found to serve
+identical code/data at diagnosis time, but only the `1` URL is the
+intended one — the frontend's `netlify.toml` was pointing at the wrong
+one and has been corrected).
+
+**Still open:** the Upstox WebSocket feed fails to connect in production
+(`marketStatus` stays `"Upstox Live (REST)"`; a local repro showed
+`Unexpected server response: 403` on the feed authorize/connect). Not
+fixed in this pass — needs Render log access or further Upstox-side
+investigation to confirm the exact cause before touching
+`connectFeed()`/`authorizeFeed()`.
 
 **Update this section whenever a future session makes a major
 architectural or security change — don't let it go stale.**
