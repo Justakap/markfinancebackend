@@ -1289,6 +1289,14 @@ function buildQuickRow(stock) {
         prevHourlyRsi: cachedIndicators?.prevHourlyRsi ?? snapshot.prevHourlyRsi ?? null,
         hourlyRsiChange: cachedIndicators?.hourlyRsiChange ?? snapshot.hourlyRsiChange ?? null,
         pe: snapshot.pe ?? getCachedPe(instrumentKey) ?? stock.trailingPE ?? null,
+        delta: Number.isFinite(Number(live.delta)) ? Number(live.delta) : snapshot.delta ?? null,
+        gamma: Number.isFinite(Number(live.gamma)) ? Number(live.gamma) : snapshot.gamma ?? null,
+        theta: Number.isFinite(Number(live.theta)) ? Number(live.theta) : snapshot.theta ?? null,
+        vega: Number.isFinite(Number(live.vega)) ? Number(live.vega) : snapshot.vega ?? null,
+        iv: Number.isFinite(Number(live.iv)) ? Number(live.iv) : snapshot.iv ?? null,
+        oi: Number.isFinite(Number(live.oi)) ? Number(live.oi) : snapshot.oi ?? null,
+        oiChange: snapshot.oiChange ?? null,
+        optionPremium: liveLtp,
     };
 }
 
