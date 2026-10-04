@@ -287,15 +287,21 @@ No separate lint script is configured in this repo.
 
 ## Current Technical Debt
 
-- **`app.js` is a large single file** (routes + bootstrap). A module split
-  (auth/watchlist/strategy/backtest/market-data routers + a bootstrap file)
-  was deliberately deferred as a high-diff, high-regression-risk refactor
-  relative to the security/reliability work that was prioritized. Do it
-  carefully, one route group at a time, with tests passing after each step,
-  if you take it on.
-- **`marketDataService.js` is a large single file** (WS client + REST polling
-  + indicator computation + caching + subscription management). Same
-  reasoning as above — not split yet.
+- **`app.js` has been split** into `routes/authRoutes.js`,
+  `routes/debugRoutes.js`, `routes/strategyRoutes.js`,
+  `routes/watchlistRoutes.js`, `routes/backtestRoutes.js`,
+  `routes/dashboardRoutes.js` (plus the pre-existing
+  `routes/stockAnalysisRoutes.js`) and `middleware/rateLimiters.js`. `app.js`
+  is now ~254 lines: Express/Helmet/CORS/JSON setup, mounting each router,
+  error handlers, and the `startServer`/graceful-shutdown bootstrap. All
+  route modules follow the dependency-injection factory pattern
+  (`createXRoutes({ ...deps })`) `stockAnalysisRoutes.js` already used —
+  keep using that pattern for any new router.
+- **`marketDataService.js` is still a large single file** (WS client + REST
+  polling + indicator computation + caching + subscription management). Not
+  split — higher risk/lower payoff than the `app.js` split since its
+  functions are more interdependent (shared module-level state like
+  `liveData`/`indicatorSnapshot`/`subscribedInstruments`).
 - **In-memory caches are per-process.** If this is ever scaled to multiple
   backend instances, `upstoxRequestQueue`, `boundedCache`-based caches, and
   `liveData`/`indicatorSnapshot` all need a shared store (e.g. Redis) — not
@@ -372,6 +378,19 @@ one and has been corrected).
 fixed in this pass — needs Render log access or further Upstox-side
 investigation to confirm the exact cause before touching
 `connectFeed()`/`authorizeFeed()`.
+
+### 2026-10-05 (later still) — Split app.js; fixed null-coerced-to-zero display bugs
+
+- Split `app.js` into per-domain route modules (see Current Technical Debt
+  above for the file list). Pure reorganization, verified with a full live
+  regression of every route (CRUD, IDOR, malformed-ID, auth gating,
+  strategy run, backtest run) against a local server before committing —
+  no behavior change.
+- (Frontend) Fixed a bug class where `Number(null) === 0` caused several
+  UI fields to render a misleading "0"/"Below"/wrong-trend instead of "--"
+  when quote data was genuinely missing (not this repo, but noting it here
+  since it was found while verifying the Greeks fix) — see the frontend
+  repo's `CLAUDE.md` change history for details.
 
 **Update this section whenever a future session makes a major
 architectural or security change — don't let it go stale.**
