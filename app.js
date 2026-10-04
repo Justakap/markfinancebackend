@@ -1,16 +1,25 @@
 const express = require("express");
+const mongoose = require("mongoose");
 const cors = require("cors");
+const helmet = require("helmet");
+const expressRateLimit = require("express-rate-limit");
 require("dotenv").config();
 
-const Stock = require("./models/Stock");
 const Watchlist = require("./models/Watchlist");
 const User = require("./models/User");
 const Strategy = require("./models/Strategy");
 const Backtest = require("./models/Backtest");
 const jwt = require("jsonwebtoken");
 const { requireAuth } = require("./middleware/auth");
+const { validateObjectId } = require("./middleware/validateObjectId");
 const { getJwtSecret } = require("./config/jwt");
-const { connectDatabase, isDatabaseConnected } = require("./config/database");
+const { isOriginAllowed } = require("./config/cors");
+const { notFoundHandler, errorHandler } = require("./middleware/errorHandler");
+const {
+    connectDatabase,
+    disconnectDatabase,
+    isDatabaseConnected,
+} = require("./config/database");
 const { requireDatabase } = require("./middleware/dbReady");
 const {
     runBacktestSimulation,
@@ -34,10 +43,6 @@ const VALIDATION_MODE =
     process.env.ENABLE_VALIDATION_MODE === "true" ||
     process.env.NODE_ENV !== "production";
 
-function ownsResource(ownerId, req) {
-    return String(ownerId) === String(req.user.mongoId);
-}
-
 try {
     getJwtSecret();
 } catch (error) {
@@ -47,11 +52,33 @@ try {
 
 const app = express();
 
-app.use(cors());
+app.set("trust proxy", 1);
+
+app.use(
+    helmet({
+        // Pure JSON API — no HTML pages to protect with a CSP, and a default CSP can
+        // confuse API clients/tools for no benefit here.
+        contentSecurityPolicy: false,
+        // The frontend lives on a different origin (Netlify); must not block cross-origin fetches.
+        crossOriginResourcePolicy: { policy: "cross-origin" },
+    }),
+);
+
+app.use(
+    cors({
+        origin(origin, callback) {
+            if (isOriginAllowed(origin)) return callback(null, true);
+            return callback(new Error("Not allowed by CORS"));
+        },
+    }),
+);
+
 app.use(express.json());
 
-// Simple rate limiter per IP (very basic)
+// Simple rate limiter per IP (used by search/market-data routes which need a high, debounce-friendly ceiling).
 const rateMap = new Map();
+const RATE_ENTRY_MAX_AGE_MS = 10 * 60 * 1000;
+
 function rateLimit(ip, limit = 20, windowSec = 60) {
     const now = Date.now();
     const entry = rateMap.get(ip) || { count: 0, start: now };
@@ -64,10 +91,48 @@ function rateLimit(ip, limit = 20, windowSec = 60) {
     return entry.count <= limit;
 }
 
+// Stale IP entries must not grow the map forever.
+const rateMapCleanup = setInterval(() => {
+    const now = Date.now();
+    for (const [key, entry] of rateMap) {
+        if (now - entry.start > RATE_ENTRY_MAX_AGE_MS) {
+            rateMap.delete(key);
+        }
+    }
+}, 5 * 60 * 1000);
+rateMapCleanup.unref();
+
 // Search is local (instrument master cache) — allow frequent debounced typing
 function searchRateLimit(ip, limit = 120, windowSec = 60) {
     return rateLimit(`search:${ip}`, limit, windowSec);
 }
+
+// express-rate-limit (self-expiring store) for sensitive/expensive endpoints.
+const authLimiter = expressRateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 20,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { success: false, message: "Too many login attempts. Try again later." },
+});
+
+const backtestLimiter = expressRateLimit({
+    windowMs: 60 * 1000,
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { message: "Too many backtest requests. Wait a moment and retry." },
+});
+
+// Generous safety net on all other mutating /api requests — not meant to bother normal usage.
+const writeLimiter = expressRateLimit({
+    windowMs: 60 * 1000,
+    max: 60,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { message: "Too many requests. Please slow down." },
+    skip: (req) => req.method === "GET",
+});
 
 app.get("/", (req, res) => {
     res.send("Share Analysis MK API Running");
@@ -81,141 +146,90 @@ app.get("/api/health", (req, res) => {
 });
 
 app.use("/api", requireDatabase);
+app.use("/api", writeLimiter);
 app.use(
     "/api",
     createStockAnalysisRoutes({
         Watchlist,
         requireAuth,
-        ownsResource,
         rateLimit,
         searchRateLimit,
         upstoxMarketData,
     }),
 );
 
-//market mapper
-
-
-function getMarket(exchange) {
-    switch (exchange) {
-        case "NSI":
-            return "NSE";
-
-        case "BSE":
-            return "BSE";
-
-        case "NMS":
-            return "NASDAQ";
-
-        case "NYQ":
-            return "NYSE";
-
-        case "DJI":
-            return "DOW JONES";
-
-        case "CCY":
-        case "CCC":
-            return "CRYPTO";
-
-        default:
-            return exchange || "UNKNOWN";
-    }
-}
-
-
 async function resolveInstrumentKey(symbol, instrumentKey) {
     return resolveUpstoxInstrumentKey(symbol, instrumentKey);
 }
 
-
 // run strategy
 
-app.post(
-    "/api/strategies/run",
-    requireAuth,
-    async (req, res) => {
-        if (!rateLimit(req.ip, 20, 60)) {
-            return res.status(429).json({
-                message: "Too many scan requests. Wait a moment and retry.",
-            });
-        }
-        try {
-            const {
-                strategyId,
-                watchlistId,
-            } = req.body;
-
-            const strategy =
-                await Strategy.findById(
-                    strategyId
-                );
-
-            const watchlist =
-                await Watchlist.findById(
-                    watchlistId
-                );
-
-            if (!strategy) {
-                return res.status(404).json({
-                    message:
-                        "Strategy not found",
-                });
-            }
-
-            if (!watchlist) {
-                return res.status(404).json({
-                    message:
-                        "Watchlist not found",
-                });
-            }
-
-            if (strategy.userId && !ownsResource(strategy.userId, req)) {
-                return res.status(403).json({ message: "Forbidden" });
-            }
-
-            if (watchlist.userId && !ownsResource(watchlist.userId, req)) {
-                return res.status(403).json({ message: "Forbidden" });
-            }
-
-            const scanResult = await runStrategyScan(strategy, watchlist);
-            recordScanTime(scanResult.scanTimeMs);
-
-            if (!scanResult.evaluated && scanResult.skipped?.length) {
-                return res.status(400).json({
-                    message:
-                        "No valid Upstox instrument keys on this watchlist. Remove expired F&O contracts and re-add symbols from search.",
-                    skipped: scanResult.skipped,
-                });
-            }
-
-            return res.json({
-                strategy: strategy.name,
-                matched: scanResult.matches.length,
-                matches: scanResult.matches,
-                scanMode: scanResult.scanMode,
-                scanTimeMs: scanResult.scanTimeMs,
-                dataSource: scanResult.dataSource,
-                skipped: scanResult.skipped || [],
-                evaluated: scanResult.evaluated,
-            });
-        } catch (error) {
-            console.log(error);
-
-            return res.status(500).json({
-                message:
-                    "Failed to run strategy",
-            });
-        }
+app.post("/api/strategies/run", requireAuth, async (req, res) => {
+    if (!rateLimit(req.ip, 20, 60)) {
+        return res.status(429).json({
+            message: "Too many scan requests. Wait a moment and retry.",
+        });
     }
-);
+    try {
+        const { strategyId, watchlistId } = req.body;
 
+        if (!mongoose.Types.ObjectId.isValid(strategyId) || !mongoose.Types.ObjectId.isValid(watchlistId)) {
+            return res.status(400).json({ message: "Invalid identifier" });
+        }
 
+        const strategy = await Strategy.findOne({
+            _id: strategyId,
+            userId: req.user.mongoId,
+        });
 
+        const watchlist = await Watchlist.findOne({
+            _id: watchlistId,
+            userId: req.user.mongoId,
+        });
 
+        if (!strategy) {
+            return res.status(404).json({ message: "Strategy not found" });
+        }
 
+        if (!watchlist) {
+            return res.status(404).json({ message: "Watchlist not found" });
+        }
 
+        const scanResult = await runStrategyScan(strategy, watchlist);
+        recordScanTime(scanResult.scanTimeMs);
 
-app.get("/api/debug/:symbol", async (req, res) => {
+        if (!scanResult.evaluated && scanResult.skipped?.length) {
+            return res.status(400).json({
+                message:
+                    "No valid Upstox instrument keys on this watchlist. Remove expired F&O contracts and re-add symbols from search.",
+                skipped: scanResult.skipped,
+            });
+        }
+
+        return res.json({
+            strategy: strategy.name,
+            matched: scanResult.matches.length,
+            matches: scanResult.matches,
+            scanMode: scanResult.scanMode,
+            scanTimeMs: scanResult.scanTimeMs,
+            dataSource: scanResult.dataSource,
+            skipped: scanResult.skipped || [],
+            evaluated: scanResult.evaluated,
+        });
+    } catch (error) {
+        console.error("Strategy run error:", error);
+        return res.status(500).json({ message: "Failed to run strategy" });
+    }
+});
+
+// Debug/diagnostic endpoints — require auth and are only enabled when VALIDATION_MODE is on
+// (off by default in production unless ENABLE_VALIDATION_MODE=true). They must never be
+// reachable anonymously in production.
+app.get("/api/debug/:symbol", requireAuth, async (req, res) => {
+    if (!VALIDATION_MODE) {
+        return res.status(403).json({ message: "Debug endpoints disabled" });
+    }
+
     try {
         const instrumentKey = await resolveInstrumentKey(req.params.symbol);
         if (!instrumentKey) {
@@ -250,13 +264,12 @@ app.get("/api/debug/:symbol", async (req, res) => {
             dataSource: "upstox",
         });
     } catch (error) {
-        res.status(500).json({
-            message: error.message,
-        });
+        console.error("Debug endpoint error:", error);
+        res.status(500).json({ message: "Failed to load debug data" });
     }
 });
 
-app.get("/api/validation/indicators", async (req, res) => {
+app.get("/api/validation/indicators", requireAuth, async (req, res) => {
     if (!VALIDATION_MODE) {
         return res.status(403).json({ message: "Validation mode disabled" });
     }
@@ -265,11 +278,12 @@ app.get("/api/validation/indicators", async (req, res) => {
         const report = await runIndicatorValidation();
         res.json(report);
     } catch (error) {
-        res.status(500).json({ message: error.message });
+        console.error("Validation indicators error:", error);
+        res.status(500).json({ message: "Validation failed" });
     }
 });
 
-app.get("/api/validation/debug/:symbol", async (req, res) => {
+app.get("/api/validation/debug/:symbol", requireAuth, async (req, res) => {
     if (!VALIDATION_MODE) {
         return res.status(403).json({ message: "Validation mode disabled" });
     }
@@ -291,31 +305,34 @@ app.get("/api/validation/debug/:symbol", async (req, res) => {
             : null;
         res.json({ symbol: req.params.symbol, rawData: data, dataSource: "upstox" });
     } catch (error) {
-        res.status(500).json({ message: error.message });
+        console.error("Validation debug error:", error);
+        res.status(500).json({ message: "Validation failed" });
     }
 });
 
+// google login
 
-// google login 
-
-
-
-app.post("/api/auth/google", async (req, res) => {
+app.post("/api/auth/google", authLimiter, async (req, res) => {
     try {
         const { uid, name, email, photoURL } = req.body;
 
-        if (!uid || !email) {
+        if (typeof uid !== "string" || typeof email !== "string" || !uid || !email) {
             return res.status(400).json({
                 success: false,
                 message: "Google uid and email are required",
             });
         }
 
+        if (name != null && typeof name !== "string") {
+            return res.status(400).json({ success: false, message: "Invalid name" });
+        }
+
+        if (photoURL != null && typeof photoURL !== "string") {
+            return res.status(400).json({ success: false, message: "Invalid photoURL" });
+        }
+
         let user = await User.findOne({
-            $or: [
-                { googleId: uid },
-                { email },
-            ],
+            $or: [{ googleId: uid }, { email }],
         });
 
         let isNewUser = false;
@@ -368,59 +385,20 @@ app.post("/api/auth/google", async (req, res) => {
             token,
         });
     } catch (error) {
-        console.log(error);
-
+        console.error("Google auth error:", error);
         res.status(500).json({
             success: false,
-            message: error.message,
+            message: "Authentication failed",
         });
     }
 });
 
-
-app.get("/test", async (req, res) => {
-    try {
-        const instrumentKey = await resolveInstrumentKey("TCS");
-        if (!instrumentKey) {
-            return res.status(404).json({ message: "TCS not found on Upstox" });
-        }
-
-        const result = await upstoxMarketData.getRowsForWatchlist({
-            stocks: [{ symbol: "TCS", instrumentKey, name: "TCS" }],
-        });
-
-        res.json(result.data[0] || null);
-    } catch (error) {
-        console.log(error);
-
-        res.status(500).json({
-            message: error.message,
-        });
-    }
-});
-
-
-
-
-
-
-// Stratergy 
+// Strategy
 
 app.post("/api/strategies", requireAuth, async (req, res) => {
     try {
-        const {
-            name,
-            description,
-
-            entryConditions,
-            exitConditions,
-
-            stopLoss,
-            target,
-
-            logic,
-            alertEnabled,
-        } = req.body;
+        const { name, description, entryConditions, exitConditions, stopLoss, target, logic, alertEnabled } =
+            req.body;
 
         if (!name || !name.trim()) return res.status(400).json({ message: "Strategy name required" });
 
@@ -428,20 +406,17 @@ app.post("/api/strategies", requireAuth, async (req, res) => {
             userId: req.user.mongoId,
             name,
             description,
-
             entryConditions,
             exitConditions,
-
             stopLoss,
             target,
-
             logic,
             alertEnabled,
         });
 
         res.status(201).json(strategy);
     } catch (error) {
-        console.error(error);
+        console.error("Create strategy error:", error);
         res.status(500).json({ message: "Failed to create strategy" });
     }
 });
@@ -450,31 +425,31 @@ app.get("/api/strategies/:userId", requireAuth, async (req, res) => {
     try {
         if (req.user.mongoId !== req.params.userId) return res.status(403).json({ message: "Forbidden" });
 
-        const strategies = await Strategy.find({ userId: req.params.userId }).sort({ createdAt: -1 });
+        const strategies = await Strategy.find({ userId: req.user.mongoId }).sort({ createdAt: -1 });
 
         res.json(strategies);
     } catch (error) {
-        console.error(error);
+        console.error("List strategies error:", error);
         res.status(500).json({ message: "Failed to fetch strategies" });
     }
 });
 
-
-
-app.put("/api/strategies/:id", requireAuth, async (req, res) => {
+app.put("/api/strategies/:id", requireAuth, validateObjectId("id"), async (req, res) => {
     try {
-        const strategy = await Strategy.findById(req.params.id);
-        if (!strategy) return res.status(404).json({ message: "Strategy not found" });
-        if (strategy.userId.toString() !== req.user.mongoId) return res.status(403).json({ message: "Forbidden" });
+        const strategy = await Strategy.findOneAndUpdate(
+            { _id: req.params.id, userId: req.user.mongoId },
+            req.body,
+            { returnDocument: "after" },
+        );
 
-        const updated = await Strategy.findByIdAndUpdate(req.params.id, req.body, { new: true });
-        res.json(updated);
+        if (!strategy) return res.status(404).json({ message: "Strategy not found" });
+
+        res.json(strategy);
     } catch (error) {
-        console.error(error);
+        console.error("Update strategy error:", error);
         res.status(500).json({ message: "Failed to update strategy" });
     }
 });
-
 
 app.post("/api/strategies/seed-samples", requireAuth, async (req, res) => {
     try {
@@ -509,89 +484,35 @@ app.post("/api/strategies/seed-samples", requireAuth, async (req, res) => {
             existing,
         });
     } catch (error) {
-        console.error(error);
+        console.error("Seed sample strategies error:", error);
         res.status(500).json({ message: "Failed to seed sample strategies" });
     }
 });
 
-app.delete("/api/strategies/:id", requireAuth, async (req, res) => {
+app.delete("/api/strategies/:id", requireAuth, validateObjectId("id"), async (req, res) => {
     try {
-        const strategy = await Strategy.findById(req.params.id);
-        if (!strategy) return res.status(404).json({ message: "Strategy not found" });
-        if (strategy.userId.toString() !== req.user.mongoId) return res.status(403).json({ message: "Forbidden" });
+        const strategy = await Strategy.findOneAndDelete({
+            _id: req.params.id,
+            userId: req.user.mongoId,
+        });
 
-        await Strategy.findByIdAndDelete(req.params.id);
+        if (!strategy) return res.status(404).json({ message: "Strategy not found" });
 
         res.json({ success: true, message: "Strategy deleted" });
     } catch (error) {
-        console.error(error);
+        console.error("Delete strategy error:", error);
         res.status(500).json({ message: "Failed to delete strategy" });
     }
 });
 
-
-
-
-
-
-
-// =======================
-// Seed Stocks
-// =======================
-
-app.post("/api/seed-stocks", async (req, res) => {
+app.post("/api/watchlists/:id/refresh-fundamentals", requireAuth, validateObjectId("id"), async (req, res) => {
     try {
-
-        await Stock.insertMany([
-            {
-                symbol: "TCS.NS",
-                name: "Tata Consultancy Services",
-                exchange: "NSE"
-            },
-            {
-                symbol: "INFY.NS",
-                name: "Infosys",
-                exchange: "NSE"
-            },
-            {
-                symbol: "RELIANCE.NS",
-                name: "Reliance Industries",
-                exchange: "NSE"
-            },
-            {
-                symbol: "HDFCBANK.NS",
-                name: "HDFC Bank",
-                exchange: "NSE"
-            },
-            {
-                symbol: "SBIN.NS",
-                name: "State Bank of India",
-                exchange: "NSE"
-            }
-        ]);
-
-        res.json({
-            message: "Stocks Seeded"
+        const watchlist = await Watchlist.findOne({
+            _id: req.params.id,
+            userId: req.user.mongoId,
         });
-
-    } catch (error) {
-        res.status(500).json({
-            message: error.message
-        });
-    }
-});
-
-
-
-
-
-
-app.post("/api/watchlists/:id/refresh-fundamentals", requireAuth, async (req, res) => {
-    try {
-        const watchlist = await Watchlist.findById(req.params.id);
 
         if (!watchlist) return res.status(404).json({ message: "Watchlist not found" });
-        if (watchlist.userId && watchlist.userId.toString() !== req.user.mongoId) return res.status(403).json({ message: "Forbidden" });
 
         for (const stock of watchlist.stocks) {
             try {
@@ -608,10 +529,7 @@ app.post("/api/watchlists/:id/refresh-fundamentals", requireAuth, async (req, re
 
                 stock.updatedAt = new Date();
             } catch (err) {
-                console.log(
-                    "Failed:",
-                    stock.symbol
-                );
+                console.log("Failed:", stock.symbol);
             }
         }
 
@@ -621,20 +539,10 @@ app.post("/api/watchlists/:id/refresh-fundamentals", requireAuth, async (req, re
             message: "Fundamentals refreshed",
         });
     } catch (error) {
-        console.log(error);
-
-        res.status(500).json({
-            message: "Server Error",
-        });
+        console.error("Refresh fundamentals error:", error);
+        res.status(500).json({ message: "Server Error" });
     }
 });
-
-
-
-
-
-
-
 
 // =======================
 // Create Watchlist
@@ -649,7 +557,8 @@ app.post("/api/watchlists", requireAuth, async (req, res) => {
 
         res.status(201).json(watchlist);
     } catch (error) {
-        res.status(500).json({ message: error.message });
+        console.error("Create watchlist error:", error);
+        res.status(500).json({ message: "Failed to create watchlist" });
     }
 });
 
@@ -658,16 +567,11 @@ app.post("/api/watchlists", requireAuth, async (req, res) => {
 // =======================
 app.get("/api/watchlists", requireAuth, async (req, res) => {
     try {
-        const { userId } = req.query;
-        if (!userId) return res.json([]);
-        if (req.user.mongoId !== userId) return res.status(403).json({ message: "Forbidden" });
-
-        const watchlists = await Watchlist.find({ userId }).sort({ createdAt: -1 });
+        const watchlists = await Watchlist.find({ userId: req.user.mongoId }).sort({ createdAt: -1 });
         res.json(watchlists);
     } catch (error) {
-        console.log("WATCHLIST ERROR:");
-        console.log(error);
-        res.status(500).json({ message: error.message });
+        console.error("List watchlists error:", error);
+        res.status(500).json({ message: "Failed to fetch watchlists" });
     }
 });
 
@@ -675,65 +579,66 @@ app.get("/api/watchlists", requireAuth, async (req, res) => {
 // Get Single Watchlist
 // =======================
 
-app.get("/api/watchlists/:id", requireAuth, async (req, res) => {
+app.get("/api/watchlists/:id", requireAuth, validateObjectId("id"), async (req, res) => {
     try {
-        const watchlist = await Watchlist.findById(req.params.id);
+        const watchlist = await Watchlist.findOne({ _id: req.params.id, userId: req.user.mongoId });
         if (!watchlist) return res.status(404).json({ message: "Watchlist not found" });
-        if (watchlist.userId && watchlist.userId.toString() !== req.user.mongoId) return res.status(403).json({ message: "Forbidden" });
         res.json(watchlist);
     } catch (error) {
-        res.status(500).json({ message: error.message });
+        console.error("Get watchlist error:", error);
+        res.status(500).json({ message: "Failed to fetch watchlist" });
     }
 });
-
 
 // =======================
 // Rename Watchlist
 // =======================
 
-app.put("/api/watchlists/:id", requireAuth, async (req, res) => {
+app.put("/api/watchlists/:id", requireAuth, validateObjectId("id"), async (req, res) => {
     try {
         const { name } = req.body;
         if (!name || !name.trim()) return res.status(400).json({ message: "Watchlist name required" });
 
-        const watchlist = await Watchlist.findById(req.params.id);
-        if (!watchlist) return res.status(404).json({ message: "Watchlist not found" });
-        if (watchlist.userId && watchlist.userId.toString() !== req.user.mongoId) return res.status(403).json({ message: "Forbidden" });
+        const watchlist = await Watchlist.findOneAndUpdate(
+            { _id: req.params.id, userId: req.user.mongoId },
+            { name: name.trim() },
+            { returnDocument: "after" },
+        );
 
-        watchlist.name = name.trim();
-        await watchlist.save();
+        if (!watchlist) return res.status(404).json({ message: "Watchlist not found" });
 
         res.json(watchlist);
     } catch (error) {
-        res.status(500).json({ message: error.message });
+        console.error("Rename watchlist error:", error);
+        res.status(500).json({ message: "Failed to rename watchlist" });
     }
 });
-
 
 // =======================
 // Delete Watchlist
 // =======================
 
-app.delete("/api/watchlists/:id", requireAuth, async (req, res) => {
+app.delete("/api/watchlists/:id", requireAuth, validateObjectId("id"), async (req, res) => {
     try {
-        const watchlist = await Watchlist.findById(req.params.id);
-        if (!watchlist) return res.status(404).json({ message: "Watchlist not found" });
-        if (watchlist.userId && watchlist.userId.toString() !== req.user.mongoId) return res.status(403).json({ message: "Forbidden" });
+        const watchlist = await Watchlist.findOneAndDelete({
+            _id: req.params.id,
+            userId: req.user.mongoId,
+        });
 
-        await Watchlist.findByIdAndDelete(req.params.id);
+        if (!watchlist) return res.status(404).json({ message: "Watchlist not found" });
 
         res.json({ message: "Watchlist deleted" });
     } catch (error) {
-        res.status(500).json({ message: error.message });
+        console.error("Delete watchlist error:", error);
+        res.status(500).json({ message: "Failed to delete watchlist" });
     }
 });
-
 
 // =======================
 // Add Stock To Watchlist
 // =======================
 
-app.post("/api/watchlists/:id/stocks", requireAuth, async (req, res) => {
+app.post("/api/watchlists/:id/stocks", requireAuth, validateObjectId("id"), async (req, res) => {
     try {
         const {
             symbol,
@@ -754,9 +659,8 @@ app.post("/api/watchlists/:id/stocks", requireAuth, async (req, res) => {
             });
         }
 
-        const watchlist = await Watchlist.findById(req.params.id);
+        const watchlist = await Watchlist.findOne({ _id: req.params.id, userId: req.user.mongoId });
         if (!watchlist) return res.status(404).json({ message: "Watchlist not found" });
-        if (watchlist.userId && watchlist.userId.toString() !== req.user.mongoId) return res.status(403).json({ message: "Forbidden" });
 
         const exists = watchlist.stocks.find((stock) => stock.instrumentKey === instrumentKey);
         if (!exists) {
@@ -780,29 +684,24 @@ app.post("/api/watchlists/:id/stocks", requireAuth, async (req, res) => {
             });
 
             await watchlist.save();
-            upstoxMarketData.subscribe(
-                watchlist.stocks.map((stock) => stock.instrumentKey),
-            );
+            upstoxMarketData.subscribe(watchlist.stocks.map((stock) => stock.instrumentKey));
         }
 
         res.json(watchlist);
     } catch (error) {
-        res.status(500).json({ message: error.message });
+        console.error("Add stock error:", error);
+        res.status(500).json({ message: "Failed to add stock" });
     }
 });
-
 
 // =======================
 // Remove Stock From Watchlist
 // =======================
 
-app.delete("/api/watchlists/:id/stocks/:symbol", requireAuth, async (req, res) => {
+app.delete("/api/watchlists/:id/stocks/:symbol", requireAuth, validateObjectId("id"), async (req, res) => {
     try {
-        const watchlist = await Watchlist.findById(req.params.id);
+        const watchlist = await Watchlist.findOne({ _id: req.params.id, userId: req.user.mongoId });
         if (!watchlist) return res.status(404).json({ message: "Watchlist not found" });
-        if (watchlist.userId && watchlist.userId.toString() !== req.user.mongoId) {
-            return res.status(403).json({ message: "Forbidden" });
-        }
 
         const stockId = decodeURIComponent(req.params.symbol);
 
@@ -812,17 +711,16 @@ app.delete("/api/watchlists/:id/stocks/:symbol", requireAuth, async (req, res) =
 
         const updated = await watchlist.save();
 
-        upstoxMarketData.subscribe(
-            (updated?.stocks || []).map((stock) => stock.instrumentKey),
-        );
+        upstoxMarketData.subscribe((updated?.stocks || []).map((stock) => stock.instrumentKey));
 
         res.json(updated);
     } catch (error) {
-        res.status(500).json({ message: error.message });
+        console.error("Remove stock error:", error);
+        res.status(500).json({ message: "Failed to remove stock" });
     }
 });
 
-app.post("/api/watchlists/:id/stocks/bulk-remove", requireAuth, async (req, res) => {
+app.post("/api/watchlists/:id/stocks/bulk-remove", requireAuth, validateObjectId("id"), async (req, res) => {
     try {
         const { symbols = [] } = req.body;
 
@@ -830,45 +728,31 @@ app.post("/api/watchlists/:id/stocks/bulk-remove", requireAuth, async (req, res)
             return res.status(400).json({ message: "symbols array required" });
         }
 
-        const watchlist = await Watchlist.findById(req.params.id);
+        const watchlist = await Watchlist.findOne({ _id: req.params.id, userId: req.user.mongoId });
         if (!watchlist) return res.status(404).json({ message: "Watchlist not found" });
-        if (watchlist.userId && watchlist.userId.toString() !== req.user.mongoId) {
-            return res.status(403).json({ message: "Forbidden" });
-        }
 
         const symbolSet = new Set(symbols.map(String));
         watchlist.stocks = watchlist.stocks.filter(
-            (stock) =>
-                !symbolSet.has(stock.symbol) &&
-                !symbolSet.has(stock.instrumentKey),
+            (stock) => !symbolSet.has(stock.symbol) && !symbolSet.has(stock.instrumentKey),
         );
 
         const updated = await watchlist.save();
 
-        upstoxMarketData.subscribe(
-            (updated?.stocks || []).map((stock) => stock.instrumentKey),
-        );
+        upstoxMarketData.subscribe((updated?.stocks || []).map((stock) => stock.instrumentKey));
 
         res.json(updated);
     } catch (error) {
-        res.status(500).json({ message: error.message });
+        console.error("Bulk remove stocks error:", error);
+        res.status(500).json({ message: "Failed to remove stocks" });
     }
 });
 
-
-
-app.get("/api/strategy-details/:id", requireAuth, async (req, res) => {
+app.get("/api/strategy-details/:id", requireAuth, validateObjectId("id"), async (req, res) => {
     try {
-        const strategy = await Strategy.findById(req.params.id);
+        const strategy = await Strategy.findOne({ _id: req.params.id, userId: req.user.mongoId });
 
         if (!strategy) {
-            return res.status(404).json({
-                message: "Strategy not found",
-            });
-        }
-
-        if (strategy.userId && !ownsResource(strategy.userId, req)) {
-            return res.status(403).json({ message: "Forbidden" });
+            return res.status(404).json({ message: "Strategy not found" });
         }
 
         res.json({
@@ -878,15 +762,12 @@ app.get("/api/strategy-details/:id", requireAuth, async (req, res) => {
             backtestPreview: resolveBacktestConfig(strategy, "1y"),
         });
     } catch (error) {
-        console.log(error);
-
-        res.status(500).json({
-            message: "Failed to fetch strategy",
-        });
+        console.error("Strategy details error:", error);
+        res.status(500).json({ message: "Failed to fetch strategy" });
     }
 });
 
-app.post("/api/backtest/run", requireAuth, async (req, res) => {
+app.post("/api/backtest/run", requireAuth, backtestLimiter, async (req, res) => {
     const btStart = Date.now();
 
     try {
@@ -904,17 +785,14 @@ app.post("/api/backtest/run", requireAuth, async (req, res) => {
             return res.status(400).json({ message: "Symbol or instrumentKey required" });
         }
 
-        const strategy = await Strategy.findById(strategyId);
-        if (!strategy) return res.status(404).json({ message: "Strategy not found" });
-
-        if (strategy.userId && !ownsResource(strategy.userId, req)) {
-            return res.status(403).json({ message: "Forbidden" });
+        if (!mongoose.Types.ObjectId.isValid(strategyId)) {
+            return res.status(400).json({ message: "Invalid identifier" });
         }
 
-        const instrumentKey = await resolveInstrumentKey(
-            symbol,
-            bodyInstrumentKey,
-        );
+        const strategy = await Strategy.findOne({ _id: strategyId, userId: req.user.mongoId });
+        if (!strategy) return res.status(404).json({ message: "Strategy not found" });
+
+        const instrumentKey = await resolveInstrumentKey(symbol, bodyInstrumentKey);
 
         if (!instrumentKey) {
             return res.status(400).json({
@@ -924,13 +802,12 @@ app.post("/api/backtest/run", requireAuth, async (req, res) => {
 
         const instrumentMeta = upstoxMarketData.getInstrumentMeta(instrumentKey);
 
-        const { candles, auxiliaryCandles, config: backtestConfig } =
-            await fetchBacktestCandles(
-                instrumentKey,
-                period,
-                strategy,
-                instrumentMeta,
-            );
+        const { candles, auxiliaryCandles, config: backtestConfig } = await fetchBacktestCandles(
+            instrumentKey,
+            period,
+            strategy,
+            instrumentMeta,
+        );
 
         if (!candles.length) {
             const derivativeHint = instrumentMeta &&
@@ -958,21 +835,12 @@ app.post("/api/backtest/run", requireAuth, async (req, res) => {
             capital,
             interval: backtestConfig.interval,
             auxiliaryCandles,
-            validationMode:
-                validationMode && VALIDATION_MODE,
+            validationMode: validationMode && VALIDATION_MODE,
             pe,
         });
 
-        const {
-            summary,
-            trades,
-            equityCurve,
-            fullEquityCurve,
-            signalStats,
-            tradeMarkers,
-            auditLog,
-            signalLogs,
-        } = simulation;
+        const { summary, trades, equityCurve, fullEquityCurve, signalStats, tradeMarkers, auditLog, signalLogs } =
+            simulation;
 
         const backtestMeta = {
             interval: backtestConfig.interval,
@@ -1001,7 +869,7 @@ app.post("/api/backtest/run", requireAuth, async (req, res) => {
                 });
             }
         } catch (err) {
-            console.log("Failed to save backtest:", err);
+            console.error("Failed to save backtest:", err);
         }
 
         recordBacktestTime(Date.now() - btStart);
@@ -1015,18 +883,15 @@ app.post("/api/backtest/run", requireAuth, async (req, res) => {
             tradeMarkers,
             signalStats,
             auditLog: validationMode && VALIDATION_MODE ? auditLog : undefined,
-            signalLogs:
-                validationMode && VALIDATION_MODE ? signalLogs : undefined,
+            signalLogs: validationMode && VALIDATION_MODE ? signalLogs : undefined,
             backtestMeta,
             backtestTimeMs: Date.now() - btStart,
         });
     } catch (error) {
         recordBacktestTime(Date.now() - btStart);
-        console.log(error);
+        console.error("Backtest run error:", error);
 
-        res.status(500).json({
-            message: "Backtest failed",
-        });
+        res.status(500).json({ message: "Backtest failed" });
     }
 });
 
@@ -1035,16 +900,10 @@ app.get("/api/dashboard", requireAuth, async (req, res) => {
         const userId = req.user.mongoId;
 
         const watchlists = await Watchlist.find({ userId });
-        const stocksTracked = watchlists.reduce(
-            (sum, list) => sum + (list.stocks?.length || 0),
-            0,
-        );
+        const stocksTracked = watchlists.reduce((sum, list) => sum + (list.stocks?.length || 0), 0);
 
         const strategies = await Strategy.countDocuments({ userId });
         const backtests = await Backtest.countDocuments({ userId });
-
-        const startOfDay = new Date();
-        startOfDay.setHours(0, 0, 0, 0);
 
         const signalsToday = await Strategy.countDocuments({
             userId,
@@ -1076,7 +935,7 @@ app.get("/api/dashboard", requireAuth, async (req, res) => {
             recentActivity,
         });
     } catch (error) {
-        console.log(error);
+        console.error("Dashboard error:", error);
         res.status(500).json({ message: "Failed to load dashboard" });
     }
 });
@@ -1087,20 +946,20 @@ app.get("/api/backtests/:userId", requireAuth, async (req, res) => {
             return res.status(403).json({ message: "Forbidden" });
         }
 
-        const backtests = await Backtest.find({ userId: req.params.userId })
+        const backtests = await Backtest.find({ userId: req.user.mongoId })
             .sort({ createdAt: -1 })
             .populate("strategyId", "name");
 
         res.json(backtests);
     } catch (err) {
-        console.log(err);
+        console.error("List backtests error:", err);
         res.status(500).json({ message: "Failed to fetch backtests" });
     }
 });
 
-app.get("/api/backtests/detail/:id", requireAuth, async (req, res) => {
+app.get("/api/backtests/detail/:id", requireAuth, validateObjectId("id"), async (req, res) => {
     try {
-        const backtest = await Backtest.findById(req.params.id).populate(
+        const backtest = await Backtest.findOne({ _id: req.params.id, userId: req.user.mongoId }).populate(
             "strategyId",
             "name",
         );
@@ -1109,44 +968,30 @@ app.get("/api/backtests/detail/:id", requireAuth, async (req, res) => {
             return res.status(404).json({ message: "Backtest not found" });
         }
 
-        if (
-            backtest.userId &&
-            backtest.userId.toString() !== req.user.mongoId
-        ) {
-            return res.status(403).json({ message: "Forbidden" });
-        }
-
         res.json(backtest);
     } catch (err) {
-        console.log(err);
+        console.error("Backtest detail error:", err);
         res.status(500).json({ message: "Failed to fetch backtest" });
     }
 });
 
-app.delete("/api/backtests/:id", requireAuth, async (req, res) => {
+app.delete("/api/backtests/:id", requireAuth, validateObjectId("id"), async (req, res) => {
     try {
-        const backtest = await Backtest.findById(req.params.id);
+        const backtest = await Backtest.findOneAndDelete({
+            _id: req.params.id,
+            userId: req.user.mongoId,
+        });
 
         if (!backtest) {
             return res.status(404).json({ message: "Backtest not found" });
         }
 
-        if (
-            backtest.userId &&
-            backtest.userId.toString() !== req.user.mongoId
-        ) {
-            return res.status(403).json({ message: "Forbidden" });
-        }
-
-        await Backtest.findByIdAndDelete(req.params.id);
-
         res.json({ success: true });
     } catch (err) {
-        console.log(err);
+        console.error("Delete backtest error:", err);
         res.status(500).json({ message: "Failed to delete backtest" });
     }
 });
-
 
 app.get("/api/metrics", requireAuth, async (req, res) => {
     try {
@@ -1156,10 +1001,13 @@ app.get("/api/metrics", requireAuth, async (req, res) => {
             subscribedInstruments: upstoxMarketData.subscribedInstruments?.size || 0,
         });
     } catch (error) {
-        res.status(500).json({ message: error.message });
+        console.error("Metrics error:", error);
+        res.status(500).json({ message: "Failed to load metrics" });
     }
 });
 
+app.use(notFoundHandler);
+app.use(errorHandler);
 
 const PORT = process.env.PORT || 5001;
 
@@ -1177,7 +1025,10 @@ async function startServer() {
     const server = http.createServer(app);
     const io = new Server(server, {
         cors: {
-            origin: process.env.FRONTEND_URL || "*",
+            origin(origin, callback) {
+                if (isOriginAllowed(origin)) return callback(null, true);
+                return callback(new Error("Not allowed by CORS"));
+            },
             methods: ["GET", "POST"],
         },
     });
@@ -1188,6 +1039,41 @@ async function startServer() {
     server.listen(PORT, () => {
         console.log(`Server running on port ${PORT} (Socket.IO enabled)`);
     });
+
+    let shuttingDown = false;
+
+    async function gracefulShutdown(signal) {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        console.log(`${signal} received — shutting down gracefully`);
+
+        const forceExitTimer = setTimeout(() => {
+            console.error("Graceful shutdown timed out — forcing exit");
+            process.exit(1);
+        }, 10000);
+        forceExitTimer.unref();
+
+        try {
+            upstoxMarketData.shutdown();
+            io.close();
+
+            await new Promise((resolve, reject) => {
+                server.close((err) => (err ? reject(err) : resolve()));
+            });
+
+            await disconnectDatabase();
+
+            clearTimeout(forceExitTimer);
+            console.log("Shutdown complete");
+            process.exit(0);
+        } catch (error) {
+            console.error("Error during shutdown:", error.message);
+            process.exit(1);
+        }
+    }
+
+    process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+    process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 }
 
 startServer();
