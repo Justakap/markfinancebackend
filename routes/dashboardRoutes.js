@@ -7,21 +7,17 @@ function createDashboardRoutes({ Watchlist, Strategy, Backtest, requireAuth, get
         try {
             const userId = req.user.mongoId;
 
-            const watchlists = await Watchlist.find({ userId });
+            // These five queries are independent of one another — run them concurrently
+            // instead of paying their round-trip latency five times in series.
+            const [watchlists, strategies, backtests, signalsToday, recentBacktests] = await Promise.all([
+                Watchlist.find({ userId }),
+                Strategy.countDocuments({ userId }),
+                Backtest.countDocuments({ userId }),
+                Strategy.countDocuments({ userId, alertEnabled: true }),
+                Backtest.find({ userId }).sort({ createdAt: -1 }).limit(5).populate("strategyId", "name"),
+            ]);
+
             const stocksTracked = watchlists.reduce((sum, list) => sum + (list.stocks?.length || 0), 0);
-
-            const strategies = await Strategy.countDocuments({ userId });
-            const backtests = await Backtest.countDocuments({ userId });
-
-            const signalsToday = await Strategy.countDocuments({
-                userId,
-                alertEnabled: true,
-            });
-
-            const recentBacktests = await Backtest.find({ userId })
-                .sort({ createdAt: -1 })
-                .limit(5)
-                .populate("strategyId", "name");
 
             const recentActivity = recentBacktests.map((item) => ({
                 type: "backtest",
