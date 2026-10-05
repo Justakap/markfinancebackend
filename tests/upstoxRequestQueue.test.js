@@ -147,6 +147,56 @@ function httpError(status, { retryAfter, code } = {}) {
         assert.strictEqual(result, "still works");
     });
 
+    await test("critical-priority requests jump ahead of a queued background backlog", async () => {
+        const order = [];
+        const makeTask = (label) => () =>
+            new Promise((resolve) =>
+                setTimeout(() => {
+                    order.push(label);
+                    resolve(label);
+                }, 5),
+            );
+
+        // Seed a background backlog first, then queue a critical request —
+        // it should run before all of the already-queued background ones,
+        // but after whichever task was already in flight when it arrived.
+        const backgroundRuns = [
+            enqueue(makeTask("bg-1"), { priority: "background" }),
+            enqueue(makeTask("bg-2"), { priority: "background" }),
+            enqueue(makeTask("bg-3"), { priority: "background" }),
+        ];
+        const criticalRun = enqueue(makeTask("critical"), { priority: "critical" });
+
+        await Promise.all([...backgroundRuns, criticalRun]);
+
+        assert.strictEqual(order[0], "bg-1", "the already in-flight task finishes first");
+        assert.strictEqual(
+            order[1],
+            "critical",
+            "critical jumps the remaining background backlog once it is queued",
+        );
+        assert.deepStrictEqual(order.slice(2), ["bg-2", "bg-3"]);
+    });
+
+    await test("default priority (no options) behaves as background", async () => {
+        const order = [];
+        const makeTask = (label) => () =>
+            new Promise((resolve) =>
+                setTimeout(() => {
+                    order.push(label);
+                    resolve(label);
+                }, 5),
+            );
+
+        const defaultRuns = [enqueue(makeTask("default-1")), enqueue(makeTask("default-2"))];
+        const criticalRun = enqueue(makeTask("critical-2"), { priority: "critical" });
+
+        await Promise.all([...defaultRuns, criticalRun]);
+
+        assert.strictEqual(order[0], "default-1");
+        assert.strictEqual(order[1], "critical-2", "critical still jumps a default-priority backlog");
+    });
+
     console.log(`\n${passed} passed, ${failed} failed`);
     process.exit(failed ? 1 : 0);
 })();

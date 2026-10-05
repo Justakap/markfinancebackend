@@ -99,6 +99,17 @@ section first — it was built specifically to solve recurring Upstox 429
   exponential backoff + jitter, honoring `Retry-After` when present, bounded
   by `UPSTOX_MAX_RETRIES` (default 3). It never retries permanent 4xx errors
   (400/401/403/404). Covered by `tests/upstoxRequestQueue.test.js`.
+  - **Priority lanes:** `enqueue(task, { priority: "critical" })` jumps ahead
+    of the (default) `"background"` lane's backlog — it does not interrupt a
+    task already in flight, and both lanes share the same throttle clock, so
+    the combined Upstox call rate is unchanged; only ordering changes.
+    `marketDataService.warmLiveQuotes()` (the LTP lookup that blocks
+    `GET /api/market-data/:id`'s response) uses `"critical"`. Candle fetches
+    (`candleService.js`) and PE lookups (`fundamentalService.js`) stay on the
+    default background lane since they feed indicators asynchronously and
+    don't block any user-facing response. This fixes "add stock"/RSI-DMA
+    population feeling slow when a watchlist refresh queues dozens of candle
+    fetches ahead of a live-price lookup — see Change History below.
 - `utils/requestDedup.js` — collapses concurrent identical in-flight requests
   to one underlying call (used by `candleService.getCandles`).
 - Caching (all via `utils/boundedCache.js` — TTL + max-size + LRU eviction,
@@ -391,6 +402,34 @@ investigation to confirm the exact cause before touching
   when quote data was genuinely missing (not this repo, but noting it here
   since it was found while verifying the Greeks fix) — see the frontend
   repo's `CLAUDE.md` change history for details.
+
+### 2026-10-05 (later still) — Split the Upstox request queue into priority lanes
+
+Diagnosed (read-only, no code changes) why adding a stock and populating
+RSI/DMA on Stock Analysis felt slow (5-7s): `utils/upstoxRequestQueue.js` had
+a single global serialized queue shared by every Upstox REST caller. A
+watchlist refresh fires ~8-9 candle-fetch calls per instrument (5 timeframes)
+through `candleService.js`/`instrumentIndicatorBundle.js` to compute
+indicators — for a 5-stock watchlist that's 40+ queued calls. Those queued
+ahead of (or interleaved with) `marketDataService.warmLiveQuotes()`'s LTP
+lookup, which is what `GET /api/market-data/:id` actually awaits before
+responding.
+
+Fix: added `"critical"`/`"background"` priority lanes to the queue (see
+"Market Data" above for the mechanics). `warmLiveQuotes()` now enqueues at
+`"critical"`; candle/PE fetches stay `"background"`. Both lanes still share
+one throttle clock, so this changes queue *ordering* only — it does not
+relax the combined Upstox rate limit. Verified locally: a brand-new
+watchlist with 5 never-before-subscribed instruments returned
+`GET /api/market-data/:id` in ~0.17-0.5s (RSI/EMA correctly `null` at that
+point, since the background bundle fetch is still in flight), with all five
+instruments' indicators populated roughly 0.7-1s later via Socket.IO ticks —
+all local-network timing, not directly comparable to the ~5-7s reported in
+production (Render + real Upstox latency), but confirms the critical lookup
+no longer waits behind the background backlog. Added
+`tests/upstoxRequestQueue.test.js` coverage for lane ordering
+(critical jumps a queued background backlog; default/no-`priority` behaves
+as background). All existing tests still pass.
 
 **Update this section whenever a future session makes a major
 architectural or security change — don't let it go stale.**

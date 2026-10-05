@@ -1188,17 +1188,19 @@ async function warmLiveQuotes(instrumentKeys = []) {
         const query = chunk.map((key) => encodeURIComponent(key)).join(",");
 
         try {
-            const response = await enqueue(() =>
-                axios.get(
-                    `https://api.upstox.com/v3/market-quote/ltp?instrument_key=${query}`,
-                    {
-                        headers: {
-                            Accept: "application/json",
-                            Authorization: `Bearer ${token}`,
+            const response = await enqueue(
+                () =>
+                    axios.get(
+                        `https://api.upstox.com/v3/market-quote/ltp?instrument_key=${query}`,
+                        {
+                            headers: {
+                                Accept: "application/json",
+                                Authorization: `Bearer ${token}`,
+                            },
+                            timeout: 15000,
                         },
-                        timeout: 15000,
-                    },
-                ),
+                    ),
+                { priority: "critical" },
             );
 
             const quotes = response.data?.data || {};

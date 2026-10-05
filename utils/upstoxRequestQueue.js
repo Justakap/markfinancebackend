@@ -6,10 +6,20 @@
  * Permanent 4xx errors (400 bad request, 401/403 auth, 404 not found, etc.)
  * are never retried — they bubble up immediately so callers (e.g.
  * instrumentKeyResolver's invalid-key cache) can react to them.
+ *
+ * Priority lanes: calls queued with `{ priority: "critical" }` (live LTP
+ * lookups that block a user-facing response) always run before queued
+ * `"background"` calls (candle fetches, PE lookups feeding indicators),
+ * so a burst of background work never makes a critical lookup wait behind
+ * it. Both lanes share the same MIN_GAP_MS throttle clock below, so the
+ * combined Upstox request rate is governed exactly as before — splitting
+ * only changes queue *ordering*, not how fast requests go out overall.
  */
 const { recordUpstoxApiCall } = require("./metrics");
 
-let chain = Promise.resolve();
+const criticalQueue = [];
+const backgroundQueue = [];
+let pumping = false;
 let lastRequestAt = 0;
 
 const MIN_GAP_MS = Number(process.env.UPSTOX_REQUEST_GAP_MS || 50);
@@ -80,20 +90,46 @@ async function runWithRetry(task, maxRetries) {
     }
 }
 
-/** `task` is a zero-arg function returning a promise (e.g. an axios call). */
+/**
+ * Picks the next queued item to run: any pending critical-lane item always
+ * wins over background-lane ones, FIFO within a lane. This is what lets a
+ * live-price lookup jump ahead of a large backlog of candle fetches without
+ * needing a second, independently-paced queue (which would risk the two
+ * lanes together exceeding Upstox's rate limit).
+ */
+async function pump() {
+    if (pumping) return;
+    pumping = true;
+
+    try {
+        while (criticalQueue.length > 0 || backgroundQueue.length > 0) {
+            const item = criticalQueue.length > 0 ? criticalQueue.shift() : backgroundQueue.shift();
+
+            try {
+                const result = await runWithRetry(item.task, item.maxRetries);
+                item.resolve(result);
+            } catch (error) {
+                item.reject(error);
+            }
+        }
+    } finally {
+        pumping = false;
+    }
+}
+
+/**
+ * `task` is a zero-arg function returning a promise (e.g. an axios call).
+ * `options.priority`: `"critical"` jumps ahead of queued `"background"`
+ * (default) work; it does not interrupt a task already in flight.
+ */
 function enqueue(task, options = {}) {
     const maxRetries = Number.isFinite(options.maxRetries) ? options.maxRetries : MAX_RETRIES;
+    const queue = options.priority === "critical" ? criticalQueue : backgroundQueue;
 
-    const run = chain.then(() => runWithRetry(task, maxRetries));
-
-    // Keep the chain alive regardless of this task's outcome so one failure
-    // doesn't wedge every subsequent queued request.
-    chain = run.then(
-        () => {},
-        () => {},
-    );
-
-    return run;
+    return new Promise((resolve, reject) => {
+        queue.push({ task, maxRetries, resolve, reject });
+        pump();
+    });
 }
 
 module.exports = { enqueue, isRetryableError, getRetryAfterMs };
