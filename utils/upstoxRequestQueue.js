@@ -1,7 +1,7 @@
 /**
- * Serializes Upstox REST calls to avoid burst 429s, and retries transient
- * failures (429 rate-limit, 502/503/504, network/timeout) with exponential
- * backoff + jitter, honoring Retry-After when Upstox sends it.
+ * Throttles and retries Upstox REST calls to avoid burst 429s. Retries
+ * transient failures (429 rate-limit, 502/503/504, network/timeout) with
+ * exponential backoff + jitter, honoring Retry-After when Upstox sends it.
  *
  * Permanent 4xx errors (400 bad request, 401/403 auth, 404 not found, etc.)
  * are never retried — they bubble up immediately so callers (e.g.
@@ -9,23 +9,41 @@
  *
  * Priority lanes: calls queued with `{ priority: "critical" }` (live LTP
  * lookups that block a user-facing response) always run before queued
- * `"background"` calls (candle fetches, PE lookups feeding indicators),
- * so a burst of background work never makes a critical lookup wait behind
- * it. Both lanes share the same MIN_GAP_MS throttle clock below, so the
- * combined Upstox request rate is governed exactly as before — splitting
- * only changes queue *ordering*, not how fast requests go out overall.
+ * `"background"` calls (candle fetches, PE lookups feeding indicators), so
+ * a burst of background work never makes a critical lookup wait behind it.
+ *
+ * Concurrency: up to `UPSTOX_QUEUE_CONCURRENCY` calls may be in flight at
+ * once (default 3, chosen conservatively — see CLAUDE.md's change history
+ * for the measured comparison against 5, which showed no benefit for a
+ * typical watchlist size), instead of waiting for each call's full round
+ * trip to finish before starting the next. This does NOT raise the actual
+ * request rate ceiling — every real network call (across every concurrent
+ * slot) still goes through `reserveSlot()`, which enforces at least
+ * MIN_GAP_MS between successive call *starts*, globally, exactly as before.
+ * Previously that ceiling (1 request / MIN_GAP_MS, e.g. 20/s at the 50ms
+ * default) was never actually reached — effective throughput was capped by
+ * each call's network latency instead, since the queue waited for one call
+ * to fully complete before starting the next. Concurrency removes that
+ * artificial cap without changing how many requests/sec Upstox actually
+ * sees — though unlike before (where true network concurrency was always
+ * exactly 1), it does mean up to MAX_CONCURRENCY requests can be
+ * simultaneously open, which is why this is deliberately conservative
+ * rather than raised further without evidence of a need.
  */
 const { recordUpstoxApiCall } = require("./metrics");
 
 const criticalQueue = [];
 const backgroundQueue = [];
+const slotWaiters = [];
 let pumping = false;
+let activeCount = 0;
 let lastRequestAt = 0;
 
 const MIN_GAP_MS = Number(process.env.UPSTOX_REQUEST_GAP_MS || 50);
 const MAX_RETRIES = Number(process.env.UPSTOX_MAX_RETRIES || 3);
 const BASE_BACKOFF_MS = Number(process.env.UPSTOX_RETRY_BASE_MS || 500);
 const MAX_BACKOFF_MS = Number(process.env.UPSTOX_RETRY_MAX_MS || 8000);
+const MAX_CONCURRENCY = Math.max(1, Number(process.env.UPSTOX_QUEUE_CONCURRENCY || 3));
 
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -51,13 +69,25 @@ function isRetryableError(error) {
     return Boolean(error?.request) || error?.code === "ECONNABORTED";
 }
 
+/**
+ * Reserves the next allowed call-start time and advances `lastRequestAt` in
+ * the same synchronous step (no `await` in between), so concurrent callers
+ * each get a distinct, correctly-spaced slot instead of racing to read
+ * `lastRequestAt` before any of them has updated it.
+ */
+function reserveSlot() {
+    const now = Date.now();
+    const slot = Math.max(now, lastRequestAt + MIN_GAP_MS);
+    lastRequestAt = slot;
+    return slot;
+}
+
 async function runThrottled(task) {
-    const elapsed = Date.now() - lastRequestAt;
-    const wait = Math.max(0, MIN_GAP_MS - elapsed);
+    const slot = reserveSlot();
+    const wait = slot - Date.now();
     if (wait > 0) {
         await sleep(wait);
     }
-    lastRequestAt = Date.now();
     recordUpstoxApiCall();
     return task();
 }
@@ -90,12 +120,18 @@ async function runWithRetry(task, maxRetries) {
     }
 }
 
+function releaseSlot() {
+    activeCount -= 1;
+    const resolveWaiter = slotWaiters.shift();
+    if (resolveWaiter) resolveWaiter();
+}
+
 /**
  * Picks the next queued item to run: any pending critical-lane item always
- * wins over background-lane ones, FIFO within a lane. This is what lets a
- * live-price lookup jump ahead of a large backlog of candle fetches without
- * needing a second, independently-paced queue (which would risk the two
- * lanes together exceeding Upstox's rate limit).
+ * wins over background-lane ones, FIFO within a lane. Dispatches up to
+ * MAX_CONCURRENCY items at once (not awaited to completion here) — each
+ * dispatched item still goes through `runThrottled`'s shared slot
+ * reservation, so the actual Upstox request rate is unchanged.
  */
 async function pump() {
     if (pumping) return;
@@ -103,14 +139,15 @@ async function pump() {
 
     try {
         while (criticalQueue.length > 0 || backgroundQueue.length > 0) {
-            const item = criticalQueue.length > 0 ? criticalQueue.shift() : backgroundQueue.shift();
-
-            try {
-                const result = await runWithRetry(item.task, item.maxRetries);
-                item.resolve(result);
-            } catch (error) {
-                item.reject(error);
+            if (activeCount >= MAX_CONCURRENCY) {
+                await new Promise((resolve) => slotWaiters.push(resolve));
+                continue;
             }
+
+            const item = criticalQueue.length > 0 ? criticalQueue.shift() : backgroundQueue.shift();
+            activeCount += 1;
+
+            runWithRetry(item.task, item.maxRetries).then(item.resolve, item.reject).finally(releaseSlot);
         }
     } finally {
         pumping = false;

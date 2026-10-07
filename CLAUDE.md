@@ -94,22 +94,27 @@ section first — it was built specifically to solve recurring Upstox 429
 (rate limit) errors.**
 
 - `utils/upstoxRequestQueue.js` — every Upstox REST call should go through
-  `enqueue(() => axios...)`. It serializes calls with a minimum gap
-  (`UPSTOX_REQUEST_GAP_MS`), and on 429/502/503/504/timeout it retries with
+  `enqueue(() => axios...)`. On 429/502/503/504/timeout it retries with
   exponential backoff + jitter, honoring `Retry-After` when present, bounded
   by `UPSTOX_MAX_RETRIES` (default 3). It never retries permanent 4xx errors
   (400/401/403/404). Covered by `tests/upstoxRequestQueue.test.js`.
   - **Priority lanes:** `enqueue(task, { priority: "critical" })` jumps ahead
     of the (default) `"background"` lane's backlog — it does not interrupt a
-    task already in flight, and both lanes share the same throttle clock, so
-    the combined Upstox call rate is unchanged; only ordering changes.
-    `marketDataService.warmLiveQuotes()` (the LTP lookup that blocks
-    `GET /api/market-data/:id`'s response) uses `"critical"`. Candle fetches
-    (`candleService.js`) and PE lookups (`fundamentalService.js`) stay on the
-    default background lane since they feed indicators asynchronously and
-    don't block any user-facing response. This fixes "add stock"/RSI-DMA
-    population feeling slow when a watchlist refresh queues dozens of candle
-    fetches ahead of a live-price lookup — see Change History below.
+    task already in flight. `marketDataService.warmLiveQuotes()` (the LTP
+    lookup that blocks `GET /api/market-data/:id`'s response) uses
+    `"critical"`. Candle fetches (`candleService.js`) and PE lookups
+    (`fundamentalService.js`) stay on the default background lane since they
+    feed indicators asynchronously and don't block any user-facing response.
+  - **Concurrency:** up to `UPSTOX_QUEUE_CONCURRENCY` calls (default 3) may
+    be in flight at once, instead of each call's full round trip finishing
+    before the next starts. Every real network call, across every
+    concurrent slot, still goes through `reserveSlot()` — an atomic
+    (no-`await`-in-between) read-modify-write of a shared `lastRequestAt` —
+    which enforces at least `UPSTOX_REQUEST_GAP_MS` between successive call
+    *starts*, globally. So concurrency does **not** raise the actual
+    request-rate ceiling Upstox sees; it only removes the old artificial cap
+    where each call's network latency (not the gap) was the bottleneck. See
+    Change History below for why this was safe to do.
 - `utils/requestDedup.js` — collapses concurrent identical in-flight requests
   to one underlying call (used by `candleService.getCandles`).
 - Caching (all via `utils/boundedCache.js` — TTL + max-size + LRU eviction,
@@ -228,7 +233,7 @@ real values:
 - `ALLOWED_ORIGINS` / `FRONTEND_URL` — comma-separated CORS allowlist override
 - `ENABLE_VALIDATION_MODE` — force-enable debug/validation routes outside dev
 - `UPSTOX_REQUEST_GAP_MS`, `UPSTOX_MAX_RETRIES`, `UPSTOX_RETRY_BASE_MS`,
-  `UPSTOX_RETRY_MAX_MS` — request queue tuning
+  `UPSTOX_RETRY_MAX_MS`, `UPSTOX_QUEUE_CONCURRENCY` — request queue tuning
 - `UPSTOX_LTP_POLL_MS`, `UPSTOX_WS_RECONNECT_MS`,
   `UPSTOX_INDICATOR_REFRESH_MS` — live feed timing
 - `UPSTOX_FEED_MODE`, `UPSTOX_FUTURES_FEED_MODE`, `UPSTOX_OPTION_FEED_MODE` —
@@ -430,6 +435,70 @@ no longer waits behind the background backlog. Added
 `tests/upstoxRequestQueue.test.js` coverage for lane ordering
 (critical jumps a queued background backlog; default/no-`priority` behaves
 as background). All existing tests still pass.
+
+### 2026-10-07 — Added bounded concurrency to the Upstox request queue
+
+Diagnosed (read-only first, no code changes) a second, bigger contributor to
+slow RSI/EMA/DMA/VolAvg/Velocity population on Analysis/Greek (reported
+16-20s in production): the queue's `pump()` fully serialized every call,
+including its real network round trip, across *all* callers — "priority
+lanes" (above) only changed ordering, not concurrency. A single cold
+5-stock watchlist needs ~8-9 Upstox calls per instrument (confirmed by
+instrumenting a real local run against the live Upstox API): 3 "minutes"
+timeframes (1m/5m/15m) each fire *two* calls — a historical-range call and
+an intraday call — because the range endpoint only ever returns candles
+through **yesterday's close**, never today's; the intraday endpoint is the
+only source for today's candles. (I initially proposed dropping the
+intraday call as "redundant" — that was wrong, verified by direct API
+comparison before touching any code, and would have served stale
+day-old indicators during market hours. Left as-is.) Plus 1 hour1, 1 daily,
+1 PE lookup ≈ 9 calls/instrument × 5 stocks = ~45 serialized Upstox calls,
+one at a time, before every indicator was visible.
+
+Fix: `utils/upstoxRequestQueue.js`'s `pump()` now dispatches up to
+`UPSTOX_QUEUE_CONCURRENCY` calls at once instead of awaiting each one's
+full completion before starting the next. The per-call
+`UPSTOX_REQUEST_GAP_MS` throttle moved into `reserveSlot()`, an atomic
+(no `await` in between) read-modify-write of the shared `lastRequestAt`,
+so concurrent callers each get a correctly-spaced, race-free start slot —
+the actual Upstox request-rate ceiling (1 call / `UPSTOX_REQUEST_GAP_MS`,
+20/s at the default 50ms) is unchanged; concurrency only removes the old
+situation where that ceiling was never reached because each call's network
+latency (60-230ms observed), not the 50ms gap, was the real bottleneck.
+Priority lanes are preserved exactly as before.
+
+Shipped first with a default of 5, flagged by the owner as inconsistent
+with the conservative "start at 3" the diagnosis had proposed — a fair
+catch; I'd changed the number without calling it out. Compared 3 vs. 5
+with an initial test that showed 5 as dramatically *slower* (9.4s vs 2.76s)
+— traced to an unrelated pre-existing bug: `marketDataService.js`'s
+`loadInstruments()` has no in-flight dedup, so on a cold process, more
+concurrent candle-fetch chains racing at once (with concurrency 5) meant
+more of them saw the instrument-master cache still empty and each fired
+its own redundant multi-MB gzip download. Reran both with the instrument
+cache pre-warmed first to isolate concurrency as the only variable: 3 and
+5 were statistically indistinguishable (2.1-3.1s across runs for both),
+because this 5-stock workload's natural fan-out never actually used more
+than 3 simultaneous in-flight requests even when 5 slots were available.
+Zero 429s/retries/failures at either setting. Since 3 already meets the
+2-3s target with no measurable loss vs. 5, and true network concurrency
+above 1 is new behavior this process never had before (undocumented
+Upstox concurrent-connection limits are an unverified risk — see the
+queue's own top-of-file comment), shipped **3** as the production default,
+not 5. All five instruments' indicators went from fully populated at
+**T+5.5s** (serialized, before this change) to **T+2.1-2.3s** (concurrency
+3, after) — this is local-network timing, not a production measurement,
+but it's the same request pattern so the relative improvement should carry
+over. Extended `tests/upstoxRequestQueue.test.js` with concurrency-bound
+and concurrency-ordering tests (peak concurrent tasks never exceeds the
+configured limit; critical priority still jumps a still-queued,
+not-yet-dispatched background backlog). All 14 queue tests and the full
+suite (28 tests across 3 files) pass.
+
+`loadInstruments()`'s missing in-flight dedup (above) was not fixed here —
+out of scope for this change, flagged for a future session. It's a
+once-per-24h-cache-TTL latent issue that only bites right after a cold
+boot/restart (e.g. a Render redeploy), not on every watchlist load.
 
 **Update this section whenever a future session makes a major
 architectural or security change — don't let it go stale.**
