@@ -116,11 +116,23 @@ section first — it was built specifically to solve recurring Upstox 429
     where each call's network latency (not the gap) was the bottleneck. See
     Change History below for why this was safe to do.
 - `utils/requestDedup.js` — collapses concurrent identical in-flight requests
-  to one underlying call (used by `candleService.getCandles`).
+  to one underlying call (used by `candleService.getCandles`,
+  `candleService`'s historical-range cache below, and
+  `marketDataService.loadInstruments`).
 - Caching (all via `utils/boundedCache.js` — TTL + max-size + LRU eviction,
   see Current Technical Debt / cache docs below for specifics):
   `fundamentalService`'s PE cache, `marketDataService`'s instrument-search
   cache, `instrumentKeyResolver`'s invalid-key cache.
+  - `candleService.js`'s `historicalMinuteCandleCache` — caches only the
+    through-yesterday historical-range portion of minute1/5/15 candle
+    fetches (`UPSTOX_HISTORICAL_CANDLE_CACHE_MAX_SIZE`,
+    `UPSTOX_HISTORICAL_CANDLE_TTL_MS`, default 26h). **Never caches today's
+    intraday data** — the historical-range endpoint doesn't return today's
+    candles at all (verified directly against the live API), so this is
+    exactly the part that cannot change again once a trading day closes.
+    Cache key includes the exact requested date range, which itself shifts
+    daily, so the cache naturally rolls over at each calendar-day boundary
+    without needing explicit invalidation logic. See Change History below.
 - `liveData`/`indicatorSnapshot` in `marketDataService.js` are **not** TTL
   caches — they're live state for currently-subscribed instruments, pruned
   the moment an instrument is unsubscribed (see `subscribe()`), with a
@@ -240,7 +252,8 @@ real values:
   Upstox WS subscription modes
 - `UPSTOX_PE_TTL_MS`, `UPSTOX_PE_CACHE_MAX_SIZE`,
   `UPSTOX_SEARCH_CACHE_MAX_SIZE`, `UPSTOX_INVALID_KEY_CACHE_MAX_SIZE`,
-  `UPSTOX_LIVE_DATA_MAX_SIZE` — cache sizing/TTL
+  `UPSTOX_LIVE_DATA_MAX_SIZE`, `UPSTOX_HISTORICAL_CANDLE_CACHE_MAX_SIZE`,
+  `UPSTOX_HISTORICAL_CANDLE_TTL_MS` — cache sizing/TTL
 - `INDICATOR_BUNDLE_MAX_AGE_MS` — indicator bundle cache age
 - `BACKTEST_COMMISSION_PCT`, `BACKTEST_SLIPPAGE_PCT` — backtest engine tuning
 
@@ -537,6 +550,52 @@ original bad measurement from the concurrency investigation (concurrency 5,
 the real-world instance of this exact race actually being hit. The fix
 makes that worst case structurally impossible regardless of timing luck,
 not just statistically less likely.
+
+### 2026-10-07 (later) — Cached the through-yesterday portion of minute candle fetches
+
+Task 2 of the 3-task performance follow-up. `fetchHistoricalCandles`'s
+"minutes" branch (minute1/5/15 — 3 of the 5 indicator-bundle timeframes)
+fires both a historical-range call and a today-only intraday call on
+*every* fetch, including every ~30s indicator-bundle refresh
+(`INDICATOR_BUNDLE_MAX_AGE_MS`). The historical-range endpoint was verified
+earlier (Task 1's investigation) to only ever return candles through
+yesterday's close — it cannot change again once a trading day closes, so
+re-fetching it on every refresh was pure waste.
+
+Added `historicalMinuteCandleCache` (`services/candleService.js`, via the
+existing `utils/boundedCache.js`) scoped *only* to the historical-range
+call inside the "minutes" branch — the "hours" (hour1) and "days" (daily)
+branches, and the intraday call for minute1/5/15, are untouched, exactly
+matching the task's scope. Cache key includes the exact requested
+`fromDate`/`toDate`, which is derived from "today's date" — so the cache
+naturally rolls over at each calendar-day boundary with no explicit
+invalidation logic needed (a weekend/holiday costs at most one harmless
+extra fetch of identical data, not a correctness issue). `ttlMs` (default
+26h) is a backstop, not the primary invalidation mechanism. Only
+non-empty results are cached, so a transient failure is never remembered
+as a real answer for the rest of the day. Concurrent callers for the same
+(instrument, timeframe, date range) share one in-flight fetch via the
+existing `dedupe()` utility, independent of `getCandles()`'s own
+outer-level dedupe.
+
+Added `tests/historicalCandleCache.test.js` (7 tests, mocked `axios.get`):
+first fetch does 1 range + 1 intraday call; a second fetch reuses the
+cached range but still fetches fresh intraday; 6 concurrent callers share
+one range call; a different date range gets its own cache entry (stands
+in for day-rollover, exercising the same key-differentiation path); a
+failed range fetch isn't cached and the next call retries; different
+instruments don't cross-contaminate; hours/days timeframes are confirmed
+unaffected. Full suite: 42/42 passing (6 files).
+
+Measured on a 5-stock cold watchlist (concurrency 3, same scenario used
+throughout this investigation): first load unchanged (20 range + 15
+intraday calls, as expected — nothing is cached yet on a cold instrument).
+Steady-state refresh (after the 30s bundle TTL expires): range calls
+**25 → 10** (hour1 + daily's own 5+5 unchanged; minute1/5/15's 15 range
+calls eliminated to 0), intraday calls unchanged at **15** (today's data
+still always fresh, as required) — a 37.5% reduction in total
+historical-candle-family Upstox calls per refresh cycle, with zero risk of
+stale same-day data since nothing about the intraday path changed.
 
 **Update this section whenever a future session makes a major
 architectural or security change — don't let it go stale.**

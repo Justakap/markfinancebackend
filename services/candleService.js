@@ -8,6 +8,31 @@ const {
 } = require("../utils/instrumentKeyResolver");
 
 const { dedupe } = require("../utils/requestDedup");
+const { createBoundedCache } = require("../utils/boundedCache");
+
+/**
+ * Caches the through-yesterday historical portion of minute-based candle
+ * requests (minute1/5/15 — the timeframes whose "minutes" branch below
+ * fires both a historical-range call and a today-only intraday call on
+ * every single fetch). The historical-range endpoint never returns today's
+ * data (verified directly against the live API), so once a trading day has
+ * closed, that portion cannot change again until the next one does —
+ * making it safe to cache across the 15-30s refresh cadence that previously
+ * re-fetched it unchanged every time.
+ *
+ * Cache key includes the exact requested date range (`fromDate`/`toDate`),
+ * which is itself derived from "today's date" — so the key naturally
+ * changes at each calendar-day rollover (including non-trading days; a
+ * weekend/holiday costs at most one harmless re-fetch of identical data,
+ * not a correctness issue). `ttlMs` is a backstop, not the primary
+ * invalidation mechanism. Only non-empty results are cached, so a
+ * transient failure (swallowed to `[]` by the caller) is never remembered
+ * as if it were a genuine answer for the rest of the day.
+ */
+const historicalMinuteCandleCache = createBoundedCache({
+    maxSize: Number(process.env.UPSTOX_HISTORICAL_CANDLE_CACHE_MAX_SIZE || 300),
+    ttlMs: Number(process.env.UPSTOX_HISTORICAL_CANDLE_TTL_MS || 26 * 60 * 60 * 1000),
+});
 
 const RSI_CANDLE_CONFIGS = [
     { interval: "minutes", unit: "1" },
@@ -225,6 +250,37 @@ function aggregateToHourlyCandles(candles = []) {
     );
 }
 
+/**
+ * Cache-aware wrapper around `fetchHistoricalCandlesByRange` for the
+ * "minutes" branch only (minute1/5/15) — see `historicalMinuteCandleCache`
+ * above. Concurrent callers for the same (instrument, timeframe, date
+ * range, maxBars) share one in-flight fetch via `dedupe()`, independent of
+ * `getCandles()`'s own outer-level dedupe (which covers the whole
+ * historical+intraday call, not just this piece).
+ */
+async function fetchCachedHistoricalMinuteRange(instrumentKey, unit, interval, fromDate, toDate, maxBars) {
+    const cacheKey = `${instrumentKey}:${unit}:${interval}:${fromDate}:${toDate}:${maxBars || ""}`;
+
+    const cached = historicalMinuteCandleCache.get(cacheKey);
+    if (cached !== undefined) {
+        return cached;
+    }
+
+    const result = await dedupe(`historical-range:${cacheKey}`, async () => {
+        try {
+            return await fetchHistoricalCandlesByRange(instrumentKey, unit, interval, fromDate, toDate, { maxBars });
+        } catch {
+            return [];
+        }
+    });
+
+    if (result.length) {
+        historicalMinuteCandleCache.set(cacheKey, result);
+    }
+
+    return result;
+}
+
 function getDateRangeForPeriodDays(unit, periodDays = 365) {
     const toDate = formatDate(new Date());
     const days = Math.max(1, Number(periodDays) || 365);
@@ -295,19 +351,14 @@ async function fetchHistoricalCandles(instrumentKey, options = {}) {
                 : getDateRangeForUnit(unit);
         const { toDate, fromDate } = range;
 
-        let historical = [];
-        try {
-            historical = await fetchHistoricalCandlesByRange(
-                instrumentKey,
-                unit,
-                interval,
-                fromDate,
-                toDate,
-                { maxBars },
-            );
-        } catch {
-            historical = [];
-        }
+        const historical = await fetchCachedHistoricalMinuteRange(
+            instrumentKey,
+            unit,
+            interval,
+            fromDate,
+            toDate,
+            maxBars,
+        );
 
         const intraday = await fetchIntradayCandles(instrumentKey, {
             interval: unit,
