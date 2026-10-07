@@ -500,5 +500,43 @@ out of scope for this change, flagged for a future session. It's a
 once-per-24h-cache-TTL latent issue that only bites right after a cold
 boot/restart (e.g. a Render redeploy), not on every watchlist load.
 
+### 2026-10-07 (later) — Fixed loadInstruments() missing in-flight dedup
+
+Fixed the latent issue flagged above (Task 1 of a 3-task performance
+follow-up). `loadInstruments()`'s network-fetch branch now goes through
+`utils/requestDedup.js`'s existing `dedupe("instrument-master", ...)` —
+the same in-flight-collapsing utility already used by
+`candleService.getCandles` and `instrumentIndicatorBundle.loadInstrumentBundle`,
+rather than a bespoke mechanism. Any caller needing a fresh fetch (forced
+or not — `force` only affects whether the TTL cache-hit shortcut is
+skipped) joins the same in-flight promise; `dedupe()` clears its entry on
+both success and failure, so a failed download doesn't leave future callers
+stuck, and a later call retries normally.
+
+Added `tests/instrumentMasterDedup.test.js` (new file, registered in
+`package.json`'s `test` script) with a mocked `axios.get` — proves: 1
+caller → 1 download; 8 concurrent callers → 1 download (was 8, confirmed
+by running the same suite against the pre-fix code via `git stash`); all
+concurrent callers get the identical result; a failure rejects every
+current caller (was: each failed independently, confirmed via the same
+stash comparison); a later caller can retry after a failure; a warm cache
+serves with zero downloads; instrument metadata population is unchanged.
+Full suite: 35/35 passing (4 files).
+
+Live cold-process end-to-end re-test (same 5-stock scenario used to
+originally find this bug) did not hit the race window in 3 fresh attempts
+today (consistently 1 instrument-master download, ~3 max concurrent
+in-flight, ~2.1-2.3s to all indicators, both before and after this fix) —
+the race is timing-dependent on how close a request lands to server boot
+(`init()` fires an unawaited `loadInstruments()` at startup; the race only
+manifests if a real request's own `loadInstruments()` call arrives while
+that boot-time fetch is still in flight), so it doesn't reproduce on every
+run. The unit tests above are the reliable, deterministic proof; the
+original bad measurement from the concurrency investigation (concurrency 5,
+`maxConcurrentInFlight: 9`, `totalIndicatorTimeMs: 9904ms`, see above) is
+the real-world instance of this exact race actually being hit. The fix
+makes that worst case structurally impossible regardless of timing luck,
+not just statistically less likely.
+
 **Update this section whenever a future session makes a major
 architectural or security change — don't let it go stale.**

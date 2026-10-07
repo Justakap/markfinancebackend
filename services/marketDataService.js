@@ -18,6 +18,7 @@ const {
     warmPeForInstruments,
 } = require("./fundamentalService");
 const { createBoundedCache } = require("../utils/boundedCache");
+const { dedupe } = require("../utils/requestDedup");
 
 const INSTRUMENT_MASTER_URL =
     process.env.UPSTOX_INSTRUMENT_MASTER_URL ||
@@ -186,6 +187,41 @@ async function loadFeedProto() {
     return feedResponseType;
 }
 
+async function fetchAndStoreInstruments() {
+    const response = await axios.get(INSTRUMENT_MASTER_URL, {
+        responseType: "arraybuffer",
+        timeout: 30000,
+    });
+
+    const buffer = Buffer.from(response.data);
+    const body = INSTRUMENT_MASTER_URL.endsWith(".gz")
+        ? zlib.gunzipSync(buffer).toString("utf8")
+        : buffer.toString("utf8");
+
+    const parsed = JSON.parse(body)
+        .filter((item) => item.instrument_key && isSupportedInstrument(item))
+        .map(normalizeInstrument);
+
+    instrumentsCache = parsed;
+
+    instrumentMeta.clear();
+    instrumentsCache.forEach((instrument) => {
+        instrumentMeta.set(instrument.instrumentKey, instrument);
+    });
+
+    instrumentsLoadedAt = Date.now();
+    return instrumentsCache;
+}
+
+/**
+ * Downloads and caches the Upstox instrument master (a multi-MB gzip file).
+ * `force` skips the TTL cache-hit shortcut below, but does not duplicate an
+ * already-in-flight download — any caller that needs a fresh fetch (forced
+ * or not) joins the same in-flight `dedupe()` promise, since a fetch
+ * already underway satisfies "get fresh data" for everyone waiting on it.
+ * On failure the in-flight entry is cleared (see `requestDedup.dedupe`), so
+ * a later call retries normally instead of being stuck on a dead promise.
+ */
 async function loadInstruments(force = false) {
     const oneDay = 24 * 60 * 60 * 1000;
 
@@ -197,27 +233,7 @@ async function loadInstruments(force = false) {
         return instrumentsCache;
     }
 
-    const response = await axios.get(INSTRUMENT_MASTER_URL, {
-        responseType: "arraybuffer",
-        timeout: 30000,
-    });
-
-    const buffer = Buffer.from(response.data);
-    const body = INSTRUMENT_MASTER_URL.endsWith(".gz")
-        ? zlib.gunzipSync(buffer).toString("utf8")
-        : buffer.toString("utf8");
-
-    instrumentsCache = JSON.parse(body)
-        .filter((item) => item.instrument_key && isSupportedInstrument(item))
-        .map(normalizeInstrument);
-
-    instrumentMeta.clear();
-    instrumentsCache.forEach((instrument) => {
-        instrumentMeta.set(instrument.instrumentKey, instrument);
-    });
-
-    instrumentsLoadedAt = Date.now();
-    return instrumentsCache;
+    return dedupe("instrument-master", fetchAndStoreInstruments);
 }
 
 function rankSearchResults(items, q) {
