@@ -34,24 +34,35 @@ function parsePeValue(ratios = []) {
     return Number.isFinite(value) ? value : null;
 }
 
-async function fetchPeByIsin(isin) {
+async function fetchPeByIsin(isin, { priority } = {}) {
     const token = getAccessToken();
     if (!token || !isin) return null;
 
-    const response = await enqueue(() =>
-        axios.get(`https://api.upstox.com/v2/fundamentals/${isin}/key-ratios`, {
-            headers: {
-                Accept: "application/json",
-                Authorization: `Bearer ${token}`,
-            },
-            timeout: 15000,
-        }),
+    const response = await enqueue(
+        () =>
+            axios.get(`https://api.upstox.com/v2/fundamentals/${isin}/key-ratios`, {
+                headers: {
+                    Accept: "application/json",
+                    Authorization: `Bearer ${token}`,
+                },
+                timeout: 15000,
+            }),
+        { priority },
     );
 
     return parsePeValue(response.data?.data || []);
 }
 
-async function getPeForInstrument(instrumentKey, instrumentType = "") {
+/**
+ * `options.priority`: passed straight through to the underlying Upstox
+ * queue call. Callers needing PE to fulfill a direct, awaited request
+ * (watchlist/backtest routes, strategy scans, `buildRow`'s on-demand
+ * lookup) should leave this unset (default queue priority) so they're
+ * never held up by background warming. `warmPeForInstruments` (below)
+ * explicitly passes `"low"` since it's fire-and-forget and must never
+ * compete with indicator candle requests.
+ */
+async function getPeForInstrument(instrumentKey, instrumentType = "", options = {}) {
     if (!instrumentKey) return null;
 
     const type = String(instrumentType || "").toUpperCase();
@@ -71,7 +82,7 @@ async function getPeForInstrument(instrumentKey, instrumentType = "") {
     const isin = isinFromInstrumentKey(instrumentKey);
     if (!isin) return null;
 
-    const promise = fetchPeByIsin(isin)
+    const promise = fetchPeByIsin(isin, { priority: options.priority })
         .then((value) => {
             peCache.set(instrumentKey, value);
             return value;
@@ -89,6 +100,13 @@ async function getPeForInstrument(instrumentKey, instrumentType = "") {
     return promise;
 }
 
+/**
+ * Fire-and-forget bulk PE pre-fetch for a watchlist. Runs at the lowest
+ * queue priority ("low") so it can never delay LTP ("critical") or
+ * indicator candle fetches ("background") — it only gets a queue turn once
+ * both of those lanes are empty. PE data still populates normally; it's
+ * just never allowed to compete with what the UI needs first.
+ */
 async function warmPeForInstruments(stocks = []) {
     const equityStocks = stocks.filter((stock) => {
         const type = String(
@@ -98,7 +116,7 @@ async function warmPeForInstruments(stocks = []) {
     });
 
     for (const stock of equityStocks.slice(0, 20)) {
-        await getPeForInstrument(stock.instrumentKey, stock.instrumentType);
+        await getPeForInstrument(stock.instrumentKey, stock.instrumentType, { priority: "low" });
         await new Promise((resolve) => setTimeout(resolve, 120));
     }
 }

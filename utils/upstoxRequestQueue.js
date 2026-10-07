@@ -7,10 +7,16 @@
  * are never retried — they bubble up immediately so callers (e.g.
  * instrumentKeyResolver's invalid-key cache) can react to them.
  *
- * Priority lanes: calls queued with `{ priority: "critical" }` (live LTP
- * lookups that block a user-facing response) always run before queued
- * `"background"` calls (candle fetches, PE lookups feeding indicators), so
- * a burst of background work never makes a critical lookup wait behind it.
+ * Priority lanes (highest first): `"critical"` (live LTP lookups that block
+ * a user-facing response) > `"background"` (default — candle fetches, and
+ * any on-demand PE lookup needed to fulfill a direct request) > `"low"`
+ * (fire-and-forget PE warming only). A lane only runs once every queued
+ * item ahead of it is gone, and it never interrupts a task already in
+ * flight. This guarantees indicator candle requests (background) always
+ * get a turn before PE warming (low) without starving PE indefinitely —
+ * `low` still gets dispatched as soon as the busier lanes drain, which they
+ * do between refresh bursts (candle/LTP work is bounded per watchlist, not
+ * a continuous stream).
  *
  * Concurrency: up to `UPSTOX_QUEUE_CONCURRENCY` calls may be in flight at
  * once (default 3, chosen conservatively — see CLAUDE.md's change history
@@ -34,6 +40,7 @@ const { recordUpstoxApiCall } = require("./metrics");
 
 const criticalQueue = [];
 const backgroundQueue = [];
+const lowQueue = [];
 const slotWaiters = [];
 let pumping = false;
 let activeCount = 0;
@@ -126,25 +133,36 @@ function releaseSlot() {
     if (resolveWaiter) resolveWaiter();
 }
 
+function nextQueuedItem() {
+    if (criticalQueue.length > 0) return criticalQueue.shift();
+    if (backgroundQueue.length > 0) return backgroundQueue.shift();
+    return lowQueue.shift();
+}
+
+function hasQueuedWork() {
+    return criticalQueue.length > 0 || backgroundQueue.length > 0 || lowQueue.length > 0;
+}
+
 /**
- * Picks the next queued item to run: any pending critical-lane item always
- * wins over background-lane ones, FIFO within a lane. Dispatches up to
- * MAX_CONCURRENCY items at once (not awaited to completion here) — each
- * dispatched item still goes through `runThrottled`'s shared slot
- * reservation, so the actual Upstox request rate is unchanged.
+ * Picks the next queued item to run: critical > background > low, FIFO
+ * within a lane; a lane is only considered once every busier lane is
+ * empty. Dispatches up to MAX_CONCURRENCY items at once (not awaited to
+ * completion here) — each dispatched item still goes through
+ * `runThrottled`'s shared slot reservation, so the actual Upstox request
+ * rate is unchanged.
  */
 async function pump() {
     if (pumping) return;
     pumping = true;
 
     try {
-        while (criticalQueue.length > 0 || backgroundQueue.length > 0) {
+        while (hasQueuedWork()) {
             if (activeCount >= MAX_CONCURRENCY) {
                 await new Promise((resolve) => slotWaiters.push(resolve));
                 continue;
             }
 
-            const item = criticalQueue.length > 0 ? criticalQueue.shift() : backgroundQueue.shift();
+            const item = nextQueuedItem();
             activeCount += 1;
 
             runWithRetry(item.task, item.maxRetries).then(item.resolve, item.reject).finally(releaseSlot);
@@ -157,11 +175,17 @@ async function pump() {
 /**
  * `task` is a zero-arg function returning a promise (e.g. an axios call).
  * `options.priority`: `"critical"` jumps ahead of queued `"background"`
- * (default) work; it does not interrupt a task already in flight.
+ * (default) work; `"low"` only runs once both of those lanes are empty.
+ * None of these interrupt a task already in flight.
  */
 function enqueue(task, options = {}) {
     const maxRetries = Number.isFinite(options.maxRetries) ? options.maxRetries : MAX_RETRIES;
-    const queue = options.priority === "critical" ? criticalQueue : backgroundQueue;
+    const queue =
+        options.priority === "critical"
+            ? criticalQueue
+            : options.priority === "low"
+              ? lowQueue
+              : backgroundQueue;
 
     return new Promise((resolve, reject) => {
         queue.push({ task, maxRetries, resolve, reject });

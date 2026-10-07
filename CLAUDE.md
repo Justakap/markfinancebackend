@@ -98,13 +98,18 @@ section first — it was built specifically to solve recurring Upstox 429
   exponential backoff + jitter, honoring `Retry-After` when present, bounded
   by `UPSTOX_MAX_RETRIES` (default 3). It never retries permanent 4xx errors
   (400/401/403/404). Covered by `tests/upstoxRequestQueue.test.js`.
-  - **Priority lanes:** `enqueue(task, { priority: "critical" })` jumps ahead
-    of the (default) `"background"` lane's backlog — it does not interrupt a
-    task already in flight. `marketDataService.warmLiveQuotes()` (the LTP
-    lookup that blocks `GET /api/market-data/:id`'s response) uses
-    `"critical"`. Candle fetches (`candleService.js`) and PE lookups
-    (`fundamentalService.js`) stay on the default background lane since they
-    feed indicators asynchronously and don't block any user-facing response.
+  - **Priority lanes (highest first):** `"critical"` > `"background"`
+    (default) > `"low"`. A lane only runs once every item ahead of it is
+    gone; none interrupt a task already in flight.
+    `marketDataService.warmLiveQuotes()` (the LTP lookup that blocks
+    `GET /api/market-data/:id`'s response) uses `"critical"`. Candle fetches
+    (`candleService.js`) and any on-demand PE lookup needed to fulfill a
+    direct request (`buildRow`'s `includePe: true` path, `watchlistRoutes`,
+    `backtestRoutes`, `strategyScanService`) stay on the default
+    `"background"` lane. `fundamentalService.warmPeForInstruments()` (the
+    fire-and-forget bulk PE pre-fetch fired on every watchlist load) uses
+    `"low"` — it can never delay LTP or candle fetches, only run once both
+    of those lanes are empty. See Change History below.
   - **Concurrency:** up to `UPSTOX_QUEUE_CONCURRENCY` calls (default 3) may
     be in flight at once, instead of each call's full round trip finishing
     before the next starts. Every real network call, across every
@@ -596,6 +601,53 @@ calls eliminated to 0), intraday calls unchanged at **15** (today's data
 still always fresh, as required) — a 37.5% reduction in total
 historical-candle-family Upstox calls per refresh cycle, with zero risk of
 stale same-day data since nothing about the intraday path changed.
+
+### 2026-10-07 (later still) — Deprioritized PE warming behind indicator candle work
+
+Task 3 of the 3-task performance follow-up. `fundamentalService.fetchPeByIsin()`
+and `candleService.js`'s candle fetches were both on the same `"background"`
+queue lane, competing FIFO for the same concurrency slots — a watchlist's PE
+pre-fetch (`warmPeForInstruments`, fire-and-forget on every load) could
+interleave with and delay the candle fetches that indicators (RSI/EMA/DMA/
+VolAvg/Velocity) actually depend on, even though PE is never required for
+any visible indicator value (`refreshIndicatorsForKey` already calls
+`buildRow(stock, { includePe: false })`).
+
+Added a third, lowest queue priority tier, `"low"`, to
+`utils/upstoxRequestQueue.js` (critical > background > low; same
+not-yet-dispatched-only semantics as the existing critical-vs-background
+split — a lane never interrupts a task already in flight, it only wins
+the next *queueing* decision). `fundamentalService.warmPeForInstruments()`
+now enqueues every PE lookup at `"low"`; every other `getPeForInstrument`
+caller (routes needing PE to answer a direct request, `buildRow`'s
+on-demand path) is untouched, still default `"background"` priority, so
+deprioritizing bulk warming never slows down a request that's actually
+waiting on PE. No new queue, no bypass of the existing rate limiter/retry/
+backoff/min-gap mechanism (`reserveSlot()`/`MAX_CONCURRENCY` are shared
+across all three lanes, unchanged), concurrency still capped at 3.
+
+Added tests: `upstoxRequestQueue.test.js` gained 3 new cases (`"low"`
+never jumps a background backlog including items queued after it; `"low"`
+still runs once background drains — not starved indefinitely; `"critical"`
+still beats both `"background"` and `"low"`). New
+`tests/fundamentalServicePriority.test.js` (2 tests, mocked `enqueue()`)
+confirms `warmPeForInstruments` always passes `priority: "low"` and a
+direct `getPeForInstrument` call does not. Full suite: 47/47 passing
+(7 files).
+
+Measured on the same 5-stock cold watchlist (concurrency 3): indicator
+timing essentially unchanged (`timeToAllIndicatorsMs` 2281ms before →
+2242ms after — PE was only 5 of ~40+ total calls, so its removal from
+competition is a small effect on this scale, not a large one). The
+structural fix is visible directly in the call sequence: before, the
+first PE call fired at t=4.702s while candle calls were *still running*
+(last candle at t=5.303s) — interleaved. After, the first PE call fired
+at t=5.274s, strictly after the last candle call (t=5.225s) — zero
+interleaving. PE's own total completion time shifted later as an
+accepted tradeoff (2771ms → 3226ms) since it now waits for indicator work
+to fully drain before getting a queue turn — PE still completes normally,
+just later, exactly as intended. Zero 429s/retries/failures in either
+run.
 
 **Update this section whenever a future session makes a major
 architectural or security change — don't let it go stale.**

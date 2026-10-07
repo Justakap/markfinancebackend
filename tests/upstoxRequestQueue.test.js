@@ -256,6 +256,98 @@ function httpError(status, { retryAfter, code } = {}) {
         assert.strictEqual(activePeak, 3, "peak concurrent tasks should never exceed UPSTOX_QUEUE_CONCURRENCY (3)");
     });
 
+    await test("low priority never jumps ahead of a queued background backlog (Task 3: PE warming vs indicator candles)", async () => {
+        // Concurrency is 3. Fill all 3 slots with slow background (candle
+        // -like) work, queue a 'low' (PE-warming-like) call, then add more
+        // background work behind it — the low-priority call must still wait
+        // for every background item, not just the ones already in flight
+        // when it arrived.
+        const order = [];
+        const makeTask = (label, ms) => () =>
+            new Promise((resolve) =>
+                setTimeout(() => {
+                    order.push(label);
+                    resolve(label);
+                }, ms),
+            );
+
+        const inFlight = [
+            enqueue(makeTask("bg-1", 15), { priority: "background" }),
+            enqueue(makeTask("bg-2", 15), { priority: "background" }),
+            enqueue(makeTask("bg-3", 15), { priority: "background" }),
+        ];
+        const lowRun = enqueue(makeTask("pe-warm", 5), { priority: "low" });
+        const laterBackground = [
+            enqueue(makeTask("bg-4", 5), { priority: "background" }),
+            enqueue(makeTask("bg-5", 5), { priority: "background" }),
+        ];
+
+        await Promise.all([...inFlight, lowRun, ...laterBackground]);
+
+        const lowIndex = order.indexOf("pe-warm");
+        assert.ok(
+            lowIndex > order.indexOf("bg-4") && lowIndex > order.indexOf("bg-5"),
+            `low priority must wait behind all background work, even background items queued after it (order: ${order.join(",")})`,
+        );
+    });
+
+    await test("low priority still runs once background drains (PE warming is not starved indefinitely)", async () => {
+        // Saturate all 3 concurrency slots first, so the low- and
+        // background-priority calls queued next are both genuinely
+        // waiting at the same decision point (rather than one being
+        // dispatched before the other is even enqueued).
+        const order = [];
+        const makeTask = (label, ms) => () =>
+            new Promise((resolve) =>
+                setTimeout(() => {
+                    order.push(label);
+                    resolve(label);
+                }, ms),
+            );
+
+        const saturating = [
+            enqueue(makeTask("sat-1", 15), { priority: "background" }),
+            enqueue(makeTask("sat-2", 15), { priority: "background" }),
+            enqueue(makeTask("sat-3", 15), { priority: "background" }),
+        ];
+        const lowRun = enqueue(makeTask("pe-warm-2", 5), { priority: "low" });
+        const backgroundRun = enqueue(makeTask("bg-only", 5), { priority: "background" });
+
+        await Promise.all([...saturating, lowRun, backgroundRun]);
+
+        assert.ok(order.includes("pe-warm-2"), "low-priority work must still complete once there is no busier work left");
+        assert.ok(
+            order.indexOf("bg-only") < order.indexOf("pe-warm-2"),
+            `background should still win when both are genuinely waiting at once (order: ${order.join(",")})`,
+        );
+    });
+
+    await test("critical still jumps both background and low-priority backlogs", async () => {
+        const order = [];
+        const makeTask = (label, ms) => () =>
+            new Promise((resolve) =>
+                setTimeout(() => {
+                    order.push(label);
+                    resolve(label);
+                }, ms),
+            );
+
+        const inFlight = [
+            enqueue(makeTask("bg-1b", 15), { priority: "background" }),
+            enqueue(makeTask("bg-2b", 15), { priority: "background" }),
+            enqueue(makeTask("bg-3b", 15), { priority: "background" }),
+        ];
+        const lowRun = enqueue(makeTask("pe-warm-3", 5), { priority: "low" });
+        const criticalRun = enqueue(makeTask("critical-3", 5), { priority: "critical" });
+
+        await Promise.all([...inFlight, lowRun, criticalRun]);
+
+        assert.ok(
+            order.indexOf("critical-3") < order.indexOf("pe-warm-3"),
+            `critical must run before low-priority PE warming (order: ${order.join(",")})`,
+        );
+    });
+
     console.log(`\n${passed} passed, ${failed} failed`);
     process.exit(failed ? 1 : 0);
 })();
