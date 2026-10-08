@@ -11,6 +11,7 @@ function createBacktestRoutes({
     fetchBacktestCandles,
     runBacktestSimulation,
     getPeForInstrument,
+    strategyUsesPe,
     upstoxMarketData,
     recordBacktestTime,
     VALIDATION_MODE,
@@ -41,6 +42,13 @@ function createBacktestRoutes({
 
             const strategy = await Strategy.findOne({ _id: strategyId, userId: req.user.mongoId });
             if (!strategy) return res.status(404).json({ message: "Strategy not found" });
+
+            if (strategyUsesPe(strategy)) {
+                return res.status(400).json({
+                    message:
+                        "PE-based conditions are currently unavailable for historical backtesting because historical point-in-time PE data is not available. Remove the PE Ratio condition to run this backtest.",
+                });
+            }
 
             const instrumentKey = await resolveInstrumentKey(symbol, bodyInstrumentKey);
 

@@ -31,6 +31,7 @@ const {
     getStrategyInterval,
     resolveBacktestConfig,
     INTERVAL_CONFIG,
+    strategyUsesPe,
 } = require("./utils/backtestEngine");
 const { runIndicatorValidation } = require("./utils/validationService");
 const { runStrategyScan } = require("./services/strategyScanService");
@@ -163,6 +164,7 @@ app.use(
         fetchBacktestCandles,
         runBacktestSimulation,
         getPeForInstrument,
+        strategyUsesPe,
         upstoxMarketData,
         recordBacktestTime,
         VALIDATION_MODE,

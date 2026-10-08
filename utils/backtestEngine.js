@@ -85,6 +85,21 @@ function collectStrategyIndicators(strategy) {
     });
 }
 
+/**
+ * Upstox's Key Ratios endpoint (the only PE source this app calls) returns a
+ * point-in-time snapshot only — no historical series exists. Applying that
+ * single current value to every historical bar (as `buildBacktestIndicators`
+ * does via `options.pe`) would silently mix "today's PE" with "2020's price,"
+ * which is invalid. Callers must check this before running a historical
+ * backtest and reject it rather than letting the engine substitute today's
+ * PE for history — see `backend/CLAUDE.md` Core Rule #14.
+ */
+function strategyUsesPe(strategy) {
+    return collectStrategyIndicators(strategy).some(
+        (label) => normalizeIndicatorLabel(label) === "PE Ratio",
+    );
+}
+
 function getRequiredRsiIntervals(strategy) {
     const intervals = new Set();
 
@@ -1001,6 +1016,7 @@ module.exports = {
     INTERVAL_CONFIG,
     UPSTOX_INTERVAL_CONFIG,
     dataRowToEvaluatorSnapshot,
+    strategyUsesPe,
 };
 
 function dataRowToEvaluatorSnapshot(row) {
