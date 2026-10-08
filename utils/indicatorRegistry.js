@@ -4,17 +4,15 @@
  * indicators exist and how to key their computed series. This registry is
  * that single source of truth for both.
  *
- * Deliberately short today. Per BLOCKER-001 (.claude/state/BLOCKERS.md),
- * only RSI and EMA have actual per-bar *series* implementations in
- * `indicatorService.js` right now (`calculateRSISeries`/
- * `calculateEMASeries`) — SMA/MACD/VWAP currently only have single-latest-
- * value functions, which is not enough for a bar-by-bar backtest or an
- * indicator-vs-indicator chart overlay. Do not register an indicator here
- * until its series function actually exists — this is what makes the
- * Phase B validator's "unknown indicator" rejection meaningful instead of
- * decorative (the legacy system's exact "Future Indicators" bug: an
- * indicator selectable in the UI but silently always-false at evaluation
- * time).
+ * Only register an indicator once its series function actually exists in
+ * `indicatorService.js` — this is what makes the Phase B validator's
+ * "unknown indicator" rejection meaningful instead of decorative (the
+ * legacy system's exact "Future Indicators" bug: an indicator selectable
+ * in the UI but silently always-false at evaluation time, with no warning
+ * anywhere). RSI/EMA/SMA/MACD/MACD_SIGNAL/VWAP all have real series
+ * functions as of Phase C (see BLOCKERS.md — BLOCKER-001 resolved for
+ * these six; Bollinger/ATR/ADX/Supertrend remain deliberately
+ * unregistered, not yet implemented).
  */
 
 const INDICATOR_REGISTRY = {
@@ -31,6 +29,35 @@ const INDICATOR_REGISTRY = {
             period: { type: "number", default: 20, min: 1, max: 500 },
         },
         warmup: (params = {}) => Number(params.period) || 20,
+    },
+    SMA: {
+        name: "SMA",
+        params: {
+            period: { type: "number", default: 20, min: 1, max: 500 },
+        },
+        warmup: (params = {}) => Number(params.period) || 20,
+    },
+    // Fixed 12/26/9 — matches indicatorService.js's calculateMACDSeries,
+    // which isn't parameterized yet. MACD and its signal line are
+    // registered as two separately-selectable indicator names (matching
+    // how the architecture's own DSL example writes "MACD > MACD_SIGNAL"
+    // as two operands), computed together under the hood.
+    MACD: {
+        name: "MACD",
+        params: {},
+        warmup: () => 35, // slowPeriod(26) + signalPeriod(9)
+    },
+    MACD_SIGNAL: {
+        name: "MACD_SIGNAL",
+        params: {},
+        warmup: () => 35,
+    },
+    // Session-anchored — resets every trading day, so its "warmup" is
+    // just needing the current session's bars so far, not a fixed lookback.
+    VWAP: {
+        name: "VWAP",
+        params: {},
+        warmup: () => 1,
     },
 };
 

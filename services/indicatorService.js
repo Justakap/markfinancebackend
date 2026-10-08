@@ -215,6 +215,103 @@ function calculateVWAP(candles = [], ltp = null, nowMs = Date.now()) {
     return Number((totalPriceVolume / totalVolume).toFixed(2));
 }
 
+/**
+ * Phase C additions — causal per-bar series for indicators that previously
+ * only had a single-latest-value function (BLOCKER-001 in
+ * .claude/state/BLOCKERS.md). Follow calculateEMASeries'/
+ * calculateRSISeries' existing offset-alignment pattern: null-pad the
+ * warmup period, place real values starting at the first bar where the
+ * underlying library actually produces one. No bar's value is ever
+ * computed using data from a later bar — each index only ever reads
+ * `candles[0..index]`.
+ */
+function calculateSMASeries(candles = [], period = 20) {
+    const closes = closesFromCandles(candles);
+    if (closes.length < period) {
+        return new Array(candles.length).fill(null);
+    }
+
+    const values = SMA.calculate({ values: closes, period });
+    const offset = candles.length - values.length;
+    const series = new Array(candles.length).fill(null);
+
+    values.forEach((value, index) => {
+        series[offset + index] = value == null ? null : Number(Number(value).toFixed(2));
+    });
+
+    return series;
+}
+
+/** Fixed 12/26/9 params, matching calculateMACD()'s existing single-value
+ *  function — not parameterized yet (no caller needs a custom MACD config
+ *  today; the registry can add params later without changing this shape). */
+function calculateMACDSeries(candles = []) {
+    const closes = closesFromCandles(candles);
+    const macdValues = MACD.calculate({
+        values: closes,
+        fastPeriod: 12,
+        slowPeriod: 26,
+        signalPeriod: 9,
+        SimpleMAOscillator: false,
+        SimpleMASignal: false,
+    });
+
+    const offset = candles.length - macdValues.length;
+    const macd = new Array(candles.length).fill(null);
+    const signal = new Array(candles.length).fill(null);
+    const histogram = new Array(candles.length).fill(null);
+
+    macdValues.forEach((entry, index) => {
+        macd[offset + index] = entry?.MACD != null ? Number(entry.MACD.toFixed(4)) : null;
+        signal[offset + index] = entry?.signal != null ? Number(entry.signal.toFixed(4)) : null;
+        histogram[offset + index] = entry?.histogram != null ? Number(entry.histogram.toFixed(4)) : null;
+    });
+
+    return { macd, signal, histogram };
+}
+
+/**
+ * Session-anchored, causal VWAP series: resets at each new calendar-day
+ * boundary (candle.date/candle.timestamp) and accumulates only forward —
+ * bar i's VWAP uses exactly the bars from that session's open through bar
+ * i, never a later bar. This is a genuinely different shape from
+ * calculateVWAP() above (which is "now, as of this instant, possibly
+ * blended with a live LTP") — this is the bar-by-bar historical series a
+ * backtest/chart-overlay needs instead.
+ */
+function calculateVWAPSeries(candles = []) {
+    const series = new Array(candles.length).fill(null);
+    let sessionKey = null;
+    let cumulativePriceVolume = 0;
+    let cumulativeVolume = 0;
+
+    candles.forEach((candle, index) => {
+        const ts = candle.date ?? candle.timestamp;
+        const day = ts ? new Date(ts).toDateString() : null;
+
+        if (day !== sessionKey) {
+            sessionKey = day;
+            cumulativePriceVolume = 0;
+            cumulativeVolume = 0;
+        }
+
+        const close = Number(candle.close);
+        const high = Number.isFinite(Number(candle.high)) ? Number(candle.high) : close;
+        const low = Number.isFinite(Number(candle.low)) ? Number(candle.low) : close;
+        const volume = Number(candle.volume) || 0;
+
+        if (Number.isFinite(close) && volume > 0) {
+            const typicalPrice = (high + low + close) / 3;
+            cumulativePriceVolume += typicalPrice * volume;
+            cumulativeVolume += volume;
+        }
+
+        series[index] = cumulativeVolume > 0 ? Number((cumulativePriceVolume / cumulativeVolume).toFixed(2)) : null;
+    });
+
+    return series;
+}
+
 function clearIndicatorCache() {
     // no-op: indicator cache removed for live accuracy
 }
@@ -226,8 +323,11 @@ module.exports = {
     calculateEMA,
     calculateEMASeries,
     calculateSMA,
+    calculateSMASeries,
     calculateMACD,
+    calculateMACDSeries,
     calculateVolumeAverage,
     calculateVWAP,
+    calculateVWAPSeries,
     clearIndicatorCache,
 };

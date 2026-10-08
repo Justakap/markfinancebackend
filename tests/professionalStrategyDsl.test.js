@@ -175,8 +175,12 @@ test("getProfessionalWarmupBars with no indicators at all returns 1", () => {
 // --- Validation ---
 
 test("Unregistered indicator is rejected (the legacy 'Future Indicators' bug, prevented)", () => {
+    // BOLLINGER has no series implementation (Phase C registered
+    // RSI/EMA/SMA/MACD/MACD_SIGNAL/VWAP only — see BLOCKERS.md) — it must
+    // never be silently accepted the way the legacy UI accepted MACD/VWAP
+    // before they had real series functions.
     assert.throws(
-        () => validateProfessionalNode(condition(indicatorOperand("MACD", {}), "GT", constantOperand(0))),
+        () => validateProfessionalNode(condition(indicatorOperand("BOLLINGER", {}), "GT", constantOperand(0))),
         /not implemented yet/,
     );
 });
