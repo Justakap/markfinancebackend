@@ -42,8 +42,40 @@ function applySlippage(price, side, slippagePct) {
     return side === "buy" ? price * (1 + slip) : price * (1 - slip);
 }
 
-function computeQuantity(equity, fillPrice, positionSizing) {
-    const pct = positionSizing?.type === "percentOfEquity" ? Number(positionSizing.value) : 100;
+/**
+ * Phase E — four sizing modes, all driven by the strategy's own
+ * `execution.positionSizing` config (validated in Phase B's
+ * validateStrategyDefinition) rather than hardcoded in the engine:
+ *
+ *  - percentOfEquity: value% of current equity, in shares (legacy default).
+ *  - fixedQuantity: exactly `value` units, regardless of equity/price.
+ *  - fixedCash: `value` currency units worth, in shares, regardless of equity.
+ *  - riskPercent: size so that `stopDistance * quantity` equals `value`%
+ *    of equity — requires a configured stop-loss (Phase B's validator
+ *    rejects riskPercent sizing without one); `stopDistance` must be
+ *    passed in by the caller (it's entry-price-dependent, computed at
+ *    fill time, not something this function can derive on its own).
+ */
+function computeQuantity(equity, fillPrice, positionSizing, { stopDistance = null } = {}) {
+    const type = positionSizing?.type || "percentOfEquity";
+    const value = Number(positionSizing?.value);
+
+    if (type === "fixedQuantity") {
+        return Number.isFinite(value) ? value : 0;
+    }
+
+    if (type === "fixedCash") {
+        return fillPrice > 0 && Number.isFinite(value) ? value / fillPrice : 0;
+    }
+
+    if (type === "riskPercent") {
+        if (!stopDistance || stopDistance <= 0 || !Number.isFinite(value)) return 0;
+        const riskBudget = equity * (value / 100);
+        return riskBudget / stopDistance;
+    }
+
+    // percentOfEquity (default)
+    const pct = Number.isFinite(value) ? value : 100;
     const allocatedCash = equity * (pct / 100);
     return fillPrice > 0 ? allocatedCash / fillPrice : 0;
 }
@@ -172,7 +204,8 @@ function runProfessionalBacktest({
         if (pendingEntryFromBar !== null && i === pendingEntryFromBar + 1) {
             const rawPrice = candle.open ?? candle.close;
             const fillPrice = applySlippage(rawPrice, "buy", slippagePct);
-            quantity = computeQuantity(equity, fillPrice, positionSizing);
+            const stopDistance = stopLossPct > 0 ? fillPrice * (stopLossPct / 100) : null;
+            quantity = computeQuantity(equity, fillPrice, positionSizing, { stopDistance });
             entryPrice = fillPrice;
             entryRawPrice = rawPrice;
             entryDate = candle.date;

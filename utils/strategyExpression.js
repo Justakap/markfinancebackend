@@ -629,6 +629,28 @@ function validateStrategyDefinition(definition) {
             if (!Number.isFinite(Number(sizing.value)) || Number(sizing.value) <= 0) {
                 throw makeValidationError("execution.positionSizing.value must be a positive number");
             }
+            // Phase E: riskPercent sizing computes quantity from the stop
+            // distance — meaningless (and silently zero at runtime) without
+            // a configured stop-loss to measure that distance from.
+            if (sizing.type === "riskPercent" && !definition.risk?.stopLoss) {
+                throw makeValidationError("execution.positionSizing.type \"riskPercent\" requires risk.stopLoss to be set");
+            }
+        }
+
+        // Phase E: optional per-strategy cost assumptions. Deliberately NOT
+        // read by the execution engine itself (backtestExecutionEngine.js
+        // takes commissionPct/slippagePct as explicit call parameters) —
+        // this is reproducibility metadata a future route/UI can surface
+        // as the strategy's own defaults, keeping the engine decoupled
+        // from where cost config comes from.
+        if (definition.execution.costs) {
+            ["commissionPct", "slippagePct"].forEach((key) => {
+                const value = definition.execution.costs[key];
+                if (value === undefined) return;
+                if (!Number.isFinite(Number(value)) || Number(value) < 0 || Number(value) > 5) {
+                    throw makeValidationError(`execution.costs.${key} must be a number between 0 and 5 (percent)`);
+                }
+            });
         }
     }
 }
