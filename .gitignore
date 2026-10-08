@@ -2,6 +2,10 @@ node_modules/
 dist/
 coverage/
 
+# Legacy strategy exports (scripts/exportLegacyStrategies.js) — user data,
+# never committed.
+exports/
+
 .env
 .env.*
 !.env.example
