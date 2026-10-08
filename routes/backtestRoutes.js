@@ -12,6 +12,7 @@ function createBacktestRoutes({
     runBacktestSimulation,
     getPeForInstrument,
     strategyUsesPe,
+    CORPORATE_ACTIONS_NOTE,
     upstoxMarketData,
     recordBacktestTime,
     VALIDATION_MODE,
@@ -109,6 +110,8 @@ function createBacktestRoutes({
                 message: backtestConfig.message,
                 candleCount: candles.length,
                 requiredIntervals: backtestConfig.requiredIntervals,
+                corporateActionsAdjusted: false,
+                corporateActionsNote: CORPORATE_ACTIONS_NOTE,
             };
 
             try {

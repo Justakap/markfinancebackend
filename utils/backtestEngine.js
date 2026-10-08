@@ -72,6 +72,21 @@ const INTERVAL_TO_RSI = {
 
 const backtestSeriesCache = new Map();
 
+/**
+ * Phase 2.0 audit finding: Upstox's own community support stated they adjust
+ * historical candles for splits/bonuses only (never dividends) — but the
+ * same thread documents a confirmed real split (PowerGrid, Sept 2023)
+ * returned UNADJUSTED, contradicting that claim. This backend performs no
+ * corporate-action adjustment of its own. Net effect: treat historical
+ * candles as unreliably adjusted, not reliably adjusted — surfaced to users
+ * rather than silently assumed correct.
+ */
+const CORPORATE_ACTIONS_NOTE =
+    "Historical prices may not be fully adjusted for stock splits, bonuses, or dividends. " +
+    "MarkFinance applies no correction of its own, and Upstox's own adjustment behavior for " +
+    "splits/bonuses has been inconsistent in practice. A large, unexplained price gap around a " +
+    "known corporate-action date may be a data artifact rather than a real market move.";
+
 function collectStrategyIndicators(strategy) {
     const entry = strategy.entryConditions?.length
         ? strategy.entryConditions
@@ -1017,6 +1032,7 @@ module.exports = {
     UPSTOX_INTERVAL_CONFIG,
     dataRowToEvaluatorSnapshot,
     strategyUsesPe,
+    CORPORATE_ACTIONS_NOTE,
 };
 
 function dataRowToEvaluatorSnapshot(row) {
