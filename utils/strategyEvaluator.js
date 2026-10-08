@@ -1,135 +1,42 @@
+/**
+ * Public, backward-compatible API over strategyExpression.js's primitives.
+ * Kept as a separate module (rather than inlining into strategyExpression.js)
+ * because existing call sites and tests import `evaluateCondition`/
+ * `evaluateStrategy`/`getBacktestStartIndex` from here specifically — Phase
+ * 2.2 did not rename or relocate any of this file's exports.
+ */
+const { getIndicatorWarmup } = require("./indicatorCatalog");
 const {
-    getFieldForIndicator,
-    getPrevFieldForIndicator,
-    getIndicatorWarmup,
-    normalizeIndicatorLabel,
-} = require("./indicatorCatalog");
+    evaluateCondition,
+    getIndicatorValue,
+    getPreviousIndicatorValue,
+    conditionsToExpression,
+    evaluateExpression,
+    getStrategyWarmupBars,
+} = require("./strategyExpression");
 
-function readField(stock, field) {
-    if (!stock || !field) return null;
-
-    const value = stock[field];
-
-    return value === undefined ? null : value;
-}
-
-function getIndicatorValue(stock, indicator) {
-    const field = getFieldForIndicator(indicator);
-
-    return readField(stock, field);
-}
-
-function getPreviousIndicatorValue(stock, indicator) {
-    const prevField = getPrevFieldForIndicator(indicator);
-
-    if (prevField) {
-        return readField(stock, prevField);
-    }
-
-    return null;
-}
-
-function evaluateCondition(current, previous, condition) {
-    const indicator = normalizeIndicatorLabel(condition.indicator);
-
-    if (!indicator) return false;
-
-    const left = getIndicatorValue(current, indicator);
-
-    let prevLeft = null;
-
-    if (previous) {
-        prevLeft = getIndicatorValue(previous, indicator);
-    } else {
-        prevLeft = getPreviousIndicatorValue(current, indicator);
-    }
-
-    let right;
-    let prevRight = null;
-
-    if (condition.compareType === "indicator") {
-        const rightIndicator = normalizeIndicatorLabel(condition.value);
-
-        if (!rightIndicator) return false;
-
-        right = getIndicatorValue(current, rightIndicator);
-
-        if (previous) {
-            prevRight = getIndicatorValue(previous, rightIndicator);
-        } else {
-            prevRight = getPreviousIndicatorValue(current, rightIndicator);
-        }
-    } else {
-        right = Number(condition.value);
-        prevRight = right;
-    }
-
-    if (left == null || right == null) return false;
-
-    switch (condition.operator) {
-        case ">":
-        case "Greater Than":
-            return left > right;
-        case "<":
-        case "Less Than":
-            return left < right;
-        case ">=":
-            return left >= right;
-        case "<=":
-            return left <= right;
-        case "=":
-        case "Equals":
-            return left === right;
-        case "Crosses Above":
-            if (prevLeft == null || prevRight == null) return false;
-
-            return prevLeft <= prevRight && left > right;
-        case "Crosses Below":
-            if (prevLeft == null || prevRight == null) return false;
-
-            return prevLeft >= prevRight && left < right;
-        default:
-            return false;
-    }
-}
-
+/**
+ * Flat-list entry point, unchanged signature and behavior. Internally this
+ * now normalizes `conditions` into an expression tree and runs it through
+ * the single recursive evaluator — conditionsToExpression() reproduces the
+ * exact old left-to-right AND/OR fold, so every existing caller (and
+ * evaluator.test.js) sees byte-identical results.
+ */
 function evaluateStrategy(current, previous, conditions = [], logic = "AND") {
-    if (!conditions || !conditions.length) return false;
-
-    let result = evaluateCondition(current, previous, conditions[0]);
-
-    for (let i = 1; i < conditions.length; i += 1) {
-        const connector = conditions[i - 1].nextLogic || logic || "AND";
-        const currentResult = evaluateCondition(
-            current,
-            previous,
-            conditions[i],
-        );
-
-        if (connector === "OR") {
-            result = result || currentResult;
-        } else {
-            result = result && currentResult;
-        }
-    }
-
-    return result;
+    const expression = conditionsToExpression(conditions, logic);
+    if (!expression) return false;
+    return evaluateExpression(current, previous, expression);
 }
 
-function getBacktestStartIndex(entryConditions, exitConditions) {
-    const indicators = [
-        ...(entryConditions || []),
-        ...(exitConditions || []),
-    ].flatMap((condition) => {
-        const values = [condition.indicator];
-        if (condition.compareType === "indicator") values.push(condition.value);
-        return values;
-    });
-
-    return Math.max(
-        1,
-        ...indicators.map((label) => getIndicatorWarmup(label)),
-    );
+/**
+ * Pre-2.2 this took (entryConditions, exitConditions) flat arrays. It now
+ * takes the full strategy object so it can resolve warmup bars from either
+ * a new entryExpression/exitExpression tree or legacy flat conditions via
+ * the single shared recursive traversal (collectStrategyIndicatorLabels).
+ * Its only caller (backtestEngine.js) was updated in the same change.
+ */
+function getBacktestStartIndex(strategy) {
+    return getStrategyWarmupBars(strategy);
 }
 
 module.exports = {

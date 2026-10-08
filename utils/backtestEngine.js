@@ -10,6 +10,12 @@ const {
     evaluateStrategy,
     getBacktestStartIndex,
 } = require("./strategyEvaluator");
+const {
+    getEntryExpression,
+    getExitExpression,
+    evaluateExpression,
+    collectStrategyIndicatorLabels,
+} = require("./strategyExpression");
 const { normalizeIndicatorLabel } = require("./indicatorCatalog");
 
 const COMMISSION_PCT = Number(process.env.BACKTEST_COMMISSION_PCT || 0.03);
@@ -87,17 +93,15 @@ const CORPORATE_ACTIONS_NOTE =
     "splits/bonuses has been inconsistent in practice. A large, unexplained price gap around a " +
     "known corporate-action date may be a data artifact rather than a real market move.";
 
+/**
+ * Delegates to the single recursive expression-tree traversal
+ * (strategyExpression.js) rather than re-walking flat conditions here —
+ * this now discovers indicators from entryExpression/exitExpression trees
+ * (any nesting depth) as well as legacy flat entryConditions/conditions/
+ * exitConditions, with no duplicated discovery logic.
+ */
 function collectStrategyIndicators(strategy) {
-    const entry = strategy.entryConditions?.length
-        ? strategy.entryConditions
-        : strategy.conditions || [];
-    const exit = strategy.exitConditions || [];
-
-    return [...entry, ...exit].flatMap((condition) => {
-        const values = [condition.indicator];
-        if (condition.compareType === "indicator") values.push(condition.value);
-        return values;
-    });
+    return collectStrategyIndicatorLabels(strategy);
 }
 
 /**
@@ -633,12 +637,18 @@ function runBacktestSimulation({
     let pendingExitReason = null;
     let pendingExitSignalIndex = null;
 
+    // Kept for audit-log/signalLogs display text (describeCondition) and the
+    // legacy verifyTradeSignal() path only — actual signal control flow below
+    // uses entryExpression/exitExpression so both legacy flat strategies and
+    // new nested-tree strategies evaluate correctly.
     const entryConditions = strategy.entryConditions?.length
         ? strategy.entryConditions
         : strategy.conditions || [];
-
     const exitConditions = strategy.exitConditions || [];
-    const startIndex = getBacktestStartIndex(entryConditions, exitConditions);
+
+    const entryExpression = getEntryExpression(strategy);
+    const exitExpression = getExitExpression(strategy);
+    const startIndex = getBacktestStartIndex(strategy);
 
     for (let i = startIndex; i < data.length; i += 1) {
         const candle = candles[i];
@@ -756,12 +766,9 @@ function runBacktestSimulation({
         const previous = data[i - 1];
 
         if (!inPosition && pendingEntryFromBar === null) {
-            const entrySignal = evaluateStrategy(
-                current,
-                previous,
-                entryConditions,
-                strategy.logic || "AND",
-            );
+            const entrySignal = entryExpression
+                ? evaluateExpression(current, previous, entryExpression)
+                : false;
 
             if (entrySignal) {
                 signalStats.entrySignalsFound += 1;
@@ -791,13 +798,8 @@ function runBacktestSimulation({
             const targetHit =
                 targetPrice !== null && current.close >= targetPrice;
             const exitSignal =
-                exitConditions.length > 0 &&
-                evaluateStrategy(
-                    current,
-                    previous,
-                    exitConditions,
-                    strategy.logic || "AND",
-                );
+                Boolean(exitExpression) &&
+                evaluateExpression(current, previous, exitExpression);
 
             if (exitSignal) {
                 signalStats.exitSignalsFound += 1;
@@ -1033,6 +1035,7 @@ module.exports = {
     dataRowToEvaluatorSnapshot,
     strategyUsesPe,
     CORPORATE_ACTIONS_NOTE,
+    collectStrategyIndicators,
 };
 
 function dataRowToEvaluatorSnapshot(row) {

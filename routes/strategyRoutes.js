@@ -1,5 +1,51 @@
 const express = require("express");
 const mongoose = require("mongoose");
+const { validateExpressionTree } = require("../utils/strategyExpression");
+
+// Every field a client is legitimately allowed to write. Phase 2.0 found
+// PUT /strategies/:id passed raw req.body into findOneAndUpdate with no
+// whitelist (the ownership-scoped filter was fine, but the update document
+// itself wasn't) — both create and update now funnel through this single
+// list so neither route can set userId, _id, timestamps, or any other
+// unexpected field via a crafted request body.
+const STRATEGY_WRITABLE_FIELDS = [
+    "name",
+    "description",
+    "status",
+    "logic",
+    "conditions",
+    "entryConditions",
+    "exitConditions",
+    "entryExpression",
+    "exitExpression",
+    "stopLoss",
+    "target",
+    "alertEnabled",
+];
+
+function pickStrategyFields(body = {}) {
+    const picked = {};
+    STRATEGY_WRITABLE_FIELDS.forEach((field) => {
+        if (body[field] !== undefined) picked[field] = body[field];
+    });
+    return picked;
+}
+
+/** Validates entryExpression/exitExpression if present in the payload.
+ *  Throws (statusCode 400, clientMessage set) on a malformed tree. Legacy
+ *  flat conditions arrays are left to Mongoose's existing subdocument
+ *  schema validation, unchanged. */
+function validateStrategyPayload(payload) {
+    // `null` is a deliberate, valid signal from the frontend meaning "clear
+    // this expression" (e.g. the user emptied all exit conditions) — only a
+    // truthy tree is actually validated as a structure.
+    if (payload.entryExpression) {
+        validateExpressionTree(payload.entryExpression, "entry expression");
+    }
+    if (payload.exitExpression) {
+        validateExpressionTree(payload.exitExpression, "exit expression");
+    }
+}
 
 function createStrategyRoutes({
     Strategy,
@@ -78,21 +124,21 @@ function createStrategyRoutes({
     // Strategy
     router.post("/strategies", requireAuth, async (req, res) => {
         try {
-            const { name, description, entryConditions, exitConditions, stopLoss, target, logic, alertEnabled } =
-                req.body;
+            const fields = pickStrategyFields(req.body);
 
-            if (!name || !name.trim()) return res.status(400).json({ message: "Strategy name required" });
+            if (!fields.name || !fields.name.trim()) {
+                return res.status(400).json({ message: "Strategy name required" });
+            }
+
+            try {
+                validateStrategyPayload(fields);
+            } catch (error) {
+                return res.status(error.statusCode || 400).json({ message: error.clientMessage });
+            }
 
             const strategy = await Strategy.create({
                 userId: req.user.mongoId,
-                name,
-                description,
-                entryConditions,
-                exitConditions,
-                stopLoss,
-                target,
-                logic,
-                alertEnabled,
+                ...fields,
             });
 
             res.status(201).json(strategy);
@@ -117,9 +163,17 @@ function createStrategyRoutes({
 
     router.put("/strategies/:id", requireAuth, validateObjectId("id"), async (req, res) => {
         try {
+            const fields = pickStrategyFields(req.body);
+
+            try {
+                validateStrategyPayload(fields);
+            } catch (error) {
+                return res.status(error.statusCode || 400).json({ message: error.clientMessage });
+            }
+
             const strategy = await Strategy.findOneAndUpdate(
                 { _id: req.params.id, userId: req.user.mongoId },
-                req.body,
+                fields,
                 { returnDocument: "after" },
             );
 
@@ -209,4 +263,9 @@ function createStrategyRoutes({
     return router;
 }
 
-module.exports = { createStrategyRoutes };
+module.exports = {
+    createStrategyRoutes,
+    pickStrategyFields,
+    validateStrategyPayload,
+    STRATEGY_WRITABLE_FIELDS,
+};

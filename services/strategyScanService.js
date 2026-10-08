@@ -1,4 +1,8 @@
-const { evaluateStrategy } = require("../utils/strategyEvaluator");
+const {
+    getEntryExpression,
+    getExitExpression,
+    evaluateExpression,
+} = require("../utils/strategyExpression");
 const {
     buildBacktestIndicators,
     fetchCandleSeriesForBacktest,
@@ -54,16 +58,9 @@ async function mapWithLimit(items = [], limit, worker) {
     return results;
 }
 
-function getEntryConditions(strategy) {
-    return strategy.entryConditions?.length
-        ? strategy.entryConditions
-        : strategy.conditions || [];
-}
-
 function getScanMode(strategy) {
-    const exitConditions = strategy.exitConditions || [];
     const hasExitRules =
-        exitConditions.length > 0 ||
+        Boolean(getExitExpression(strategy)) ||
         Number(strategy.stopLoss) > 0 ||
         Number(strategy.target) > 0;
 
@@ -145,17 +142,13 @@ async function buildScanEvaluatorRows(stock, strategy) {
 }
 
 function matchesScan(strategy, current, previous) {
-    const entryConditions = getEntryConditions(strategy);
-    const exitConditions = strategy.exitConditions || [];
-    const logic = strategy.logic || "AND";
+    const entryExpression = getEntryExpression(strategy);
+    const exitExpression = getExitExpression(strategy);
     const mode = getScanMode(strategy);
 
-    const entry = evaluateStrategy(
-        current,
-        previous,
-        entryConditions,
-        logic,
-    );
+    const entry = entryExpression
+        ? evaluateExpression(current, previous, entryExpression)
+        : false;
 
     if (mode === "entry") {
         return entry;
@@ -163,13 +156,8 @@ function matchesScan(strategy, current, previous) {
 
     if (!entry) return false;
 
-    if (exitConditions.length) {
-        const exit = evaluateStrategy(
-            current,
-            previous,
-            exitConditions,
-            logic,
-        );
+    if (exitExpression) {
+        const exit = evaluateExpression(current, previous, exitExpression);
         if (exit) return false;
     }
 
