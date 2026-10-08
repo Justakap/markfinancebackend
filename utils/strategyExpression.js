@@ -26,6 +26,13 @@ const {
     getIndicatorWarmup,
     normalizeIndicatorLabel,
 } = require("./indicatorCatalog");
+const {
+    isRegisteredIndicator,
+    indicatorKey,
+    getIndicatorWarmupBars,
+    VALID_TIMEFRAMES,
+    PRICE_FIELDS,
+} = require("./indicatorRegistry");
 
 const VALID_OPERATORS = [
     ">",
@@ -320,6 +327,312 @@ function validateExpressionTree(node, label = "expression") {
     }
 }
 
+/**
+ * ============================================================
+ * Phase B — professional DSL (ADR-007: evolves this file, does not
+ * replace it). Used only by StrategyVersion.definition documents (the new
+ * system); completely independent of the legacy evaluateExpression()
+ * above, which keeps serving Strategy.js's flat-condition strategies
+ * unchanged.
+ *
+ * CONDITION leaf shape (new, structured — not the legacy
+ * {indicator,operator,compareType,value} string-label shape):
+ *
+ *   { type: "condition", left: <operand>, operator: PROFESSIONAL_OPERATOR, right: <operand> }
+ *
+ * Operand shapes:
+ *   { type: "indicator", name: "RSI", params: { period: 14 }, timeframe?: "5m" }
+ *   { type: "price", field: "close" | "open" | "high" | "low" | "volume" }
+ *   { type: "constant", value: <number> }
+ *
+ * GROUP shape is identical to the legacy one: { type: "group", operator: "AND"|"OR", children: [...] }.
+ *
+ * Context row shape Phase C's Indicator Engine must produce, and this
+ * evaluator consumes (per timeframe, one row per evaluated bar):
+ *
+ *   { open, high, low, close, volume, indicators: { [indicatorKey(name,params)]: value|null } }
+ *
+ * A full StrategyContext is `{ [timeframe]: row }` so a condition whose
+ * operand specifies a non-primary `timeframe` can still be resolved —
+ * Phase C is responsible for aligning auxiliary-timeframe rows onto the
+ * primary bar index (same problem backtestEngine.js's
+ * alignRsiToPrimaryBars already solves for the legacy engine; Phase C
+ * should generalize that, not reinvent it).
+ * ============================================================
+ */
+
+const PROFESSIONAL_OPERATORS = ["GT", "LT", "GTE", "LTE", "EQ", "CROSSES_ABOVE", "CROSSES_BELOW"];
+
+/** Picks the row for an operand's timeframe out of a multi-timeframe
+ *  context; `defaultTimeframe` is the primary timeframe used when the
+ *  operand doesn't specify its own. */
+function pickContextRow(context, timeframe, defaultTimeframe) {
+    if (!context) return null;
+    const key = timeframe || defaultTimeframe;
+    return context[key] || null;
+}
+
+function resolveOperand(row, operand) {
+    if (!row || !operand) return null;
+
+    if (operand.type === "constant") {
+        const num = Number(operand.value);
+        return Number.isFinite(num) ? num : null;
+    }
+
+    if (operand.type === "price") {
+        const value = row[operand.field];
+        return value === undefined || value === null ? null : value;
+    }
+
+    if (operand.type === "indicator") {
+        const key = indicatorKey(operand.name, operand.params || {});
+        const value = row.indicators?.[key];
+        return value === undefined ? null : value;
+    }
+
+    return null;
+}
+
+function compareProfessional(operator, left, right, prevLeft, prevRight) {
+    if (left == null || right == null) return false;
+
+    switch (operator) {
+        case "GT":
+            return left > right;
+        case "LT":
+            return left < right;
+        case "GTE":
+            return left >= right;
+        case "LTE":
+            return left <= right;
+        case "EQ":
+            return left === right;
+        case "CROSSES_ABOVE":
+            if (prevLeft == null || prevRight == null) return false;
+            return prevLeft <= prevRight && left > right;
+        case "CROSSES_BELOW":
+            if (prevLeft == null || prevRight == null) return false;
+            return prevLeft >= prevRight && left < right;
+        default:
+            return false;
+    }
+}
+
+/**
+ * `current`/`previous` are StrategyContext objects (`{ [timeframe]: row }`
+ * — see the file-level doc comment above). `defaultTimeframe` resolves any
+ * operand that doesn't specify its own `timeframe`.
+ */
+function evaluateProfessionalCondition(current, previous, node, defaultTimeframe) {
+    const leftRow = pickContextRow(current, node.left?.timeframe, defaultTimeframe);
+    const rightRow = pickContextRow(current, node.right?.timeframe, defaultTimeframe);
+    const left = resolveOperand(leftRow, node.left);
+    const right = resolveOperand(rightRow, node.right);
+
+    let prevLeft = null;
+    let prevRight = null;
+    if (previous) {
+        prevLeft = resolveOperand(pickContextRow(previous, node.left?.timeframe, defaultTimeframe), node.left);
+        prevRight = resolveOperand(pickContextRow(previous, node.right?.timeframe, defaultTimeframe), node.right);
+    }
+
+    return compareProfessional(node.operator, left, right, prevLeft, prevRight);
+}
+
+function evaluateProfessionalExpression(current, previous, node, defaultTimeframe) {
+    if (!node) return false;
+
+    if (node.type === "condition") {
+        return evaluateProfessionalCondition(current, previous, node, defaultTimeframe);
+    }
+
+    if (node.type === "group") {
+        const children = node.children || [];
+        if (node.operator === "OR") {
+            return children.some((child) => evaluateProfessionalExpression(current, previous, child, defaultTimeframe));
+        }
+        return children.every((child) => evaluateProfessionalExpression(current, previous, child, defaultTimeframe));
+    }
+
+    return false;
+}
+
+/** Recursively collects every (name, params, timeframe) an expression
+ *  references — Phase C's context builder needs this to know what series
+ *  to compute, per timeframe, before evaluation can run. Mirrors
+ *  collectIndicatorLabels()'s role for the legacy DSL, but operand-aware. */
+function collectIndicatorRequirements(node, acc = [], defaultTimeframe = null) {
+    if (!node) return acc;
+
+    if (node.type === "condition") {
+        [node.left, node.right].forEach((operand) => {
+            if (operand?.type === "indicator") {
+                acc.push({
+                    name: operand.name,
+                    params: operand.params || {},
+                    timeframe: operand.timeframe || defaultTimeframe,
+                });
+            }
+        });
+        return acc;
+    }
+
+    if (node.type === "group") {
+        (node.children || []).forEach((child) => collectIndicatorRequirements(child, acc, defaultTimeframe));
+    }
+
+    return acc;
+}
+
+function getProfessionalWarmupBars(node, defaultTimeframe = null) {
+    const requirements = collectIndicatorRequirements(node, [], defaultTimeframe);
+    if (!requirements.length) return 1;
+    return Math.max(1, ...requirements.map((req) => getIndicatorWarmupBars(req.name, req.params)));
+}
+
+function validateOperand(operand, path) {
+    if (!operand || typeof operand !== "object" || Array.isArray(operand)) {
+        throw makeValidationError(`${path}: invalid operand`);
+    }
+
+    if (operand.type === "constant") {
+        if (!Number.isFinite(Number(operand.value))) {
+            throw makeValidationError(`${path}: constant operand requires a numeric value`);
+        }
+        return;
+    }
+
+    if (operand.type === "price") {
+        if (!PRICE_FIELDS.includes(operand.field)) {
+            throw makeValidationError(`${path}: invalid price field "${String(operand.field)}"`);
+        }
+        return;
+    }
+
+    if (operand.type === "indicator") {
+        if (!isRegisteredIndicator(operand.name)) {
+            throw makeValidationError(
+                `${path}: indicator "${String(operand.name)}" is not implemented yet — it cannot be used in a strategy until its series calculation exists (see BLOCKERS.md)`,
+            );
+        }
+        if (operand.timeframe !== undefined && !VALID_TIMEFRAMES.includes(operand.timeframe)) {
+            throw makeValidationError(`${path}: invalid timeframe "${String(operand.timeframe)}"`);
+        }
+        return;
+    }
+
+    throw makeValidationError(`${path}: unknown operand type "${String(operand.type)}"`);
+}
+
+function validateProfessionalNode(node, state = { depth: 0, counter: { count: 0 } }) {
+    state.counter.count += 1;
+
+    if (state.counter.count > MAX_EXPRESSION_NODES) {
+        throw makeValidationError(`Strategy expression has too many nodes (max ${MAX_EXPRESSION_NODES})`);
+    }
+
+    if (state.depth > MAX_EXPRESSION_DEPTH) {
+        throw makeValidationError(`Strategy expression is nested too deeply (max depth ${MAX_EXPRESSION_DEPTH})`);
+    }
+
+    if (!node || typeof node !== "object" || Array.isArray(node)) {
+        throw makeValidationError("Invalid expression node");
+    }
+
+    if (node.type === "condition") {
+        if (!PROFESSIONAL_OPERATORS.includes(node.operator)) {
+            throw makeValidationError(`Invalid condition operator: ${String(node.operator)}`);
+        }
+        validateOperand(node.left, "left");
+        validateOperand(node.right, "right");
+        return;
+    }
+
+    if (node.type === "group") {
+        if (node.operator !== "AND" && node.operator !== "OR") {
+            throw makeValidationError(`Invalid group operator: ${String(node.operator)}`);
+        }
+        if (!Array.isArray(node.children) || node.children.length === 0) {
+            throw makeValidationError("Group must have at least one child");
+        }
+        node.children.forEach((child) =>
+            validateProfessionalNode(child, { depth: state.depth + 1, counter: state.counter }),
+        );
+        return;
+    }
+
+    throw makeValidationError(`Unknown expression node type: ${String(node.type)}`);
+}
+
+function validateProfessionalExpression(node, label = "expression") {
+    try {
+        validateProfessionalNode(node);
+    } catch (error) {
+        error.clientMessage = `Invalid ${label}: ${error.clientMessage}`;
+        throw error;
+    }
+}
+
+/**
+ * Validates an entire StrategyVersion.definition document (not just one
+ * entry/exit tree) — universe/risk/execution shape, per the professional
+ * DSL example in the architecture audit. Deliberately conservative: only
+ * validates what Phase B/D actually need to agree on; does not invent
+ * fields no later phase consumes yet.
+ */
+function validateStrategyDefinition(definition) {
+    if (!definition || typeof definition !== "object") {
+        throw makeValidationError("Strategy definition must be an object");
+    }
+
+    if (definition.version !== 2) {
+        throw makeValidationError('Strategy definition must declare "version": 2');
+    }
+
+    if (!definition.universe || !VALID_TIMEFRAMES.includes(definition.universe.timeframe)) {
+        throw makeValidationError("universe.timeframe must be one of " + VALID_TIMEFRAMES.join(", "));
+    }
+
+    if (!definition.entry) {
+        throw makeValidationError("A strategy definition requires an entry expression");
+    }
+    validateProfessionalExpression(definition.entry, "entry expression");
+
+    if (definition.exit) {
+        validateProfessionalExpression(definition.exit, "exit expression");
+    }
+
+    if (definition.risk) {
+        ["stopLoss", "takeProfit"].forEach((key) => {
+            const rule = definition.risk[key];
+            if (rule === undefined) return;
+            if (rule.type !== "percent" || !Number.isFinite(Number(rule.value)) || Number(rule.value) <= 0) {
+                throw makeValidationError(`risk.${key} must be {type:"percent", value:<positive number>}`);
+            }
+        });
+    }
+
+    if (definition.execution) {
+        if (definition.execution.side && definition.execution.side !== "LONG") {
+            // Short positions are an explicitly deferred phase (architecture
+            // audit §9/Risk-Execution model) — reject rather than silently
+            // accept and ignore.
+            throw makeValidationError('execution.side: only "LONG" is supported in this phase');
+        }
+        const sizing = definition.execution.positionSizing;
+        if (sizing) {
+            const validSizingTypes = ["percentOfEquity", "fixedQuantity", "fixedCash", "riskPercent"];
+            if (!validSizingTypes.includes(sizing.type)) {
+                throw makeValidationError(`execution.positionSizing.type must be one of ${validSizingTypes.join(", ")}`);
+            }
+            if (!Number.isFinite(Number(sizing.value)) || Number(sizing.value) <= 0) {
+                throw makeValidationError("execution.positionSizing.value must be a positive number");
+            }
+        }
+    }
+}
+
 module.exports = {
     VALID_OPERATORS,
     MAX_EXPRESSION_DEPTH,
@@ -336,4 +649,15 @@ module.exports = {
     getStrategyWarmupBars,
     validateExpressionNode,
     validateExpressionTree,
+
+    // Phase B — professional DSL (separate from everything above)
+    PROFESSIONAL_OPERATORS,
+    resolveOperand,
+    evaluateProfessionalCondition,
+    evaluateProfessionalExpression,
+    collectIndicatorRequirements,
+    getProfessionalWarmupBars,
+    validateProfessionalNode,
+    validateProfessionalExpression,
+    validateStrategyDefinition,
 };
