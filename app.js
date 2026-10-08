@@ -7,6 +7,10 @@ const Watchlist = require("./models/Watchlist");
 const User = require("./models/User");
 const Strategy = require("./models/Strategy");
 const Backtest = require("./models/Backtest");
+const StrategyDefinition = require("./models/StrategyDefinition");
+const StrategyVersion = require("./models/StrategyVersion");
+const BacktestResult = require("./models/BacktestResult");
+const BacktestTrade = require("./models/BacktestTrade");
 const { requireAuth } = require("./middleware/auth");
 const { validateObjectId } = require("./middleware/validateObjectId");
 const { getJwtSecret } = require("./config/jwt");
@@ -46,6 +50,7 @@ const {
     getOptionExpiries,
     isValidExpiryFormat,
 } = require("./services/optionChainService");
+const { runAndPersistBacktest } = require("./services/professionalBacktestService");
 const { getMetrics, recordScanTime, recordBacktestTime } = require("./utils/metrics");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -57,6 +62,7 @@ const { createWatchlistRoutes } = require("./routes/watchlistRoutes");
 const { createBacktestRoutes } = require("./routes/backtestRoutes");
 const { createDashboardRoutes } = require("./routes/dashboardRoutes");
 const { createOptionChainRoutes } = require("./routes/optionChainRoutes");
+const { createProfessionalBacktestRoutes } = require("./routes/professionalBacktestRoutes");
 
 const VALIDATION_MODE =
     process.env.ENABLE_VALIDATION_MODE === "true" ||
@@ -201,6 +207,22 @@ app.use(
         getOptionChain,
         getOptionExpiries,
         isValidExpiryFormat,
+    }),
+);
+
+app.use(
+    "/api",
+    createProfessionalBacktestRoutes({
+        StrategyDefinition,
+        StrategyVersion,
+        BacktestResult,
+        BacktestTrade,
+        requireAuth,
+        validateObjectId,
+        backtestLimiter,
+        resolveInstrumentKey,
+        upstoxMarketData,
+        runAndPersistBacktest,
     }),
 );
 
