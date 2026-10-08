@@ -23,6 +23,7 @@ const {
     searchRateLimit,
     authLimiter,
     backtestLimiter,
+    optionChainLimiter,
     writeLimiter,
 } = require("./middleware/rateLimiters");
 const {
@@ -39,6 +40,11 @@ const upstoxMarketData = require("./services/marketDataService");
 const { resolveInstrumentKey } = require("./utils/instrumentKeyResolver");
 const { SAMPLE_STRATEGIES } = require("./utils/sampleStrategies");
 const { getPeForInstrument } = require("./services/fundamentalService");
+const {
+    getOptionChain,
+    getOptionExpiries,
+    isValidExpiryFormat,
+} = require("./services/optionChainService");
 const { getMetrics, recordScanTime, recordBacktestTime } = require("./utils/metrics");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -49,6 +55,7 @@ const { createStrategyRoutes } = require("./routes/strategyRoutes");
 const { createWatchlistRoutes } = require("./routes/watchlistRoutes");
 const { createBacktestRoutes } = require("./routes/backtestRoutes");
 const { createDashboardRoutes } = require("./routes/dashboardRoutes");
+const { createOptionChainRoutes } = require("./routes/optionChainRoutes");
 
 const VALIDATION_MODE =
     process.env.ENABLE_VALIDATION_MODE === "true" ||
@@ -180,6 +187,18 @@ app.use(
         requireAuth,
         getMetrics,
         upstoxMarketData,
+    }),
+);
+
+app.use(
+    "/api",
+    createOptionChainRoutes({
+        requireAuth,
+        optionChainLimiter,
+        upstoxMarketData,
+        getOptionChain,
+        getOptionExpiries,
+        isValidExpiryFormat,
     }),
 );
 

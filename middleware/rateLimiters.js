@@ -49,6 +49,16 @@ const backtestLimiter = expressRateLimit({
     message: { message: "Too many backtest requests. Wait a moment and retry." },
 });
 
+// Option-chain Upstox endpoint has no documented per-endpoint rate limit
+// (Phase 2.0 audit) — kept conservative rather than assumed generous.
+const optionChainLimiter = expressRateLimit({
+    windowMs: 60 * 1000,
+    max: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { message: "Too many option-chain requests. Wait a moment and retry." },
+});
+
 // Generous safety net on all other mutating /api requests — not meant to bother normal usage.
 const writeLimiter = expressRateLimit({
     windowMs: 60 * 1000,
@@ -64,5 +74,6 @@ module.exports = {
     searchRateLimit,
     authLimiter,
     backtestLimiter,
+    optionChainLimiter,
     writeLimiter,
 };
