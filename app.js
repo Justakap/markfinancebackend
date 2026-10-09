@@ -13,6 +13,8 @@ const BacktestResult = require("./models/BacktestResult");
 const BacktestTrade = require("./models/BacktestTrade");
 const LiveStrategyRuntime = require("./models/LiveStrategyRuntime");
 const LiveStrategySignal = require("./models/LiveStrategySignal");
+const AlertConfiguration = require("./models/AlertConfiguration");
+const Notification = require("./models/Notification");
 const { requireAuth } = require("./middleware/auth");
 const { validateObjectId } = require("./middleware/validateObjectId");
 const { getJwtSecret } = require("./config/jwt");
@@ -73,6 +75,13 @@ const { createProfessionalStrategyRoutes } = require("./routes/professionalStrat
 const { createLiveStrategyRoutes } = require("./routes/liveStrategyRoutes");
 const { activateLiveStrategy, deactivateLiveStrategy } = require("./services/liveStrategyService");
 const { startLiveEnginePolling, stopLiveEnginePolling } = require("./services/liveStrategyOrchestrator");
+const { createAlertRoutes } = require("./routes/alertRoutes");
+const {
+    createAlertConfiguration,
+    updateAlertConfiguration,
+    archiveAlertConfiguration,
+} = require("./services/alertConfigurationService");
+const { startAlertProcessingPolling, stopAlertProcessingPolling } = require("./services/alertNotificationService");
 
 const VALIDATION_MODE =
     process.env.ENABLE_VALIDATION_MODE === "true" ||
@@ -268,6 +277,20 @@ app.use(
     }),
 );
 
+app.use(
+    "/api",
+    createAlertRoutes({
+        LiveStrategyRuntime,
+        AlertConfiguration,
+        Notification,
+        requireAuth,
+        validateObjectId,
+        createAlertConfiguration,
+        updateAlertConfiguration,
+        archiveAlertConfiguration,
+    }),
+);
+
 app.use(notFoundHandler);
 app.use(errorHandler);
 
@@ -305,6 +328,12 @@ async function startServer() {
     startLiveEnginePolling({ LiveStrategyRuntime, LiveStrategySignal, StrategyVersion });
     console.log("Live strategy engine polling enabled");
 
+    // Workstream K — consumes LiveStrategySignal as a durable outbox and
+    // produces de-duplicated Notification documents; see
+    // services/alertNotificationService.js's file doc comment.
+    startAlertProcessingPolling({ LiveStrategyRuntime, LiveStrategySignal, AlertConfiguration, Notification });
+    console.log("Alert notification polling enabled");
+
     server.listen(PORT, () => {
         console.log(`Server running on port ${PORT} (Socket.IO enabled)`);
     });
@@ -323,6 +352,7 @@ async function startServer() {
         forceExitTimer.unref();
 
         try {
+            stopAlertProcessingPolling();
             stopLiveEnginePolling();
             upstoxMarketData.shutdown();
             io.close();
