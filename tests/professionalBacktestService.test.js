@@ -188,6 +188,18 @@ function professionalDefinition(overrides = {}) {
         // reopened later) would silently lack these disclosures.
         assert.strictEqual(resultDoc.dataQuality.historicalPeSupported, false);
         assert.strictEqual(resultDoc.dataQuality.corporateActionsNote, dataQuality.corporateActionsNote);
+
+        // Verification-pass audit (2026-10-09): the cost-model disclosure
+        // must name the exact commission/slippage rates actually used for
+        // THIS run and explicitly state what real-world statutory charges
+        // (STT/exchange/GST/SEBI/stamp duty) are not included — never let
+        // "net P&L" be presented as if it were real-world-complete.
+        assert.ok(dataQuality.tradingCostModelNote.includes("commission 0.03%"));
+        assert.ok(dataQuality.tradingCostModelNote.includes("slippage 0.05%"));
+        assert.ok(dataQuality.tradingCostModelNote.includes("STT"));
+        assert.ok(dataQuality.tradingCostModelNote.includes("GST"));
+        assert.ok(dataQuality.tradingCostModelNote.includes("stamp duty"));
+        assert.strictEqual(resultDoc.dataQuality.tradingCostModelNote, dataQuality.tradingCostModelNote);
     });
 
     await test("Ownership/version resolution: service runs fine given a plain StrategyVersion-shaped object (no Mongoose coupling)", async () => {

@@ -982,7 +982,10 @@ async function buildRow(stock, options = {}) {
             price: null,
             changePercent: 0,
             change: 0,
-            volume: 0,
+            // Every other data field in this object is null (no data for
+            // this instrument) — volume must match, not fabricate 0
+            // (verification-pass audit finding, 2026-10-09).
+            volume: null,
             timestamp: null,
             ema20: null,
             ema75: null,
@@ -1022,7 +1025,10 @@ async function buildRow(stock, options = {}) {
             price: null,
             changePercent: 0,
             change: 0,
-            volume: 0,
+            // Every other data field in this object is null (no data for
+            // this instrument) — volume must match, not fabricate 0
+            // (verification-pass audit finding, 2026-10-09).
+            volume: null,
             timestamp: null,
             ema20: null,
             ema75: null,
@@ -1100,7 +1106,12 @@ async function buildRow(stock, options = {}) {
         changeAmount: isValidLtp(live.ltp) ? live.changeAmount ?? 0 : 0,
         changePercent: isValidLtp(live.ltp) ? live.changePercent ?? 0 : 0,
         change: isValidLtp(live.ltp) ? live.changePercent ?? 0 : 0,
-        volume: volume ?? 0,
+        // `volume` above is already null-safe (live tick, else candle, else
+        // null) — never coerce that genuine absence to 0 here, same
+        // null-vs-fabricated-zero discipline as every other field in this
+        // row (toFiniteNumber()'s frontend equivalent; verification-pass
+        // audit finding, 2026-10-09).
+        volume,
         timestamp: live.timestamp || null,
         ema20: indicatorFields.ema20 ?? null,
         ema75: indicatorFields.ema75 ?? null,
@@ -1277,7 +1288,9 @@ function buildQuickRow(stock) {
         changeAmount: isValidLtp(live.ltp) ? live.changeAmount ?? 0 : 0,
         changePercent: isValidLtp(live.ltp) ? live.changePercent ?? 0 : 0,
         change: isValidLtp(live.ltp) ? live.changePercent ?? 0 : 0,
-        volume: live.volume ?? 0,
+        // Never coerce a genuinely-missing volume to 0 — same discipline as
+        // every other field here (verification-pass audit finding, 2026-10-09).
+        volume: live.volume ?? null,
         timestamp: live.timestamp || null,
         ema20: cachedIndicators?.ema20 ?? snapshot.ema20 ?? null,
         ema75: cachedIndicators?.ema75 ?? snapshot.ema75 ?? null,
@@ -1478,4 +1491,10 @@ module.exports = {
     isValidInstrumentKey,
     getInstrumentMeta,
     loadInstruments,
+    // Exposed for direct unit testing of row-building (verification-pass
+    // audit, 2026-10-09) — no network/DB access needed to call either
+    // (buildRow's PE lookup is opt-in via options.includePe, default false;
+    // the cached-bundle read is an in-memory Map lookup, never a fetch).
+    buildRow,
+    buildQuickRow,
 };

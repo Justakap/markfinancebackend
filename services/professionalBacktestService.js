@@ -139,6 +139,24 @@ async function runAndPersistBacktest({
         slTpAmbiguityPolicy: "When one bar touches both stop-loss and take-profit, the stop is always assumed to have triggered first.",
         isDerivativeInstrument: isDerivative,
         cappedTimeframes,
+        // Verification-pass audit (2026-10-09) finding: this engine's
+        // cost model is exactly two user-configurable percentages
+        // (commissionPct, slippagePct) applied symmetrically to both
+        // sides of every trade. It does NOT include, and never has
+        // included, STT, exchange transaction charges, GST, SEBI
+        // turnover fees, or stamp duty — the actual statutory charges on
+        // a real Indian equity trade, which are asymmetric (e.g. STT is
+        // sell-side-only intraday, buy-side-only for stamp duty) and
+        // cannot be approximated by one symmetric percentage at any
+        // value. `netPnl`/`totalReturnPct`/every trade-statistics field
+        // in `summary` reflects ONLY commission+slippage as configured
+        // below — never real-world-complete trading costs. This is a
+        // stated limitation (BLOCKER-007), not silently implied to be
+        // complete.
+        tradingCostModelNote:
+            `Costs applied: commission ${commissionPct}% + slippage ${slippagePct}% (both symmetric, both sides). ` +
+            "Does NOT include STT, exchange transaction charges, GST, SEBI turnover fees, or stamp duty — " +
+            "net P&L figures do not represent a real-world-complete cost accounting.",
     };
 
     const resultDoc = await BacktestResult.create({
