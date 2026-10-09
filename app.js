@@ -36,6 +36,7 @@ const {
     getStrategyInterval,
     resolveBacktestConfig,
     INTERVAL_CONFIG,
+    INTERVAL_TO_UPSTOX,
     strategyUsesPe,
     CORPORATE_ACTIONS_NOTE,
 } = require("./utils/backtestEngine");
@@ -51,6 +52,7 @@ const {
     isValidExpiryFormat,
 } = require("./services/optionChainService");
 const { runAndPersistBacktest } = require("./services/professionalBacktestService");
+const { fetchHistoricalCandlesByRange, toBacktestQuote } = require("./services/candleService");
 const { createStrategy: createProfessionalStrategy, createNewVersion: createProfessionalStrategyVersion } = require("./services/strategyVersionService");
 const { getMetrics, recordScanTime, recordBacktestTime } = require("./utils/metrics");
 const http = require("http");
@@ -225,6 +227,10 @@ app.use(
         resolveInstrumentKey,
         upstoxMarketData,
         runAndPersistBacktest,
+        fetchHistoricalCandlesByRange,
+        toBacktestQuote,
+        INTERVAL_TO_UPSTOX,
+        INTERVAL_CONFIG,
     }),
 );
 

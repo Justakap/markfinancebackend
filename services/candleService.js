@@ -473,4 +473,11 @@ module.exports = {
     RSI_CANDLE_CONFIGS,
     toBacktestQuote,
     normalizeCandle,
+    // Exposed for the new backtest candle-chart endpoint (Historical Candle
+    // Chart milestone): fetchCandleSeriesForBacktest/getCandles resolve a
+    // date range relative to "today," which is wrong for charting an
+    // OLDER backtest's exact historical window — this function already
+    // takes an explicit fromDate/toDate and goes through the same queue/
+    // cache/retry path, so it's reused directly rather than duplicated.
+    fetchHistoricalCandlesByRange,
 };

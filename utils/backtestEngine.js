@@ -1036,6 +1036,7 @@ module.exports = {
     strategyUsesPe,
     CORPORATE_ACTIONS_NOTE,
     collectStrategyIndicators,
+    INTERVAL_TO_UPSTOX,
 };
 
 function dataRowToEvaluatorSnapshot(row) {

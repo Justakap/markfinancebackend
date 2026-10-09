@@ -34,6 +34,8 @@ function isValidDate(value) {
     return value instanceof Date ? !Number.isNaN(value.getTime()) : !Number.isNaN(new Date(value).getTime());
 }
 
+const MAX_CANDLE_BARS = 2500; // matches the cap backtestEngine.js's own candle fetch already uses
+
 function createProfessionalBacktestRoutes({
     StrategyDefinition,
     StrategyVersion,
@@ -45,6 +47,10 @@ function createProfessionalBacktestRoutes({
     resolveInstrumentKey,
     upstoxMarketData,
     runAndPersistBacktest,
+    fetchHistoricalCandlesByRange,
+    toBacktestQuote,
+    INTERVAL_TO_UPSTOX,
+    INTERVAL_CONFIG,
     DEFAULT_COMMISSION_PCT = 0.03,
     DEFAULT_SLIPPAGE_PCT = 0.05,
 }) {
@@ -227,6 +233,73 @@ function createProfessionalBacktestRoutes({
         } catch (error) {
             console.error("List professional backtest trades error:", error);
             return res.status(500).json({ message: "Failed to fetch trades" });
+        }
+    });
+
+    /**
+     * Historical Candle Chart milestone — returns the OHLCV series for
+     * exactly the instrument/timeframe/date-range this backtest actually
+     * ran against, so entry/exit markers (built from BacktestTrade's own
+     * persisted dates) always land within the displayed window regardless
+     * of how long ago the backtest was run. Uses
+     * fetchHistoricalCandlesByRange (candleService.js) — an explicit-date-
+     * range fetch through the SAME Upstox queue/cache/retry/dedup path as
+     * every other candle request in this codebase, not a new data path.
+     */
+    router.get("/v2/backtests/:id/candles", requireAuth, validateObjectId("id"), async (req, res) => {
+        try {
+            const result = await BacktestResult.findOne({ _id: req.params.id, userId: req.user.mongoId });
+            if (!result) {
+                return res.status(404).json({ message: "Backtest result not found" });
+            }
+
+            const timeframe = result.timeframe;
+            const upstoxUnit = INTERVAL_TO_UPSTOX[timeframe] || INTERVAL_TO_UPSTOX["1d"];
+            const intervalConfig = INTERVAL_CONFIG[timeframe] || INTERVAL_CONFIG["1d"];
+
+            const fromDate = new Date(result.dateRange.from).toISOString().slice(0, 10);
+            const toDate = new Date(result.dateRange.to).toISOString().slice(0, 10);
+            const requestedDays = Math.max(
+                1,
+                Math.ceil((new Date(result.dateRange.to) - new Date(result.dateRange.from)) / (24 * 60 * 60 * 1000)),
+            );
+            const maxBars = Math.min(MAX_CANDLE_BARS, Math.max(250, requestedDays * (intervalConfig.barsPerDay || 1)));
+
+            const rawCandles = await fetchHistoricalCandlesByRange(
+                result.instrumentKey,
+                upstoxUnit.unit,
+                upstoxUnit.interval,
+                fromDate,
+                toDate,
+                { maxBars },
+            );
+
+            const candles = rawCandles.map(toBacktestQuote).filter((c) => Number.isFinite(c.close));
+            const bounded = candles.slice(-MAX_CANDLE_BARS);
+
+            return res.json({
+                backtestResultId: result._id,
+                instrumentKey: result.instrumentKey,
+                symbol: result.symbol,
+                timeframe,
+                dateRange: result.dateRange,
+                candleCount: bounded.length,
+                candles: {
+                    timestamps: bounded.map((c) => c.date),
+                    open: bounded.map((c) => c.open),
+                    high: bounded.map((c) => c.high),
+                    low: bounded.map((c) => c.low),
+                    close: bounded.map((c) => c.close),
+                    volume: bounded.map((c) => c.volume),
+                },
+            });
+        } catch (error) {
+            if (error?.response?.status) {
+                const mapped = mapUpstreamError(error);
+                return res.status(mapped.status).json({ message: mapped.message });
+            }
+            console.error("Get professional backtest candles error:", error);
+            return res.status(500).json({ message: "Failed to fetch candle data" });
         }
     });
 
