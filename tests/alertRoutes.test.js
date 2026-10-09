@@ -217,6 +217,27 @@ console.log("Workstream K — /api/v2/alert-configurations and /api/v2/notificat
         assert.strictEqual(res.body.items.length, 1);
     });
 
+    await test("Listing alert configurations can be filtered to a single runtime (Workstream L addition)", async () => {
+        const models = makeModels();
+        const userId = new mongoose.Types.ObjectId();
+        const runtimeA = new mongoose.Types.ObjectId();
+        const runtimeB = new mongoose.Types.ObjectId();
+        models.configs.set("a", { _id: new mongoose.Types.ObjectId(), userId, status: "ACTIVE", eventTypes: [], runtimeId: runtimeA, strategyId: new mongoose.Types.ObjectId() });
+        models.configs.set("b", { _id: new mongoose.Types.ObjectId(), userId, status: "ACTIVE", eventTypes: [], runtimeId: runtimeB, strategyId: new mongoose.Types.ObjectId() });
+
+        const r = router(models);
+        const handle = finalHandlerFor(r, "get", "/v2/alert-configurations");
+
+        const filtered = fakeRes();
+        await handle({ user: { mongoId: userId }, query: { runtimeId: String(runtimeA) } }, filtered);
+        assert.strictEqual(filtered.body.items.length, 1);
+        assert.strictEqual(String(filtered.body.items[0].runtimeId), String(runtimeA));
+
+        const invalidId = fakeRes();
+        await handle({ user: { mongoId: userId }, query: { runtimeId: "not-an-object-id" } }, invalidId);
+        assert.strictEqual(invalidId.body.items.length, 2, "an invalid runtimeId is silently ignored, not rejected or crashed on");
+    });
+
     await test("Deleting (archiving) another user's configuration is rejected (404)", async () => {
         const models = makeModels();
         const ownerId = new mongoose.Types.ObjectId();

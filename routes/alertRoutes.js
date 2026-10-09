@@ -1,4 +1,5 @@
 const express = require("express");
+const mongoose = require("mongoose");
 
 /**
  * Workstream K — authenticated API for alert configurations (user
@@ -93,6 +94,16 @@ function createAlertRoutes({
             const filter = { userId: req.user.mongoId };
             if (req.query.status === "ACTIVE" || req.query.status === "ARCHIVED") {
                 filter.status = req.query.status;
+            }
+            // Workstream L: lets the frontend ask "is there already a
+            // configuration for this specific runtime" in one query instead
+            // of paginating through every configuration client-side — same
+            // optional-query-filter shape as `status` above. An invalid id
+            // is silently ignored (matches `status`'s own lenient handling
+            // of an unrecognized value) rather than rejected, since this is
+            // a read-only convenience filter, not a mutating input.
+            if (req.query.runtimeId && mongoose.Types.ObjectId.isValid(req.query.runtimeId)) {
+                filter.runtimeId = req.query.runtimeId;
             }
 
             const [items, total] = await Promise.all([
