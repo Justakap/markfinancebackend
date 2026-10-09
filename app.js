@@ -51,6 +51,7 @@ const {
     isValidExpiryFormat,
 } = require("./services/optionChainService");
 const { runAndPersistBacktest } = require("./services/professionalBacktestService");
+const { createStrategy: createProfessionalStrategy, createNewVersion: createProfessionalStrategyVersion } = require("./services/strategyVersionService");
 const { getMetrics, recordScanTime, recordBacktestTime } = require("./utils/metrics");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -63,6 +64,7 @@ const { createBacktestRoutes } = require("./routes/backtestRoutes");
 const { createDashboardRoutes } = require("./routes/dashboardRoutes");
 const { createOptionChainRoutes } = require("./routes/optionChainRoutes");
 const { createProfessionalBacktestRoutes } = require("./routes/professionalBacktestRoutes");
+const { createProfessionalStrategyRoutes } = require("./routes/professionalStrategyRoutes");
 
 const VALIDATION_MODE =
     process.env.ENABLE_VALIDATION_MODE === "true" ||
@@ -223,6 +225,18 @@ app.use(
         resolveInstrumentKey,
         upstoxMarketData,
         runAndPersistBacktest,
+    }),
+);
+
+app.use(
+    "/api",
+    createProfessionalStrategyRoutes({
+        StrategyDefinition,
+        StrategyVersion,
+        requireAuth,
+        validateObjectId,
+        createStrategy: createProfessionalStrategy,
+        createNewVersion: createProfessionalStrategyVersion,
     }),
 );
 

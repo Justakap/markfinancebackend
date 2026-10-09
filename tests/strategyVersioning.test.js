@@ -284,6 +284,47 @@ function makeFakeModels() {
         assert.strictEqual(current, null);
     });
 
+    await asyncTest("createNewVersion retries on a duplicate versionNumber (simulated concurrent winner) and never loses the update", async () => {
+        const { FakeStrategyDefinition, FakeStrategyVersion } = makeFakeModels();
+        const { strategy } = await createStrategy({
+            StrategyDefinition: FakeStrategyDefinition,
+            StrategyVersion: FakeStrategyVersion,
+            userId: "user-1",
+            name: "Race Test",
+            definition: { version: 2, entry: {} },
+        });
+
+        // Simulate: by the time THIS call's create() would land, a
+        // concurrent request already took versionNumber=2 — the real
+        // unique {strategyId,versionNumber} index would reject this with
+        // a Mongo duplicate-key error (code 11000) exactly once, then
+        // succeed on retry against the now-current versionNumber=3.
+        const realCreate = FakeStrategyVersion.create.bind(FakeStrategyVersion);
+        let attempts = 0;
+        FakeStrategyVersion.create = async (doc) => {
+            attempts += 1;
+            if (attempts === 1 && doc.versionNumber === 2) {
+                const concurrentWinner = await realCreate({ ...doc, definition: { version: 2, entry: { rule: "concurrent-winner" } } });
+                const error = new Error("E11000 duplicate key error");
+                error.code = 11000;
+                throw error;
+            }
+            return realCreate(doc);
+        };
+
+        const { version } = await createNewVersion({
+            StrategyDefinition: FakeStrategyDefinition,
+            StrategyVersion: FakeStrategyVersion,
+            strategyId: strategy._id,
+            userId: "user-1",
+            definition: { version: 2, entry: { rule: "this-caller" } },
+        });
+
+        assert.strictEqual(attempts, 2, "expected exactly one retry after the simulated duplicate-key error");
+        assert.strictEqual(version.versionNumber, 3, "the retried call must land on the next free version number, not reuse 2");
+        assert.deepStrictEqual(version.definition, { version: 2, entry: { rule: "this-caller" } });
+    });
+
     // --- Legacy export payload shaping (pure, DB-free) ---
 
     test("buildExportPayload groups backtests under their owning strategy", () => {
