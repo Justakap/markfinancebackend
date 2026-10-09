@@ -11,6 +11,8 @@ const StrategyDefinition = require("./models/StrategyDefinition");
 const StrategyVersion = require("./models/StrategyVersion");
 const BacktestResult = require("./models/BacktestResult");
 const BacktestTrade = require("./models/BacktestTrade");
+const LiveStrategyRuntime = require("./models/LiveStrategyRuntime");
+const LiveStrategySignal = require("./models/LiveStrategySignal");
 const { requireAuth } = require("./middleware/auth");
 const { validateObjectId } = require("./middleware/validateObjectId");
 const { getJwtSecret } = require("./config/jwt");
@@ -28,6 +30,7 @@ const {
     authLimiter,
     backtestLimiter,
     optionChainLimiter,
+    liveStrategyLimiter,
     writeLimiter,
 } = require("./middleware/rateLimiters");
 const {
@@ -67,6 +70,9 @@ const { createDashboardRoutes } = require("./routes/dashboardRoutes");
 const { createOptionChainRoutes } = require("./routes/optionChainRoutes");
 const { createProfessionalBacktestRoutes } = require("./routes/professionalBacktestRoutes");
 const { createProfessionalStrategyRoutes } = require("./routes/professionalStrategyRoutes");
+const { createLiveStrategyRoutes } = require("./routes/liveStrategyRoutes");
+const { activateLiveStrategy, deactivateLiveStrategy } = require("./services/liveStrategyService");
+const { startLiveEnginePolling, stopLiveEnginePolling } = require("./services/liveStrategyOrchestrator");
 
 const VALIDATION_MODE =
     process.env.ENABLE_VALIDATION_MODE === "true" ||
@@ -246,6 +252,22 @@ app.use(
     }),
 );
 
+app.use(
+    "/api",
+    createLiveStrategyRoutes({
+        StrategyDefinition,
+        StrategyVersion,
+        LiveStrategyRuntime,
+        LiveStrategySignal,
+        requireAuth,
+        validateObjectId,
+        liveStrategyLimiter,
+        resolveInstrumentKey,
+        activateLiveStrategy,
+        deactivateLiveStrategy,
+    }),
+);
+
 app.use(notFoundHandler);
 app.use(errorHandler);
 
@@ -276,6 +298,13 @@ async function startServer() {
     upstoxMarketData.init(io);
     console.log("Upstox market data enabled (live quotes, strategies & backtests)");
 
+    // Workstream J — polls ACTIVE LiveStrategyRuntime documents on an
+    // interval, reusing the existing Upstox queue/candle-cache path
+    // through liveCandleFeed.js. Not a second WebSocket connection; see
+    // services/liveStrategyOrchestrator.js's file doc comment.
+    startLiveEnginePolling({ LiveStrategyRuntime, LiveStrategySignal, StrategyVersion });
+    console.log("Live strategy engine polling enabled");
+
     server.listen(PORT, () => {
         console.log(`Server running on port ${PORT} (Socket.IO enabled)`);
     });
@@ -294,6 +323,7 @@ async function startServer() {
         forceExitTimer.unref();
 
         try {
+            stopLiveEnginePolling();
             upstoxMarketData.shutdown();
             io.close();
 

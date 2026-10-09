@@ -87,6 +87,56 @@ function roundTripCommission(entryPrice, exitPrice, quantity, commissionPct) {
 }
 
 /**
+ * Workstream J (Live Strategy Engine) — extracted so the new live engine
+ * (services/liveSignalEngine.js) can reuse the EXACT SAME stop/target price
+ * math and ambiguity policy (ADR-004: stop wins on a same-bar touch) rather
+ * than re-deriving it. Pure extraction, zero behavior change: these three
+ * functions replace what was previously inline in runProfessionalBacktest's
+ * loop body below, verified by the full pre-existing
+ * backtestExecutionEngine.test.js/professionalPlatformIntegration.test.js
+ * suites still passing unchanged after this refactor.
+ */
+function computeStopAndTargetPrices(entryPrice, stopLossPct, takeProfitPct) {
+    return {
+        stopPrice: stopLossPct > 0 ? entryPrice * (1 - stopLossPct / 100) : null,
+        targetPrice: takeProfitPct > 0 ? entryPrice * (1 + takeProfitPct / 100) : null,
+    };
+}
+
+/** Resting SL/TP orders are checked against a bar's high/low and fill AT
+ *  THE THRESHOLD PRICE the instant it's touched — never that bar's open or
+ *  close (see file doc comment). Returns null if neither is hit this bar. */
+function checkStopAndTargetHit(candle, stopPrice, targetPrice) {
+    const stopHit = stopPrice !== null && candle.low <= stopPrice;
+    const targetHit = targetPrice !== null && candle.high >= targetPrice;
+
+    if (stopHit) return { exitReason: "STOP_LOSS", exitPrice: stopPrice };
+    if (targetHit) return { exitReason: "TAKE_PROFIT", exitPrice: targetPrice };
+    return null;
+}
+
+/** The exact fees/P&L/return/slippage-cost arithmetic used to build every
+ *  BacktestTrade record — see the file doc comment on closeTrade() below
+ *  for why slippage cost is computed as raw-vs-fill price difference. */
+function computeTradeEconomics({ entryPrice, entryRawPrice, exitPrice, exitRawPrice, quantity, commissionPct }) {
+    const fees = roundTripCommission(entryPrice, exitPrice, quantity, commissionPct);
+    const entrySlippageCost = Math.abs(entryPrice - entryRawPrice) * quantity;
+    const exitSlippageCost = Math.abs(exitPrice - (exitRawPrice ?? exitPrice)) * quantity;
+    const slippageCost = entrySlippageCost + exitSlippageCost;
+    const grossPnl = (exitPrice - entryPrice) * quantity;
+    const netPnl = grossPnl - fees;
+    const returnPct = entryPrice * quantity !== 0 ? (netPnl / (entryPrice * quantity)) * 100 : 0;
+
+    return {
+        fees: Number(fees.toFixed(2)),
+        grossPnl: Number(grossPnl.toFixed(2)),
+        netPnl: Number(netPnl.toFixed(2)),
+        returnPct: Number(returnPct.toFixed(2)),
+        slippageCost: Number(slippageCost.toFixed(2)),
+    };
+}
+
+/**
  * `strategy`: { entryExpression, exitExpression, risk: {stopLoss, takeProfit}, execution: {positionSizing} }
  *   — already resolved from a StrategyVersion.definition (Phase B shape).
  * `candles`: primary-timeframe OHLCV array (same source as `contexts`).
@@ -153,7 +203,6 @@ function runProfessionalBacktest({
     }
 
     function closeTrade({ exitPrice, exitRawPrice, exitDate, exitReason, exitIndex, signalExitDate }) {
-        const fees = roundTripCommission(entryPrice, exitPrice, quantity, commissionPct);
         // Slippage cost is the dollar difference between the fill and the
         // bar's raw price, on whichever side(s) actually had slippage
         // applied: signal-driven fills (applySlippage already applied to
@@ -161,14 +210,9 @@ function runProfessionalBacktest({
         // exitRawPrice === exitPrice, the threshold price itself) don't —
         // see the file doc comment on why resting orders fill at the
         // threshold exactly, with no added slippage.
-        const entrySlippageCost = Math.abs(entryPrice - entryRawPrice) * quantity;
-        const exitSlippageCost = Math.abs(exitPrice - (exitRawPrice ?? exitPrice)) * quantity;
-        const slippageCost = entrySlippageCost + exitSlippageCost;
-        const grossPnl = (exitPrice - entryPrice) * quantity;
-        const netPnl = grossPnl - fees;
-        const returnPct = entryPrice * quantity !== 0 ? (netPnl / (entryPrice * quantity)) * 100 : 0;
+        const economics = computeTradeEconomics({ entryPrice, entryRawPrice, exitPrice, exitRawPrice, quantity, commissionPct });
 
-        equity += netPnl;
+        equity += economics.netPnl;
 
         trades.push({
             side: "LONG",
@@ -177,11 +221,11 @@ function runProfessionalBacktest({
             exitDate,
             entryPrice: Number(entryPrice.toFixed(2)),
             exitPrice: Number(exitPrice.toFixed(2)),
-            grossPnl: Number(grossPnl.toFixed(2)),
-            fees: Number(fees.toFixed(2)),
-            slippageCost: Number(slippageCost.toFixed(2)),
-            netPnl: Number(netPnl.toFixed(2)),
-            returnPct: Number(returnPct.toFixed(2)),
+            grossPnl: economics.grossPnl,
+            fees: economics.fees,
+            slippageCost: economics.slippageCost,
+            netPnl: economics.netPnl,
+            returnPct: economics.returnPct,
             holdingPeriodBars: exitIndex - entrySignalIndex,
             exitReason,
             signalEntryDate: candles[entrySignalIndex]?.date || null,
@@ -235,25 +279,15 @@ function runProfessionalBacktest({
         // bar's high/low (including the entry bar, for the range after the
         // open fill above). Stop wins if both are touched in one bar.
         if (inPosition) {
-            const stopPrice = stopLossPct > 0 ? entryPrice * (1 - stopLossPct / 100) : null;
-            const targetPrice = takeProfitPct > 0 ? entryPrice * (1 + takeProfitPct / 100) : null;
-            const stopHit = stopPrice !== null && candle.low <= stopPrice;
-            const targetHit = targetPrice !== null && candle.high >= targetPrice;
+            const { stopPrice, targetPrice } = computeStopAndTargetPrices(entryPrice, stopLossPct, takeProfitPct);
+            const hit = checkStopAndTargetHit(candle, stopPrice, targetPrice);
 
-            if (stopHit) {
+            if (hit) {
                 closeTrade({
-                    exitPrice: stopPrice,
-                    exitRawPrice: stopPrice,
+                    exitPrice: hit.exitPrice,
+                    exitRawPrice: hit.exitPrice,
                     exitDate: candle.date,
-                    exitReason: "STOP_LOSS",
-                    exitIndex: i,
-                });
-            } else if (targetHit) {
-                closeTrade({
-                    exitPrice: targetPrice,
-                    exitRawPrice: targetPrice,
-                    exitDate: candle.date,
-                    exitReason: "TAKE_PROFIT",
+                    exitReason: hit.exitReason,
                     exitIndex: i,
                 });
             }
@@ -308,4 +342,7 @@ module.exports = {
     applySlippage,
     computeQuantity,
     roundTripCommission,
+    computeStopAndTargetPrices,
+    checkStopAndTargetHit,
+    computeTradeEconomics,
 };

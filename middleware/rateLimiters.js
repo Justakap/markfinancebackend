@@ -59,6 +59,17 @@ const optionChainLimiter = expressRateLimit({
     message: { message: "Too many option-chain requests. Wait a moment and retry." },
 });
 
+// Workstream J — activate/deactivate are mutating, low-frequency actions
+// (a user turning a live strategy on/off), not a hot path like backtest
+// runs, so a generous-but-bounded ceiling is enough.
+const liveStrategyLimiter = expressRateLimit({
+    windowMs: 60 * 1000,
+    max: 20,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { message: "Too many live-strategy requests. Wait a moment and retry." },
+});
+
 // Generous safety net on all other mutating /api requests — not meant to bother normal usage.
 const writeLimiter = expressRateLimit({
     windowMs: 60 * 1000,
@@ -75,5 +86,6 @@ module.exports = {
     authLimiter,
     backtestLimiter,
     optionChainLimiter,
+    liveStrategyLimiter,
     writeLimiter,
 };
