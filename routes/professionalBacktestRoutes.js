@@ -172,10 +172,17 @@ function createProfessionalBacktestRoutes({
 
     router.get("/v2/backtests", requireAuth, async (req, res) => {
         try {
+            // Populating the version reference (versionNumber + its
+            // parent strategyId only, not the full definition) is a read-
+            // only query addition, not a schema change — lets the frontend
+            // show "v3 of <strategy>" instead of a bare ObjectId, per the
+            // Phase G-I requirement to display the exact strategy-version
+            // association.
             const results = await BacktestResult.find({ userId: req.user.mongoId })
                 .sort({ createdAt: -1 })
                 .select("-equitySeries")
-                .limit(100);
+                .limit(100)
+                .populate("strategyVersionId", "versionNumber strategyId");
 
             return res.json(results);
         } catch (error) {
@@ -186,7 +193,10 @@ function createProfessionalBacktestRoutes({
 
     router.get("/v2/backtests/:id", requireAuth, validateObjectId("id"), async (req, res) => {
         try {
-            const result = await BacktestResult.findOne({ _id: req.params.id, userId: req.user.mongoId });
+            const result = await BacktestResult.findOne({ _id: req.params.id, userId: req.user.mongoId }).populate(
+                "strategyVersionId",
+                "versionNumber strategyId",
+            );
             if (!result) {
                 return res.status(404).json({ message: "Backtest result not found" });
             }

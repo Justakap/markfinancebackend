@@ -125,6 +125,22 @@ async function runAndPersistBacktest({
         timeframe: primaryTimeframe,
     });
 
+    const dataQuality = {
+        corporateActionsAdjusted: false,
+        corporateActionsNote: CORPORATE_ACTIONS_NOTE,
+        // Phase B's indicator registry never registered a PE indicator —
+        // a professional strategy structurally cannot reference PE at
+        // all (the validator rejects any unregistered indicator), so
+        // Phase 2.1A's historical-PE guard has nothing to guard here;
+        // this isn't a ported protection, it's a stronger one by
+        // construction. See ADR-008.
+        historicalPeSupported: false,
+        intrabarOrderingKnown: false,
+        slTpAmbiguityPolicy: "When one bar touches both stop-loss and take-profit, the stop is always assumed to have triggered first.",
+        isDerivativeInstrument: isDerivative,
+        cappedTimeframes,
+    };
+
     const resultDoc = await BacktestResult.create({
         userId,
         strategyVersionId: version._id,
@@ -144,6 +160,10 @@ async function runAndPersistBacktest({
         summary,
         equitySeries: engineResult.equitySeries,
         tradeCount: engineResult.trades.length,
+        // Persisted (not just returned transiently) so GET
+        // /api/v2/backtests/:id shows identical disclosures to the live
+        // run response — see the schema's own comment in BacktestResult.js.
+        dataQuality,
     });
 
     if (engineResult.trades.length) {
@@ -155,21 +175,7 @@ async function runAndPersistBacktest({
     return {
         resultDoc,
         trades: engineResult.trades,
-        dataQuality: {
-            corporateActionsAdjusted: false,
-            corporateActionsNote: CORPORATE_ACTIONS_NOTE,
-            // Phase B's indicator registry never registered a PE indicator —
-            // a professional strategy structurally cannot reference PE at
-            // all (the validator rejects any unregistered indicator), so
-            // Phase 2.1A's historical-PE guard has nothing to guard here;
-            // this isn't a ported protection, it's a stronger one by
-            // construction. See ADR-008.
-            historicalPeSupported: false,
-            intrabarOrderingKnown: false,
-            slTpAmbiguityPolicy: "When one bar touches both stop-loss and take-profit, the stop is always assumed to have triggered first.",
-            isDerivativeInstrument: isDerivative,
-            cappedTimeframes,
-        },
+        dataQuality,
     };
 }
 

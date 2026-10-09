@@ -181,6 +181,13 @@ function professionalDefinition(overrides = {}) {
 
         assert.strictEqual(dataQuality.historicalPeSupported, false);
         assert.ok(dataQuality.corporateActionsNote.length > 0);
+
+        // Phase G-I finding: dataQuality must be persisted onto the
+        // BacktestResult document itself, not just returned transiently —
+        // otherwise GET /api/v2/backtests/:id (used whenever a result is
+        // reopened later) would silently lack these disclosures.
+        assert.strictEqual(resultDoc.dataQuality.historicalPeSupported, false);
+        assert.strictEqual(resultDoc.dataQuality.corporateActionsNote, dataQuality.corporateActionsNote);
     });
 
     await test("Ownership/version resolution: service runs fine given a plain StrategyVersion-shaped object (no Mongoose coupling)", async () => {

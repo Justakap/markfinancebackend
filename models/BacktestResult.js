@@ -67,6 +67,15 @@ const backtestResultSchema = new mongoose.Schema(
 
         dataSource: { type: String, default: "upstox" },
 
+        // Phase G-I finding: the frontend's results page must show the
+        // same corporate-action/PE/SL-TP-ambiguity disclosures whether
+        // viewing a backtest just run or reopened later from history —
+        // but this was only ever returned transiently in the POST
+        // /api/v2/backtest/run response, never persisted, so GET
+        // /api/v2/backtests/:id silently lacked it. Minimal additive fix:
+        // persist it alongside the result it describes.
+        dataQuality: { type: mongoose.Schema.Types.Mixed, default: {} },
+
         status: {
             type: String,
             enum: ["completed", "failed"],
