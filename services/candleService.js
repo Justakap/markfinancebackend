@@ -11,28 +11,112 @@ const { dedupe } = require("../utils/requestDedup");
 const { createBoundedCache } = require("../utils/boundedCache");
 
 /**
- * Caches the through-yesterday historical portion of minute-based candle
- * requests (minute1/5/15 — the timeframes whose "minutes" branch below
- * fires both a historical-range call and a today-only intraday call on
- * every single fetch). The historical-range endpoint never returns today's
- * data (verified directly against the live API), so once a trading day has
- * closed, that portion cannot change again until the next one does —
- * making it safe to cache across the 15-30s refresh cadence that previously
- * re-fetched it unchanged every time.
+ * Caches the through-yesterday historical portion of intraday candle
+ * requests — originally scoped to "minutes" only (minute1/5/15), now also
+ * covers "hours" (and any chunked sub-range the longer-history backtest
+ * path below splits a request into, see `fetchHistoricalCandlesChunked`).
+ * The historical-range endpoint never returns today's data (verified
+ * directly against the live API), so once a trading day has closed, that
+ * portion cannot change again until the next one does — making it safe to
+ * cache across the 15-30s refresh cadence that previously re-fetched it
+ * unchanged every time, AND safe to cache indefinitely per exact chunk
+ * once that chunk's own `toDate` is in the past (a closed historical
+ * window never changes).
  *
  * Cache key includes the exact requested date range (`fromDate`/`toDate`),
- * which is itself derived from "today's date" — so the key naturally
- * changes at each calendar-day rollover (including non-trading days; a
- * weekend/holiday costs at most one harmless re-fetch of identical data,
- * not a correctness issue). `ttlMs` is a backstop, not the primary
- * invalidation mechanism. Only non-empty results are cached, so a
- * transient failure (swallowed to `[]` by the caller) is never remembered
- * as if it were a genuine answer for the rest of the day.
+ * which is itself derived from "today's date" for the un-chunked case — so
+ * the key naturally changes at each calendar-day rollover (including
+ * non-trading days; a weekend/holiday costs at most one harmless re-fetch
+ * of identical data, not a correctness issue). For a chunked historical
+ * sub-range (e.g. "2024-01-01..2024-01-29"), the key never changes at all
+ * once set, since that exact window is fixed/closed forever — this is what
+ * makes a 365-day 5m/1h backtest re-run cheaply reuse every chunk it
+ * already fetched instead of re-downloading the whole year. `ttlMs` is a
+ * backstop, not the primary invalidation mechanism. Only non-empty results
+ * are cached, so a transient failure is never remembered as if it were a
+ * genuine answer.
+ *
+ * Env var names kept as-is (`UPSTOX_HISTORICAL_CANDLE_*`) for backward
+ * compatibility with any already-configured deployment, even though the
+ * cache's scope has grown beyond "minute" candles.
  */
-const historicalMinuteCandleCache = createBoundedCache({
+const historicalRangeCandleCache = createBoundedCache({
     maxSize: Number(process.env.UPSTOX_HISTORICAL_CANDLE_CACHE_MAX_SIZE || 300),
     ttlMs: Number(process.env.UPSTOX_HISTORICAL_CANDLE_TTL_MS || 26 * 60 * 60 * 1000),
 });
+
+/**
+ * Upstox v3 historical-candle API — verified provider-imposed maximum span
+ * per SINGLE request (https://upstox.com/developer/api-documentation/v3/get-historical-candle-data/,
+ * checked 2026-10-10, cross-referenced against the V3 launch announcement):
+ *   - "minutes" unit, interval 1-15: max 1 month per request.
+ *   - "minutes" unit, interval >15, and "hours" unit (interval 1-5): max 1
+ *     quarter per request.
+ *   - "days"/"weeks"/"months": max 1 decade / no limit — chunking is never
+ *     needed for those in practice at this app's scale.
+ * Sized to 31/91 (not a flush 30/90) so a calendar month/quarter's actual
+ * day count (28-31 / 90-92) always fits in one chunk — this also matters
+ * because several existing default windows elsewhere in this file already
+ * span a plain 30-day/90-day subtraction (inclusive of both endpoints, i.e.
+ * 31/91 calendar days), and a threshold below that would spuriously chunk
+ * those pre-existing default-window fetches into two requests instead of
+ * one, a regression caught by tests/historicalCandleCache.test.js.
+ *
+ * Separately, Upstox only retains intraday (minutes/hours) data from
+ * January 2022 onward — a RETENTION limit, not a per-request window limit;
+ * no amount of chunking can retrieve intraday data older than that, so a
+ * requested range reaching further back is clamped (see
+ * `clampToIntradayRetention`) and the clamp is surfaced as a data-quality
+ * disclosure by callers that need one (`fetchHistoricalCandlesWithQuality`),
+ * never silently treated as "the full requested range was fetched."
+ */
+const MAX_WINDOW_DAYS = {
+    minutesShort: 31,
+    minutesLong: 91,
+    hours: 91,
+};
+const INTRADAY_RETENTION_START = "2022-01-01";
+
+function getMaxWindowDaysFor(unit, interval) {
+    if (unit === "hours") return MAX_WINDOW_DAYS.hours;
+    if (unit === "minutes") {
+        return Number(interval) <= 15 ? MAX_WINDOW_DAYS.minutesShort : MAX_WINDOW_DAYS.minutesLong;
+    }
+    return Infinity;
+}
+
+function clampToIntradayRetention(fromDate) {
+    return fromDate < INTRADAY_RETENTION_START ? INTRADAY_RETENTION_START : fromDate;
+}
+
+function addDaysToDateString(dateStr, days) {
+    const d = new Date(`${dateStr}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() + days);
+    return d.toISOString().slice(0, 10);
+}
+
+/** Splits [fromDate, toDate] (inclusive, 'YYYY-MM-DD') into consecutive
+ *  sub-ranges each spanning at most `maxWindowDays`, oldest first. Pure,
+ *  no I/O — the actual fetching/caching/retrying of each chunk is a
+ *  separate concern (`fetchHistoricalCandlesChunked` below), so this is
+ *  independently unit-testable. */
+function splitDateRangeIntoChunks(fromDate, toDate, maxWindowDays) {
+    if (!Number.isFinite(maxWindowDays) || maxWindowDays <= 0) {
+        return [{ fromDate, toDate }];
+    }
+
+    const chunks = [];
+    let chunkFrom = fromDate;
+
+    while (chunkFrom <= toDate) {
+        const naturalEnd = addDaysToDateString(chunkFrom, maxWindowDays - 1);
+        const chunkTo = naturalEnd > toDate ? toDate : naturalEnd;
+        chunks.push({ fromDate: chunkFrom, toDate: chunkTo });
+        chunkFrom = addDaysToDateString(chunkTo, 1);
+    }
+
+    return chunks;
+}
 
 const RSI_CANDLE_CONFIGS = [
     { interval: "minutes", unit: "1" },
@@ -251,34 +335,140 @@ function aggregateToHourlyCandles(candles = []) {
 }
 
 /**
- * Cache-aware wrapper around `fetchHistoricalCandlesByRange` for the
- * "minutes" branch only (minute1/5/15) — see `historicalMinuteCandleCache`
- * above. Concurrent callers for the same (instrument, timeframe, date
- * range, maxBars) share one in-flight fetch via `dedupe()`, independent of
- * `getCandles()`'s own outer-level dedupe (which covers the whole
- * historical+intraday call, not just this piece).
+ * Cache-aware wrapper around `fetchHistoricalCandlesByRange` for ONE
+ * request-sized window (never spanning more than a provider-imposed
+ * window — callers are responsible for chunking first). Concurrent
+ * callers for the same (instrument, unit, interval, date range, maxBars)
+ * share one in-flight fetch via `dedupe()`, independent of `getCandles()`'s
+ * own outer-level dedupe (which covers the whole historical+intraday
+ * call, not just this piece).
+ *
+ * Unlike the legacy-compatible `fetchHistoricalCandles`/`getCandles`
+ * (which silently swallow a failed range fetch to `[]`, the existing
+ * graceful-degradation convention throughout this module), this returns
+ * `{candles, error}` — failure is visible to any caller that needs to
+ * know ("never fabricate... detect missing/partial chunks"). Callers that
+ * want the old silent-failure behavior just read `.candles` and ignore
+ * `.error`, which is exactly what the legacy-compatible wrappers below do.
  */
-async function fetchCachedHistoricalMinuteRange(instrumentKey, unit, interval, fromDate, toDate, maxBars) {
+async function fetchCachedHistoricalRange(instrumentKey, unit, interval, fromDate, toDate, maxBars) {
     const cacheKey = `${instrumentKey}:${unit}:${interval}:${fromDate}:${toDate}:${maxBars || ""}`;
 
-    const cached = historicalMinuteCandleCache.get(cacheKey);
+    const cached = historicalRangeCandleCache.get(cacheKey);
     if (cached !== undefined) {
-        return cached;
+        return { candles: cached, error: null };
     }
 
     const result = await dedupe(`historical-range:${cacheKey}`, async () => {
         try {
-            return await fetchHistoricalCandlesByRange(instrumentKey, unit, interval, fromDate, toDate, { maxBars });
-        } catch {
-            return [];
+            const candles = await fetchHistoricalCandlesByRange(instrumentKey, unit, interval, fromDate, toDate, { maxBars });
+            return { candles, error: null };
+        } catch (error) {
+            return { candles: [], error };
         }
     });
 
-    if (result.length) {
-        historicalMinuteCandleCache.set(cacheKey, result);
+    if (result.candles.length) {
+        historicalRangeCandleCache.set(cacheKey, result.candles);
     }
 
     return result;
+}
+
+/**
+ * Fetches a (possibly multi-year) historical range by splitting it into
+ * provider-window-sized chunks (see `MAX_WINDOW_DAYS`/`splitDateRangeIntoChunks`),
+ * fetching each chunk through the SAME cache/dedupe/retry path as a
+ * single-shot request (`fetchCachedHistoricalRange` -> `fetchHistoricalCandlesByRange`
+ * -> the existing Upstox queue's retry/backoff — nothing new is added at
+ * that layer), then merging and deduplicating by exact timestamp
+ * (`mergeCandlesByTimestamp`, chronological order preserved).
+ *
+ * Chunks are fetched concurrently (`Promise.all`) — safe because each
+ * chunk has a distinct cache key (its own date range), so there is no
+ * cache-key-collision risk the way there would be racing DIFFERENT
+ * timeframes of the same instrument (see professionalCandleAdapter.js's
+ * comment on why THAT loop stays sequential). The existing queue's own
+ * concurrency cap + per-call rate-gap still governs the real network
+ * request rate; this just lets multiple chunks queue up at once instead
+ * of waiting on each other's full round trip first.
+ *
+ * Returns `{candles, incomplete, failedRanges, retentionClamped,
+ * retentionFrom}` — `incomplete`/`failedRanges` are populated only when a
+ * chunk's fetch genuinely failed (exhausted retries or a non-retryable
+ * error), never inferred from "this chunk happened to come back empty"
+ * (a legitimately data-free window — e.g. before listing, or a holiday-only
+ * span — is not an error and is not reported as one).
+ */
+async function fetchHistoricalCandlesChunked(instrumentKey, unit, interval, fromDate, toDate, { maxWindowDays, maxBars } = {}) {
+    const clampedFromDate = clampToIntradayRetention(fromDate);
+    const retentionClamped = clampedFromDate !== fromDate;
+
+    if (clampedFromDate > toDate) {
+        // The entire requested range predates what Upstox retains for this
+        // granularity — nothing to fetch, and definitely nothing to fabricate.
+        return { candles: [], incomplete: false, failedRanges: [], retentionClamped: true, retentionFrom: INTRADAY_RETENTION_START };
+    }
+
+    const chunks = splitDateRangeIntoChunks(clampedFromDate, toDate, maxWindowDays);
+
+    const results = await Promise.all(
+        chunks.map((chunk) =>
+            fetchCachedHistoricalRange(instrumentKey, unit, interval, chunk.fromDate, chunk.toDate, maxBars).then((r) => ({
+                ...chunk,
+                ...r,
+            })),
+        ),
+    );
+
+    const failedRanges = results.filter((r) => r.error).map((r) => ({ fromDate: r.fromDate, toDate: r.toDate }));
+    const allCandles = results.flatMap((r) => r.candles || []);
+    const merged = mergeCandlesByTimestamp(allCandles, []);
+    const bounded = maxBars ? merged.slice(-maxBars) : merged;
+
+    return {
+        candles: bounded,
+        incomplete: failedRanges.length > 0,
+        failedRanges,
+        retentionClamped,
+        retentionFrom: INTRADAY_RETENTION_START,
+    };
+}
+
+function diffDaysInclusive(fromDate, toDate) {
+    const msPerDay = 24 * 60 * 60 * 1000;
+    return Math.round((new Date(`${toDate}T00:00:00Z`) - new Date(`${fromDate}T00:00:00Z`)) / msPerDay) + 1;
+}
+
+/**
+ * The single entry point for "fetch this historical range, chunking only
+ * if the span actually exceeds what Upstox allows in one request." For a
+ * short range (the common case — live indicator refresh, small backtests)
+ * this is a single cached fetch, identical in shape/cost to the
+ * pre-chunking behavior. For a long range (e.g. a 365-day 5m/1h backtest)
+ * it transparently fans out into cached chunks.
+ */
+async function fetchHistoricalRangeMaybeChunked(instrumentKey, unit, interval, fromDate, toDate, maxBars) {
+    const maxWindowDays = getMaxWindowDaysFor(unit, interval);
+    const spanDays = diffDaysInclusive(fromDate, toDate);
+
+    if (spanDays <= maxWindowDays) {
+        const clampedFromDate = clampToIntradayRetention(fromDate);
+        const retentionClamped = clampedFromDate !== fromDate;
+        if (clampedFromDate > toDate) {
+            return { candles: [], incomplete: false, failedRanges: [], retentionClamped: true, retentionFrom: INTRADAY_RETENTION_START };
+        }
+        const { candles, error } = await fetchCachedHistoricalRange(instrumentKey, unit, interval, clampedFromDate, toDate, maxBars);
+        return {
+            candles: maxBars ? candles.slice(-maxBars) : candles,
+            incomplete: !!error,
+            failedRanges: error ? [{ fromDate: clampedFromDate, toDate }] : [],
+            retentionClamped,
+            retentionFrom: INTRADAY_RETENTION_START,
+        };
+    }
+
+    return fetchHistoricalCandlesChunked(instrumentKey, unit, interval, fromDate, toDate, { maxWindowDays, maxBars });
 }
 
 function getDateRangeForPeriodDays(unit, periodDays = 365) {
@@ -307,9 +497,19 @@ function mergeCandlesByTimestamp(primary = [], secondary = []) {
     );
 }
 
-async function fetchHistoricalCandles(instrumentKey, options = {}) {
+const EMPTY_QUALITY = { incomplete: false, failedRanges: [], retentionClamped: false, retentionFrom: null };
+
+/**
+ * Does the actual work for both `fetchHistoricalCandles` (legacy-compatible,
+ * plain-array return, silent degradation) and `fetchHistoricalCandlesWithQuality`
+ * (new, returns completeness metadata alongside the candles) — one
+ * implementation, two return shapes, so the two callers can never drift.
+ */
+async function fetchHistoricalCandlesInternal(instrumentKey, options = {}) {
     const token = getAccessToken();
-    if (!token || !(await assertCandleInstrumentKey(instrumentKey))) return [];
+    if (!token || !(await assertCandleInstrumentKey(instrumentKey))) {
+        return { candles: [], ...EMPTY_QUALITY };
+    }
 
     const requestedUnit = options.interval || "days";
     const requestedInterval = options.unit || "1";
@@ -317,20 +517,24 @@ async function fetchHistoricalCandles(instrumentKey, options = {}) {
     const maxBars = options.maxBars || 500;
 
     if (isInstrumentKeyBlocked(instrumentKey)) {
-        return [];
+        return { candles: [], ...EMPTY_QUALITY };
     }
 
     if (requestedUnit === "hours") {
-        const { toDate, fromDate } = getDateRangeForUnit("hours");
-        const directHourly = await fetchHistoricalCandlesByRange(
-            instrumentKey,
-            "minutes",
-            "60",
-            fromDate,
-            toDate,
-        );
-        if (directHourly.length) {
-            return directHourly.slice(-maxBars);
+        // Previously hardcoded to a fixed 90-day window via
+        // getDateRangeForUnit("hours") regardless of the caller's
+        // requested periodDays — the root cause of 1h backtests never
+        // being able to see more than 90 days even when the caller asked
+        // for more. Now respects periodDays exactly like "minutes" does,
+        // and chunks via fetchHistoricalRangeMaybeChunked when the span
+        // exceeds Upstox's documented per-request window for this
+        // granularity (60-minute interval -> the ">15min" quarter bucket).
+        const range = periodDays != null ? getDateRangeForPeriodDays("minutes", periodDays) : getDateRangeForUnit("hours");
+        const { toDate, fromDate } = range;
+
+        const directHourly = await fetchHistoricalRangeMaybeChunked(instrumentKey, "minutes", "60", fromDate, toDate, maxBars);
+        if (directHourly.candles.length) {
+            return { candles: directHourly.candles, incomplete: directHourly.incomplete, failedRanges: directHourly.failedRanges, retentionClamped: directHourly.retentionClamped, retentionFrom: directHourly.retentionFrom };
         }
 
         const minuteCandles = await fetchIntradayCandles(instrumentKey, {
@@ -338,7 +542,9 @@ async function fetchHistoricalCandles(instrumentKey, options = {}) {
             unit: "1",
         });
         const hourly = aggregateToHourlyCandles(minuteCandles);
-        if (hourly.length) return hourly.slice(-maxBars);
+        if (hourly.length) {
+            return { candles: hourly.slice(-maxBars), incomplete: directHourly.incomplete, failedRanges: directHourly.failedRanges, retentionClamped: directHourly.retentionClamped, retentionFrom: directHourly.retentionFrom };
+        }
     }
 
     const unit = requestedUnit;
@@ -351,14 +557,8 @@ async function fetchHistoricalCandles(instrumentKey, options = {}) {
                 : getDateRangeForUnit(unit);
         const { toDate, fromDate } = range;
 
-        const historical = await fetchCachedHistoricalMinuteRange(
-            instrumentKey,
-            unit,
-            interval,
-            fromDate,
-            toDate,
-            maxBars,
-        );
+        const historicalResult = await fetchHistoricalRangeMaybeChunked(instrumentKey, unit, interval, fromDate, toDate, maxBars);
+        const historical = historicalResult.candles;
 
         const intraday = await fetchIntradayCandles(instrumentKey, {
             interval: unit,
@@ -366,11 +566,18 @@ async function fetchHistoricalCandles(instrumentKey, options = {}) {
             maxBars,
         }).catch(() => []);
 
+        const quality = {
+            incomplete: historicalResult.incomplete,
+            failedRanges: historicalResult.failedRanges,
+            retentionClamped: historicalResult.retentionClamped,
+            retentionFrom: historicalResult.retentionFrom,
+        };
+
         if (historical.length && intraday.length) {
-            return mergeCandlesByTimestamp(historical, intraday).slice(-maxBars);
+            return { candles: mergeCandlesByTimestamp(historical, intraday).slice(-maxBars), ...quality };
         }
-        if (intraday.length) return intraday.slice(-maxBars);
-        if (historical.length) return historical.slice(-maxBars);
+        if (intraday.length) return { candles: intraday.slice(-maxBars), ...quality };
+        if (historical.length) return { candles: historical.slice(-maxBars), ...quality };
     }
 
     if (unit === "hours") {
@@ -379,11 +586,11 @@ async function fetchHistoricalCandles(instrumentKey, options = {}) {
             unit: interval,
             maxBars,
         });
-        if (intraday.length) return intraday;
+        if (intraday.length) return { candles: intraday, ...EMPTY_QUALITY };
     }
 
     if (isInstrumentKeyBlocked(instrumentKey)) {
-        return [];
+        return { candles: [], ...EMPTY_QUALITY };
     }
 
     const range =
@@ -400,7 +607,21 @@ async function fetchHistoricalCandles(instrumentKey, options = {}) {
         toDate,
         { maxBars },
     );
-    return candles.slice(-maxBars);
+    return { candles: candles.slice(-maxBars), ...EMPTY_QUALITY };
+}
+
+/** Legacy-compatible: plain array, silent degradation on failure — exact
+ *  same external contract every existing caller already depends on. */
+async function fetchHistoricalCandles(instrumentKey, options = {}) {
+    const result = await fetchHistoricalCandlesInternal(instrumentKey, options);
+    return result.candles;
+}
+
+/** New: same fetch, but surfaces completeness so a caller that cares
+ *  (the professional backtest path) can disclose it instead of silently
+ *  treating a partially-fetched long range as if it were complete. */
+async function fetchHistoricalCandlesWithQuality(instrumentKey, options = {}) {
+    return fetchHistoricalCandlesInternal(instrumentKey, options);
 }
 
 async function getCandles(instrumentKey, options = {}) {
@@ -429,6 +650,49 @@ async function getCandles(instrumentKey, options = {}) {
             });
         } catch {
             return [];
+        }
+    });
+}
+
+/**
+ * Same fetch as `getCandles`, but resolves to `{candles, incomplete,
+ * failedRanges, retentionClamped, retentionFrom}` instead of a plain array
+ * — used by the professional backtest path, which must disclose (never
+ * fabricate) coverage for a long chunked range. Deliberately uses its own
+ * dedupe-key namespace (`candles-wq:` vs. `getCandles`'s `candles:`)
+ * rather than sharing `getCandles`'s in-flight entries, since the two
+ * resolve to different shapes; the underlying chunk-level cache
+ * (`historicalRangeCandleCache`) is still shared, so this doesn't
+ * duplicate any actual network fetch that `getCandles` already made for
+ * the same instrument/range, only the thin in-flight-collapsing layer
+ * above it.
+ */
+async function getCandlesWithQuality(instrumentKey, options = {}) {
+    if (!instrumentKey || isInstrumentKeyBlocked(instrumentKey)) {
+        return { candles: [], ...EMPTY_QUALITY };
+    }
+
+    if (!(await assertCandleInstrumentKey(instrumentKey))) {
+        return { candles: [], ...EMPTY_QUALITY };
+    }
+
+    const requestedUnit = options.interval || "days";
+    const requestedInterval = options.unit || "1";
+    const periodDays = options.periodDays;
+    const maxBars = options.maxBars;
+
+    const key = `${instrumentKey}:${requestedUnit}:${requestedInterval}:${periodDays || ""}:${maxBars || ""}`;
+
+    return dedupe(`candles-wq:${key}`, async () => {
+        try {
+            return await fetchHistoricalCandlesWithQuality(instrumentKey, {
+                interval: requestedUnit,
+                unit: requestedInterval,
+                periodDays,
+                maxBars,
+            });
+        } catch (error) {
+            return { candles: [], incomplete: true, failedRanges: [{ error: error.message }], retentionClamped: false, retentionFrom: null };
         }
     });
 }
@@ -480,4 +744,15 @@ module.exports = {
     // takes an explicit fromDate/toDate and goes through the same queue/
     // cache/retry path, so it's reused directly rather than duplicated.
     fetchHistoricalCandlesByRange,
+    // Longer-backtest-history milestone (2026-10-10): chunked, data-quality-aware
+    // fetching for timeframes whose requested range exceeds Upstox's
+    // documented per-request window (5m/15m/1h, now able to cover up to
+    // ~365 days instead of being capped at a single request's window).
+    getCandlesWithQuality,
+    fetchHistoricalCandlesWithQuality,
+    splitDateRangeIntoChunks,
+    getMaxWindowDaysFor,
+    clampToIntradayRetention,
+    MAX_WINDOW_DAYS,
+    INTRADAY_RETENTION_START,
 };

@@ -158,14 +158,14 @@ function resetCounters() {
         assert.strictEqual(rangeCallCount, afterFirstInstrument + 1, "a different instrument must not reuse another instrument's cached range");
     });
 
-    await test("7. hours/days timeframes are unaffected (out of this task's scope) — no caching applied there", async () => {
+    await test("7. hours timeframe is now cached too (chunked-fetch work extended range caching to hours)", async () => {
         resetCounters();
         await getCandles(TEST_KEY, { interval: "hours", unit: "1", maxBars: 10 });
         const afterFirst = rangeCallCount;
 
         await getCandles(TEST_KEY, { interval: "hours", unit: "1", maxBars: 10 });
 
-        assert.strictEqual(rangeCallCount, afterFirst + 1, "hours timeframe should refetch every time, exactly as before this change");
+        assert.strictEqual(rangeCallCount, afterFirst, "hours timeframe should now reuse its cached historical range, same as minutes");
     });
 
     console.log(`\n${passed} passed, ${failed} failed`);

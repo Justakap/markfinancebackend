@@ -64,7 +64,14 @@ async function runAndPersistBacktest({
 
     const requestedDays = Math.max(1, Math.ceil((endDate - startDate) / (24 * 60 * 60 * 1000)));
 
-    const { candlesByTimeframe, primaryTimeframe, isDerivative, cappedTimeframes } = await fetchCandlesForDefinition({
+    const {
+        candlesByTimeframe,
+        primaryTimeframe,
+        isDerivative,
+        cappedTimeframes,
+        incompleteTimeframes,
+        retentionClampedTimeframes,
+    } = await fetchCandlesForDefinition({
         instrumentKey,
         definition,
         requestedDays,
@@ -139,6 +146,22 @@ async function runAndPersistBacktest({
         slTpAmbiguityPolicy: "When one bar touches both stop-loss and take-profit, the stop is always assumed to have triggered first.",
         isDerivativeInstrument: isDerivative,
         cappedTimeframes,
+        // Candle-retrieval hardening (2026-10-10): a timeframe lands here
+        // only because of a genuine caught request error on one or more
+        // date-range chunks during chunked historical fetching — never
+        // inferred from an empty result. See professionalCandleAdapter.js.
+        incompleteTimeframes,
+        incompleteDataNote: incompleteTimeframes.length
+            ? `Some historical data could not be retrieved for: ${incompleteTimeframes
+                  .map((t) => t.timeframe)
+                  .join(", ")}. This backtest ran on the candles that WERE successfully fetched — results may not reflect the full requested date range.`
+            : null,
+        retentionClampedTimeframes,
+        retentionClampedNote: retentionClampedTimeframes.length
+            ? `Requested history exceeds Upstox's intraday data retention for: ${retentionClampedTimeframes
+                  .map((t) => `${t.timeframe} (from ${t.retentionFrom})`)
+                  .join(", ")}. The date range was clamped forward to the earliest available data instead of fabricating candles.`
+            : null,
         // Verification-pass audit (2026-10-09) finding: this engine's
         // cost model is exactly two user-configurable percentages
         // (commissionPct, slippagePct) applied symmetrically to both

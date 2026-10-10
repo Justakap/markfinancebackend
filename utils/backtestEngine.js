@@ -1,4 +1,4 @@
-const { getCandles, toBacktestQuote } = require("../services/candleService");
+const { getCandles, getCandlesWithQuality, toBacktestQuote } = require("../services/candleService");
 const {
     calculateRSISeries,
     calculateEMASeries,
@@ -38,12 +38,16 @@ const PERIOD_DAYS = {
     "5y": 1825,
 };
 
+// maxDays is TOTAL history supported for a backtest (not a single Upstox
+// request window — candleService.js chunks any range exceeding Upstox's
+// per-request limits internally). absoluteMaxBars is a hard ceiling on bars
+// fetched, sized so a full maxDays-long request isn't truncated.
 const INTERVAL_CONFIG = {
-    "1m": { maxDays: 6, label: "1 Minute", barsPerDay: 375 },
-    "5m": { maxDays: 28, label: "5 Minute", barsPerDay: 75 },
-    "15m": { maxDays: 55, label: "15 Minute", barsPerDay: 25 },
-    "1h": { maxDays: 90, label: "1 Hour", barsPerDay: 7 },
-    "1d": { maxDays: 1825, label: "Daily", barsPerDay: 1 },
+    "1m": { maxDays: 6, label: "1 Minute", barsPerDay: 375, absoluteMaxBars: 2500 },
+    "5m": { maxDays: 365, label: "5 Minute", barsPerDay: 75, absoluteMaxBars: 30000 },
+    "15m": { maxDays: 55, label: "15 Minute", barsPerDay: 25, absoluteMaxBars: 2500 },
+    "1h": { maxDays: 365, label: "1 Hour", barsPerDay: 7, absoluteMaxBars: 3000 },
+    "1d": { maxDays: 1825, label: "Daily", barsPerDay: 1, absoluteMaxBars: 2500 },
 };
 
 /** F&O contracts: cap history to contract life and Upstox intraday limits */
@@ -77,6 +81,7 @@ const INTERVAL_TO_RSI = {
 };
 
 const backtestSeriesCache = new Map();
+const backtestSeriesWithQualityCache = new Map();
 
 /**
  * Phase 2.0 audit finding: Upstox's own community support stated they adjust
@@ -387,7 +392,7 @@ async function fetchCandleSeriesForBacktest(instrumentKey, intervalKey, effectiv
     const intConfig = INTERVAL_CONFIG[intervalKey] || INTERVAL_CONFIG["1d"];
     const periodDays = Math.min(effectiveDays, intConfig.maxDays);
     const maxBars = Math.min(
-        2500,
+        intConfig.absoluteMaxBars || 2500,
         Math.max(250, periodDays * (intConfig.barsPerDay || 1)),
     );
 
@@ -412,6 +417,57 @@ async function fetchCandleSeriesForBacktest(instrumentKey, intervalKey, effectiv
         return series.map((candle) => ({ ...candle }));
     } catch (error) {
         backtestSeriesCache.delete(cacheKey);
+        throw error;
+    }
+}
+
+/**
+ * Quality-aware sibling of fetchCandleSeriesForBacktest, for the professional
+ * backtest path only — never called by the legacy fetchBacktestCandles, so
+ * that function's existing array-returning contract is untouched. Returns
+ * {series, dataQuality} where dataQuality surfaces genuine fetch failures
+ * (incomplete/failedRanges) and Upstox intraday-retention clamping
+ * (retentionClamped/retentionFrom) from candleService's chunked fetch — never
+ * inferred from an empty result, only from caught request errors.
+ */
+async function fetchCandleSeriesForBacktestWithQuality(instrumentKey, intervalKey, effectiveDays) {
+    const cacheKey = `${instrumentKey}|${intervalKey}|${effectiveDays}`;
+    const cached = backtestSeriesWithQualityCache.get(cacheKey);
+    if (cached) {
+        const resolved = await cached;
+        return { series: resolved.series.map((candle) => ({ ...candle })), dataQuality: resolved.dataQuality };
+    }
+
+    const upstox = INTERVAL_TO_UPSTOX[intervalKey] || INTERVAL_TO_UPSTOX["1d"];
+    const intConfig = INTERVAL_CONFIG[intervalKey] || INTERVAL_CONFIG["1d"];
+    const periodDays = Math.min(effectiveDays, intConfig.maxDays);
+    const maxBars = Math.min(
+        intConfig.absoluteMaxBars || 2500,
+        Math.max(250, periodDays * (intConfig.barsPerDay || 1)),
+    );
+
+    const load = (async () => {
+        const { candles: raw, incomplete, failedRanges, retentionClamped, retentionFrom } = await getCandlesWithQuality(instrumentKey, {
+            interval: upstox.unit,
+            unit: upstox.interval,
+            periodDays,
+            maxBars,
+        });
+
+        const closed = dropFormingCandle(raw, upstox.unit, upstox.interval);
+        const series = closed.map(toBacktestQuote).filter((q) => q.close != null);
+
+        return { series, dataQuality: { incomplete, failedRanges, retentionClamped, retentionFrom } };
+    })();
+
+    backtestSeriesWithQualityCache.set(cacheKey, load);
+
+    try {
+        const result = await load;
+        backtestSeriesWithQualityCache.set(cacheKey, Promise.resolve(result));
+        return { series: result.series.map((candle) => ({ ...candle })), dataQuality: result.dataQuality };
+    } catch (error) {
+        backtestSeriesWithQualityCache.delete(cacheKey);
         throw error;
     }
 }
@@ -1024,6 +1080,7 @@ function runBacktestSimulation({
 module.exports = {
     buildBacktestIndicators,
     fetchBacktestCandles,
+    fetchCandleSeriesForBacktestWithQuality,
     fetchCandleSeriesForBacktest,
     runBacktestSimulation,
     trimEquityCurveToTradeWindow,
