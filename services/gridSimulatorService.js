@@ -246,22 +246,22 @@ async function processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId
             },
         );
 
+        let ledgerTrades = result.trades;
         if (result.trades.length) {
-            const annotated = annotateRunningState(result.trades, state, claimed.config.commissionPct ?? 0);
-            await GridSimulatorTrade.insertMany(
-                annotated.map((trade, i) =>
-                    tradeToDoc({
-                        trade,
-                        session: claimed,
-                        sequence: state.tradeSequence + 1 + i,
-                        eventTimestamp,
-                        gapFill: result.gapFill,
-                    }),
-                ),
-            );
+            const annotated = annotateRunningState(result.trades, state, claimed.config.commissionPct ?? 0).map((trade, i) => ({
+                ...trade,
+                sequence: state.tradeSequence + 1 + i,
+                gapFill: result.gapFill,
+                eventTimestamp,
+            }));
+            await GridSimulatorTrade.insertMany(annotated.map((trade) => tradeToDoc({ trade, session: claimed, sequence: trade.sequence, eventTimestamp, gapFill: result.gapFill })));
+            // Returned to the caller (e.g. gridSimulatorRealtime.js's Socket.IO
+            // push) fully annotated, exactly as persisted — avoids a second
+            // DB round trip just to re-fetch what was already computed here.
+            ledgerTrades = annotated;
         }
 
-        return { skipped: result.skipped === true, reason: result.reason, trades: result.trades, state: result.state };
+        return { skipped: result.skipped === true, reason: result.reason, trades: ledgerTrades, state: result.state };
     } catch (error) {
         await GridSimulatorSession.findOneAndUpdate({ _id: claimed._id }, { $set: { processingLockedUntil: null } }).catch(() => {});
         throw error;

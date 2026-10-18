@@ -1,6 +1,8 @@
 const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
+const jwt = require("jsonwebtoken");
+const mongoose = require("mongoose");
 require("dotenv").config();
 
 const Watchlist = require("./models/Watchlist");
@@ -97,7 +99,7 @@ const {
     listTrades: listGridTrades,
     getPortfolioMetrics: getGridPortfolioMetrics,
 } = require("./services/gridSimulatorService");
-const { startGridSimulatorPolling, stopGridSimulatorPolling } = require("./services/gridSimulatorFeed");
+const gridSimulatorRealtime = require("./services/gridSimulatorRealtime");
 
 const VALIDATION_MODE =
     process.env.ENABLE_VALIDATION_MODE === "true" ||
@@ -311,6 +313,8 @@ app.use(
         listSessions: listGridSessions,
         listTrades: listGridTrades,
         getPortfolioMetrics: getGridPortfolioMetrics,
+        registerRealtimeSession: gridSimulatorRealtime.registerSession,
+        unregisterRealtimeSession: gridSimulatorRealtime.unregisterSession,
     }),
 );
 
@@ -355,6 +359,35 @@ async function startServer() {
         },
     });
 
+    // Grid Trading Simulator (PAPER TRADING ONLY) — per-socket authenticated
+    // room join. The existing `marketTick` channel (see
+    // services/marketDataService.js) is a deliberate, unauthenticated
+    // global broadcast of public market prices — fine for that data, never
+    // for a simulator session's private holdings/cash/trades. This is the
+    // first per-socket auth in this codebase: a client must prove it owns
+    // the session (its own JWT, verified here, plus a DB ownership check —
+    // never trusted from the client alone) before joining
+    // `grid-session:<sessionId>`, and gridSimulatorRealtime.js emits
+    // session-state updates ONLY to that room, never a global broadcast.
+    io.on("connection", (socket) => {
+        socket.on("subscribeGridSession", async ({ sessionId, token } = {}) => {
+            try {
+                if (!sessionId || !token || !mongoose.Types.ObjectId.isValid(sessionId)) return;
+                const payload = jwt.verify(token, getJwtSecret());
+                const owned = await GridSimulatorSession.findOne({ _id: sessionId, userId: payload.mongoId });
+                if (!owned) return; // not found or not this user's — silently refuse, no detail leaked
+                socket.join(`grid-session:${sessionId}`);
+            } catch {
+                // Invalid/expired token or malformed payload — refuse silently,
+                // same "don't leak which case it is" posture as the REST API.
+            }
+        });
+
+        socket.on("unsubscribeGridSession", ({ sessionId } = {}) => {
+            if (sessionId) socket.leave(`grid-session:${sessionId}`);
+        });
+    });
+
     upstoxMarketData.init(io);
     console.log("Upstox market data enabled (live quotes, strategies & backtests)");
 
@@ -371,13 +404,16 @@ async function startServer() {
     startAlertProcessingPolling({ LiveStrategyRuntime, LiveStrategySignal, AlertConfiguration, Notification });
     console.log("Alert notification polling enabled");
 
-    // Grid Trading Simulator (PAPER TRADING ONLY) — polls ACTIVE
-    // GridSimulatorSession documents on a short interval, reusing
-    // marketDataService's existing REST LTP path. Not a second WebSocket
-    // connection, not real order execution; see
-    // services/gridSimulatorFeed.js's file doc comment (ADR-021).
-    startGridSimulatorPolling({ GridSimulatorSession, GridSimulatorTrade, marketDataService: upstoxMarketData });
-    console.log("Grid trading simulator polling enabled (paper trading only)");
+    // Grid Trading Simulator (PAPER TRADING ONLY) — event-driven on
+    // genuine Upstox WebSocket ticks (ADR-022), not a dedicated poll loop.
+    // Not real order execution. resyncFromDb() rebuilds the in-memory
+    // instrument-pin registry from every currently-ACTIVE session —
+    // necessary because that registry itself is process-memory-only (the
+    // session's own cash/holdings/trade-ledger state is already durable
+    // in Mongo regardless).
+    gridSimulatorRealtime.init({ GridSimulatorSession, GridSimulatorTrade, io });
+    const resyncedCount = await gridSimulatorRealtime.resyncFromDb({ GridSimulatorSession });
+    console.log(`Grid trading simulator real-time processing enabled (paper trading only) — resynced ${resyncedCount} active session(s)`);
 
     server.listen(PORT, () => {
         console.log(`Server running on port ${PORT} (Socket.IO enabled)`);
@@ -397,7 +433,7 @@ async function startServer() {
         forceExitTimer.unref();
 
         try {
-            stopGridSimulatorPolling();
+            gridSimulatorRealtime.shutdown();
             stopAlertProcessingPolling();
             stopLiveEnginePolling();
             upstoxMarketData.shutdown();

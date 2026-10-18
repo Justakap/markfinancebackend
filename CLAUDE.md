@@ -204,6 +204,35 @@ class of bug this hardening pass fixed:
    limits) — it now self-prunes stale IP entries every 5 minutes.
 10. All protected endpoints must use `requireAuth`. If you add a new route
     that touches user data, add it.
+11. **Socket.IO has exactly one authenticated channel**: the
+    `grid-session:<sessionId>` room (Grid Trading Simulator — see below).
+    A socket must send its own JWT via `subscribeGridSession` and the
+    server re-verifies DB ownership before letting it join — never trust
+    a client-supplied `sessionId` alone. Every other Socket.IO event
+    (`marketTick`) is a deliberate, unauthenticated global broadcast of
+    public market prices; don't put private/per-user data on it.
+
+## Grid Trading Simulator (PAPER TRADING ONLY)
+
+A standalone fixed-grid paper-trading feature — never places a real
+broker order. `models/GridSimulatorSession.js`/`GridSimulatorTrade.js`,
+pure crossing/accounting engine `services/gridSimulatorEngine.js`,
+DB orchestration + claim-lock `services/gridSimulatorService.js`,
+`routes/gridSimulatorRoutes.js` (`/api/v2/grid-simulator/*`).
+
+Price updates are event-driven, not polled: `services/gridSimulatorRealtime.js`
+subscribes directly to `marketDataService.js`'s `tickEmitter` (genuine
+Upstox WebSocket ticks via `"tick"`, REST-fallback prices — only while
+the socket is down — via the distinctly-named `"fallbackTick"`) and
+processes a session's grid the instant a relevant tick arrives. It pins
+its instruments via `marketDataService.pinInstrument()`/`unpinInstrument()`
+— an additive, reference-counted layer that never disrupts (or is
+disrupted by) the watchlist feature's own `subscribe()` (which does a
+destructive full-set-replace — never call it from a second independent
+consumer; use pin/unpin instead). See ADR-022 in the frontend repo's
+`.claude/state/DECISIONS.md` for the full design writeup (that file
+currently only exists in the frontend repo's working tree, not this
+one — read it there for the complete history of this feature).
 
 ## Important API Rules
 
@@ -226,13 +255,23 @@ Don't rename or change the shape of these without checking the frontend
 - `GET /api/market-data/:watchlistId`, `GET /api/search?q=`, `GET
   /api/search-stock?q=` (legacy alias, same handler)
 - `GET /api/dashboard`, `GET /api/metrics`, `GET /api/health`
-- **Socket.IO:** the only event currently emitted is `marketTick` (per-tick,
-  one event per instrument, not batched). The frontend's `socket.js` also
-  listens for a legacy `batchedStockUpdates` event (`onBatchedStockUpdates`,
-  `onStockUpdate`) that **the backend does not currently emit** — this is
-  dead wiring left over from an earlier batching design. Don't assume it's
-  live; if you want real batching, you'd need to add the emit on the backend
-  side and verify the frontend consumers still expect the same payload shape.
+- **Socket.IO:** `marketTick` is the only unauthenticated, globally-broadcast
+  event (per-tick, one event per instrument, not batched). The frontend's
+  `socket.js` also listens for a legacy `batchedStockUpdates` event
+  (`onBatchedStockUpdates`, `onStockUpdate`) that **the backend does not
+  currently emit** — dead wiring left over from an earlier batching design.
+  Separately, `gridSimulatorUpdate` is emitted ONLY to the authenticated,
+  per-session room `grid-session:<sessionId>` (joined via the
+  `subscribeGridSession` socket event — see Security Rules #11) — never
+  globally, since it carries a session's private holdings/cash/trades.
+- `POST /api/v2/grid-simulator/sessions` (create), `GET` (list, paginated),
+  `GET /:sessionId` (detail incl. computed portfolio + feed health),
+  `POST /:sessionId/{start,pause,resume,stop}`, `POST /:sessionId/tick`
+  (optional frontend-pushed accelerant — the authoritative path is
+  event-driven server-side, see the Grid Trading Simulator section above),
+  `GET /:sessionId/trades` (paginated, `?skippedOnly=true` filter). All
+  ownership-scoped via `req.user.mongoId`, same convention as every other
+  route in this file.
 
 ## Environment Variables
 
@@ -648,6 +687,23 @@ accepted tradeoff (2771ms → 3226ms) since it now waits for indicator work
 to fully drain before getting a queue turn — PE still completes normally,
 just later, exactly as intended. Zero 429s/retries/failures in either
 run.
+
+### 2026-10-19 — Grid Trading Simulator: real-time Socket.IO processing replaces 5s polling
+
+Deleted `services/gridSimulatorFeed.js`'s dedicated 5-second REST poll
+loop, replaced with genuine event-driven processing fed directly by the
+existing Upstox WebSocket feed. New `services/gridSimulatorRealtime.js`
+reacts to `marketDataService.js`'s new `tickEmitter` the instant a tick
+arrives, instead of on a timer. New additive, reference-counted
+`pinInstrument()`/`unpinInstrument()` subscription layer on
+`marketDataService.js` so the simulator's instruments never collide with
+(or get silently dropped by) the watchlist feature's own `subscribe()`.
+New authenticated per-socket Socket.IO room (`grid-session:<sessionId>`)
+for private session updates — the first per-socket auth in this
+codebase; the existing `marketTick` global broadcast is unchanged. Full
+design/reasoning in ADR-022 (frontend repo's `.claude/state/DECISIONS.md`
+— see the Grid Trading Simulator section above). 20 new/updated backend
+tests, full suite passing, production build/boot confirmed clean.
 
 **Update this section whenever a future session makes a major
 architectural or security change — don't let it go stale.**

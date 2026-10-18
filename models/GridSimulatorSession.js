@@ -3,11 +3,13 @@ const mongoose = require("mongoose");
 /**
  * Grid Trading Simulator — PAPER TRADING ONLY. One document per simulator
  * session: a fixed grid anchored to `config.referencePrice`, evaluated
- * against live/polled price updates for `instrumentKey`.
+ * event-driven against genuine Upstox WebSocket ticks (falling back to
+ * REST-polled prices, honestly labeled, only while the socket is down)
+ * for `instrumentKey`.
  *
  * `state` mirrors services/gridSimulatorEngine.js's state shape exactly —
  * it is the ONLY place that state lives; a restart reads it back and
- * resumes from exactly where it left off (see services/gridSimulatorFeed.js).
+ * resumes from exactly where it left off (see services/gridSimulatorRealtime.js).
  * `state.lastEventTimestamp` is the monotonic dedup/out-of-order watermark;
  * `state.levelArmed` is a sparse map (grid-level-index -> armed boolean,
  * default true when absent — see gridSimulatorEngine.js's file doc comment
@@ -15,9 +17,9 @@ const mongoose = require("mongoose");
  *
  * `processingLockedUntil` is a short-TTL claim, same idiom as
  * LiveStrategyRuntime.processingLockedUntil — prevents two concurrent
- * processors (the backend poller and a frontend-pushed tick, or two
- * processes) from processing overlapping price updates for the same
- * session at once.
+ * processors (a genuine upstream WebSocket tick and a frontend-pushed
+ * tick, or two backend processes) from processing overlapping price
+ * updates for the same session at once.
  */
 const gridSimulatorSessionSchema = new mongoose.Schema(
     {
@@ -58,7 +60,12 @@ const gridSimulatorSessionSchema = new mongoose.Schema(
 
         // Feed health — never implied "live" without a fresh, genuine read.
         lastFeedCheckAt: { type: Date, default: null },
-        lastFeedStatus: { type: String, enum: ["UNKNOWN", "LIVE", "STALE", "NO_DATA"], default: "UNKNOWN" },
+        // LIVE = a genuine Upstox WebSocket tick arrived recently.
+        // LIVE_REST_FALLBACK = only REST-polled prices have arrived
+        // recently (WS is down) — never reported as plain "LIVE", so the
+        // frontend can honestly distinguish the two (never claim a
+        // WebSocket/live badge merely because *a* price arrived).
+        lastFeedStatus: { type: String, enum: ["UNKNOWN", "LIVE", "LIVE_REST_FALLBACK", "STALE", "NO_DATA"], default: "UNKNOWN" },
         lastFeedPrice: { type: Number, default: null },
 
         processingLockedUntil: { type: Date, default: null },

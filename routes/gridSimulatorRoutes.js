@@ -4,9 +4,10 @@ const express = require("express");
  * Grid Trading Simulator — PAPER TRADING ONLY. Authenticated API for
  * configuring, running, and inspecting a simulated grid-trading session.
  * Nothing in this file (or anything it calls) places a real broker order —
- * "start"/"resume" only ever resume simulated evaluation
- * (services/gridSimulatorFeed.js's poll loop + this route's own tick
- * endpoint, both funneling into services/gridSimulatorService.processTick).
+ * "start"/"resume" only ever resume simulated evaluation, now driven by
+ * genuine Upstox WebSocket ticks (services/gridSimulatorRealtime.js) plus
+ * this route's own frontend-pushed tick endpoint, both funneling into
+ * services/gridSimulatorService.processTick (ADR-022).
  *
  * Own `/v2/grid-simulator` prefix — distinct from `/v2/strategies`,
  * `/v2/backtest`, `/v2/live`, `/v2/alert-configurations` (same
@@ -91,6 +92,8 @@ function createGridSimulatorRoutes({
     listSessions,
     listTrades,
     getPortfolioMetrics,
+    registerRealtimeSession = () => {},
+    unregisterRealtimeSession = () => {},
 }) {
     const router = express.Router();
 
@@ -149,10 +152,18 @@ function createGridSimulatorRoutes({
         }
     });
 
-    function makeTransitionHandler(transitionFn) {
+    // After ACTIVE/PAUSED/STOPPED transitions, keep the real-time registry
+    // (services/gridSimulatorRealtime.js — pins/unpins the instrument,
+    // subscribes/unsubscribes this process to its live ticks) in sync with
+    // the session's actual status. Same place watchlistRoutes.js calls
+    // marketDataService.subscribe() directly after its own DB mutation —
+    // routes already own this kind of side-effect orchestration here.
+    function makeTransitionHandler(transitionFn, { afterActivate = false, afterDeactivate = false } = {}) {
         return async (req, res) => {
             try {
                 const session = await transitionFn({ GridSimulatorSession, sessionId: req.params.sessionId, userId: req.user.mongoId });
+                if (afterActivate) registerRealtimeSession(session);
+                if (afterDeactivate) unregisterRealtimeSession(session._id);
                 return res.json({ session: sessionSummary(session) });
             } catch (error) {
                 return handleError(res, error, "Failed to update grid simulator session");
@@ -160,16 +171,16 @@ function createGridSimulatorRoutes({
         };
     }
 
-    router.post("/v2/grid-simulator/sessions/:sessionId/start", requireAuth, validateObjectId("sessionId"), makeTransitionHandler(startSession));
-    router.post("/v2/grid-simulator/sessions/:sessionId/pause", requireAuth, validateObjectId("sessionId"), makeTransitionHandler(pauseSession));
-    router.post("/v2/grid-simulator/sessions/:sessionId/resume", requireAuth, validateObjectId("sessionId"), makeTransitionHandler(resumeSession));
-    router.post("/v2/grid-simulator/sessions/:sessionId/stop", requireAuth, validateObjectId("sessionId"), makeTransitionHandler(stopSession));
+    router.post("/v2/grid-simulator/sessions/:sessionId/start", requireAuth, validateObjectId("sessionId"), makeTransitionHandler(startSession, { afterActivate: true }));
+    router.post("/v2/grid-simulator/sessions/:sessionId/pause", requireAuth, validateObjectId("sessionId"), makeTransitionHandler(pauseSession, { afterDeactivate: true }));
+    router.post("/v2/grid-simulator/sessions/:sessionId/resume", requireAuth, validateObjectId("sessionId"), makeTransitionHandler(resumeSession, { afterActivate: true }));
+    router.post("/v2/grid-simulator/sessions/:sessionId/stop", requireAuth, validateObjectId("sessionId"), makeTransitionHandler(stopSession, { afterDeactivate: true }));
 
-    // Frontend-pushed tick: lets the browser's own already-open Socket.IO
-    // `marketTick` subscription drive lower-latency updates than the
-    // backend's own poll loop (services/gridSimulatorFeed.js), which remains
-    // the fallback that keeps the session progressing even with no tab open.
-    // Both paths funnel into the exact same idempotent processTick.
+    // Frontend-pushed tick: an optional, lower-latency accelerant on top of
+    // the real authoritative path — genuine Upstox WebSocket ticks routed
+    // through services/gridSimulatorRealtime.js, which keeps the session
+    // progressing even with no browser tab open at all. Both paths funnel
+    // into the exact same idempotent processTick.
     router.post("/v2/grid-simulator/sessions/:sessionId/tick", requireAuth, validateObjectId("sessionId"), async (req, res) => {
         try {
             const { price } = req.body;

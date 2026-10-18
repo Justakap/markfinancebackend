@@ -4,6 +4,7 @@ const path = require("path");
 const protobuf = require("protobufjs");
 const WebSocket = require("ws");
 const zlib = require("zlib");
+const { EventEmitter } = require("events");
 const { enqueue } = require("../utils/upstoxRequestQueue");
 const {
     loadInstrumentBundle,
@@ -35,7 +36,31 @@ const liveData = new Map();
 const indicatorSnapshot = new Map();
 const LIVE_DATA_MAX_SIZE = Number(process.env.UPSTOX_LIVE_DATA_MAX_SIZE || 3000);
 const subscribedInstruments = new Set();
+// Reference-counted, ADDITIVE subscription layer for consumers that must
+// never be disrupted by subscribe()'s own destructive full-set-replace
+// (watchlists). Used by the Grid Trading Simulator (see
+// services/gridSimulatorRealtime.js) — pinInstrument/unpinInstrument never
+// touch `subscribedInstruments` itself, and subscribe()'s own unsubscribe
+// pass below skips anything with an active pin. A key can be pinned by
+// multiple sessions at once; the WS subscription is only dropped once the
+// last pin AND no watchlist subscription reference it.
+const pinnedInstrumentRefCounts = new Map();
 const instrumentMeta = new Map();
+
+/** Two distinctly-named events — a consumer must never confuse one for the
+ *  other, since only one of them is a genuine live tick:
+ *  - `"tick"` — `{instrumentKey, ltp, volume, timestamp}` — emitted from
+ *    handleTick() for every genuine, decoded Upstox WebSocket tick, and
+ *    nothing else. Never fabricated, never emitted for REST-sourced data.
+ *  - `"fallbackTick"` — same shape — emitted from broadcastLivePrices(),
+ *    which only ever runs from the REST LTP-poll loop while the WS socket
+ *    is down. Honestly labeled as a fallback, not a live tick.
+ *  Consumed by services/gridSimulatorRealtime.js so the grid simulator is
+ *  fed directly off the real feed instead of polling. Kept as a plain
+ *  EventEmitter (not a new Socket.IO channel) so this module stays free of
+ *  any Mongoose/DB dependency — layering this codebase already follows
+ *  elsewhere (marketDataService.js has never imported a model). */
+const tickEmitter = new EventEmitter();
 const SEARCH_CACHE_TTL_MS = 30 * 1000;
 
 /** Instrument search results keyed by normalized query string. Purpose: avoid
@@ -364,7 +389,7 @@ async function connectFeed() {
             connecting = false;
             socketConnected = true;
             console.log("Upstox V3 feed connected (socket)");
-            sendGroupedSubscriptions([...subscribedInstruments], "sub");
+            sendGroupedSubscriptions([...new Set([...subscribedInstruments, ...pinnedInstrumentRefCounts.keys()])], "sub");
         });
 
         ws.on("message", (data) => {
@@ -780,6 +805,18 @@ function handleTick(tick) {
     const snapshot = indicatorSnapshot.get(tick.instrumentKey) || {};
     emitMarketTick(next, snapshot);
     scheduleRealtimeIndicatorRefresh(tick.instrumentKey);
+
+    // Genuine WebSocket tick only — never fired for a REST-fallback-sourced
+    // price (warmLiveQuotes never calls handleTick, it writes liveData
+    // directly) and never for a tick that carried no real LTP.
+    if (isValidLtp(next.ltp)) {
+        tickEmitter.emit("tick", {
+            instrumentKey: tick.instrumentKey,
+            ltp: next.ltp,
+            volume: next.volume ?? null,
+            timestamp: next.timestamp,
+        });
+    }
 }
 
 async function refreshRealtimeIndicatorsForKey(instrumentKey) {
@@ -1183,6 +1220,18 @@ function broadcastLivePrices(keys = []) {
             { ...live, instrumentKey },
             indicatorSnapshot.get(instrumentKey) || {},
         );
+        // REST-fallback path only (this function's only caller is the LTP
+        // poll loop, which only ever runs while the WS socket is down) —
+        // a SEPARATE event name from tickEmitter's "tick" so a consumer can
+        // never mistake this for a genuine WebSocket tick. Lets the grid
+        // simulator keep progressing (honestly labeled as REST-sourced)
+        // during a WS outage instead of going silent.
+        tickEmitter.emit("fallbackTick", {
+            instrumentKey,
+            ltp: live.ltp,
+            volume: live.volume ?? null,
+            timestamp: live.timestamp || Date.now(),
+        });
     });
 }
 
@@ -1190,7 +1239,12 @@ function startLtpPollLoop() {
     if (ltpPollTimer) return;
 
     ltpPollTimer = setInterval(async () => {
-        const keys = [...subscribedInstruments];
+        // Must include pinned-only instruments (e.g. a grid simulator
+        // session watching an instrument no watchlist currently has) —
+        // otherwise this fallback silently never covers them when the WS
+        // feed is down, leaving pin-only consumers with no price source
+        // at all instead of the documented REST fallback.
+        const keys = [...new Set([...subscribedInstruments, ...pinnedInstrumentRefCounts.keys()])];
         if (!keys.length) return;
 
         // REST LTP is fallback when socket is down; socket is primary for live rates.
@@ -1403,19 +1457,38 @@ function filterSubscribableKeys(instrumentKeys = []) {
     );
 }
 
+/**
+ * Pure: given the watchlist-driven key list a caller wants (`requestedKeys`),
+ * the currently-subscribed set, and the currently-pinned keys (ADR-022),
+ * computes the new subscribed set plus exactly which keys need a WS "sub"/
+ * "unsub" message. A pinned key is NEVER included in toUnsubscribe — this
+ * is the one property that makes subscribe()'s full-set-replace semantics
+ * safe to share with a second, independent consumer (the grid simulator).
+ * Exported purely for direct unit testing (no network/WS/DB needed).
+ */
+function computeSubscriptionDiff(requestedKeys, currentlySubscribed, pinnedKeys) {
+    const next = new Set(requestedKeys);
+    const toSubscribe = [...next].filter(
+        (key) => !currentlySubscribed.has(key) && !pinnedKeys.has(key),
+    );
+    const toUnsubscribe = [...currentlySubscribed].filter(
+        (key) => !next.has(key) && !pinnedKeys.has(key),
+    );
+    return { next, toSubscribe, toUnsubscribe };
+}
+
 function subscribe(instrumentKeys = []) {
     const applySubscription = () => {
-        const next = new Set(filterSubscribableKeys(instrumentKeys));
-        const toSubscribe = [...next].filter(
-            (key) => !subscribedInstruments.has(key),
-        );
-        const toUnsubscribe = [...subscribedInstruments].filter(
-            (key) => !next.has(key),
+        const { next, toSubscribe, toUnsubscribe } = computeSubscriptionDiff(
+            filterSubscribableKeys(instrumentKeys),
+            subscribedInstruments,
+            pinnedInstrumentRefCounts,
         );
 
-        toSubscribe.forEach((key) => subscribedInstruments.add(key));
+        subscribedInstruments.clear();
+        next.forEach((key) => subscribedInstruments.add(key));
+
         toUnsubscribe.forEach((key) => {
-            subscribedInstruments.delete(key);
             // Nobody is watching this instrument anymore — drop its live state
             // so liveData/indicatorSnapshot don't grow forever as watchlists change.
             liveData.delete(key);
@@ -1435,6 +1508,41 @@ function subscribe(instrumentKeys = []) {
     loadInstruments()
         .then(applySubscription)
         .catch(() => applySubscription());
+}
+
+/**
+ * Additive, reference-counted subscribe for a consumer that must never be
+ * disrupted by (or disrupt) subscribe()'s watchlist-driven full-set-replace
+ * — see ADR-022. Safe to call multiple times for the same key (e.g. two
+ * grid simulator sessions on the same instrument); the WS subscription is
+ * only actually sent the first time, and only actually dropped once every
+ * pin (and any watchlist subscription) is gone.
+ */
+function pinInstrument(instrumentKey) {
+    if (!instrumentKey || !isValidInstrumentKey(instrumentKey)) return;
+
+    const current = pinnedInstrumentRefCounts.get(instrumentKey) || 0;
+    pinnedInstrumentRefCounts.set(instrumentKey, current + 1);
+
+    if (current === 0 && !subscribedInstruments.has(instrumentKey)) {
+        connectFeed();
+        sendGroupedSubscriptions([instrumentKey], "sub");
+    }
+}
+
+function unpinInstrument(instrumentKey) {
+    if (!instrumentKey) return;
+    const current = pinnedInstrumentRefCounts.get(instrumentKey) || 0;
+    if (current <= 1) {
+        pinnedInstrumentRefCounts.delete(instrumentKey);
+        if (!subscribedInstruments.has(instrumentKey)) {
+            sendGroupedSubscriptions([instrumentKey], "unsub");
+            liveData.delete(instrumentKey);
+            indicatorSnapshot.delete(instrumentKey);
+        }
+    } else {
+        pinnedInstrumentRefCounts.set(instrumentKey, current - 1);
+    }
 }
 
 function init(socketIo) {
@@ -1485,6 +1593,19 @@ module.exports = {
     shutdown,
     liveData,
     subscribedInstruments,
+    // Exposed so pin/subscribe interaction tests can seed a fake instrument
+    // without a real instrument-master network fetch (isValidInstrumentKey
+    // requires an entry here) — same additive-export precedent as liveData/
+    // subscribedInstruments above.
+    instrumentMeta,
+    // Lets tests make subscribe()'s internal applySubscription() run
+    // synchronously (its normal path is `if (instrumentsCache) {...}`,
+    // otherwise it defers through a real loadInstruments() network call) —
+    // without this, a test asserting on subscribe()'s effect immediately
+    // after calling it would be racing an async instrument-master fetch.
+    primeInstrumentsCacheForTests: (list = []) => {
+        instrumentsCache = list;
+    },
     searchInstruments,
     getRowsForWatchlist,
     subscribe,
@@ -1497,13 +1618,25 @@ module.exports = {
     // the cached-bundle read is an in-memory Map lookup, never a fetch).
     buildRow,
     buildQuickRow,
-    // Exposed for the Grid Trading Simulator (see services/gridSimulatorFeed.js,
-    // ADR-021) — zero behavior change, purely additive. Deliberately NOT using
-    // subscribe()/subscribedInstruments here: subscribe() performs a destructive
-    // set-REPLACE (unsubscribing every key not in its argument), so a second,
-    // independent caller using it would silently kill whatever watchlist a user
-    // currently has open (and vice versa). warmLiveQuotes() has no such side
-    // effect — it only ever adds/refreshes entries in the shared `liveData` map
-    // for the keys it's given, safe for multiple independent callers.
+    // Exposed for the Grid Trading Simulator (ADR-021/ADR-022). warmLiveQuotes
+    // now serves only as a stale-feed fallback check, not the primary price
+    // source — see services/gridSimulatorRealtime.js.
     warmLiveQuotes,
+    // Exposed for direct unit testing of the tick-event contract (same
+    // precedent as buildRow/buildQuickRow above) — both are pure enough to
+    // call standalone (io?.emit/ws.send are optional-chained/no-op-safe
+    // when neither is initialized).
+    handleTick,
+    broadcastLivePrices,
+    // Additive, reference-counted subscription layer (ADR-022) — see the
+    // pinInstrument/unpinInstrument doc comments above. This is what makes
+    // the grid simulator's real-time WS integration safe to share with the
+    // watchlist feature's own subscribe() without either disrupting the
+    // other.
+    pinInstrument,
+    unpinInstrument,
+    // Genuine-WebSocket-tick-only event stream (see the tickEmitter doc
+    // comment above) — never fired for REST-fallback data.
+    tickEmitter,
+    isFeedConnected: () => socketConnected,
 };
