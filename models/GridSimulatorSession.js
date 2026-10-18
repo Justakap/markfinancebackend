@@ -47,6 +47,13 @@ const gridSimulatorSessionSchema = new mongoose.Schema(
             lastEventTimestamp: { type: Date, default: null },
             levelArmed: { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
             sequence: { type: Number, default: 0 },
+            // Total trade-ledger rows ever written for this session —
+            // deliberately separate from `sequence` (the engine's own
+            // per-EVENT watermark). A single event can produce many trades
+            // (an overnight gap crossing ten levels), so numbering ledger
+            // rows from the per-event counter would collide across events;
+            // see services/gridSimulatorService.js's tradeToDoc/processTick.
+            tradeSequence: { type: Number, default: 0 },
         },
 
         // Feed health — never implied "live" without a fresh, genuine read.

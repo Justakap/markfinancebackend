@@ -128,6 +128,7 @@ function docStateToPlain(doc) {
         lastEventTimestamp: s.lastEventTimestamp ?? null,
         levelArmed: s.levelArmed && typeof s.levelArmed.toObject === "function" ? s.levelArmed.toObject() : { ...(s.levelArmed || {}) },
         sequence: s.sequence || 0,
+        tradeSequence: s.tradeSequence || 0,
     };
 }
 
@@ -232,10 +233,17 @@ async function processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId
     try {
         const state = docStateToPlain(claimed);
         const result = processPriceUpdate({ config: claimed.config, state, price, eventTimestamp });
+        const nextTradeSequence = state.tradeSequence + result.trades.length;
 
         await GridSimulatorSession.findOneAndUpdate(
             { _id: claimed._id },
-            { $set: { ...stateToDocFields(result.state), processingLockedUntil: null } },
+            {
+                $set: {
+                    ...stateToDocFields(result.state),
+                    "state.tradeSequence": nextTradeSequence,
+                    processingLockedUntil: null,
+                },
+            },
         );
 
         if (result.trades.length) {
@@ -245,7 +253,7 @@ async function processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId
                     tradeToDoc({
                         trade,
                         session: claimed,
-                        sequence: state.sequence + 1 + i,
+                        sequence: state.tradeSequence + 1 + i,
                         eventTimestamp,
                         gapFill: result.gapFill,
                     }),

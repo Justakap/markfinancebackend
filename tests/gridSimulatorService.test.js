@@ -240,7 +240,25 @@ async function makeActiveSession(userId = new mongoose.Types.ObjectId()) {
         assert.strictEqual(ledgerRows.items[0].cashAfter, 1000000 - 100 * 336);
     });
 
-        await test("a repeated identical/stale tick never duplicates a fill (idempotent restart recovery)", async () => {
+        await test("trade ledger sequence numbers never collide across a multi-trade gap event followed by a later event", async () => {
+        const { GridSimulatorSession, GridSimulatorTrade, session } = await makeActiveSession();
+        // Gap from reference 340 straight to 310 crosses 10 levels in one event.
+        const gapResult = await processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 310, eventTimestamp: new Date(2026, 0, 1, 9, 15).toISOString() });
+        assert.strictEqual(gapResult.trades.length, 10);
+
+        // A later, separate single-trade event (price falls further, crosses the next buy level below 310).
+        await processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 307, eventTimestamp: new Date(2026, 0, 1, 9, 16).toISOString() });
+
+        const ledgerRows = await listTrades({ GridSimulatorTrade, sessionId: session._id, page: 1, limit: 50 });
+        assert.strictEqual(ledgerRows.total, 11);
+        const sequences = ledgerRows.items.map((t) => t.sequence);
+        const uniqueSequences = new Set(sequences);
+        assert.strictEqual(uniqueSequences.size, sequences.length, `sequence numbers must never collide: ${sequences.join(",")}`);
+        // The later event's trade must sort strictly after every trade from the gap event.
+        assert.strictEqual(Math.max(...sequences), 11);
+    });
+
+    await test("a repeated identical/stale tick never duplicates a fill (idempotent restart recovery)", async () => {
         const { GridSimulatorSession, GridSimulatorTrade, session } = await makeActiveSession();
         const ts = new Date(2026, 0, 1, 9, 15).toISOString();
         await processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 336, eventTimestamp: ts });

@@ -38,7 +38,14 @@ async function pollAllActiveSessions({ GridSimulatorSession, GridSimulatorTrade,
     if (!sessions.length) return [];
 
     const instrumentKeys = [...new Set(sessions.map((s) => s.instrumentKey))];
-    await marketDataService.warmLiveQuotes(instrumentKeys);
+    try {
+        await marketDataService.warmLiveQuotes(instrumentKeys);
+    } catch (error) {
+        // A bulk-warm failure must not abort the whole cycle — each session
+        // below still gets its own isolated try/catch and will correctly
+        // report NO_DATA/STALE from whatever liveData already holds.
+        console.error("Grid simulator warmLiveQuotes error:", error.message);
+    }
 
     const nowMs = Date.now();
     const results = [];

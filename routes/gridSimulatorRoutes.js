@@ -172,11 +172,16 @@ function createGridSimulatorRoutes({
     // Both paths funnel into the exact same idempotent processTick.
     router.post("/v2/grid-simulator/sessions/:sessionId/tick", requireAuth, validateObjectId("sessionId"), async (req, res) => {
         try {
-            const { price, eventTimestamp } = req.body;
+            const { price } = req.body;
             if (!Number.isFinite(Number(price)) || Number(price) <= 0) {
                 return res.status(400).json({ message: "price must be a positive number" });
             }
-            const timestamp = eventTimestamp && !Number.isNaN(new Date(eventTimestamp).getTime()) ? eventTimestamp : new Date().toISOString();
+            // Always server-stamped, never a client-supplied timestamp — this
+            // value is the monotonic dedup/out-of-order watermark
+            // (gridSimulatorEngine.js), so trusting a client clock here would
+            // let a skewed/crafted future timestamp permanently freeze the
+            // session against every subsequent genuine backend-poll tick.
+            const timestamp = new Date().toISOString();
 
             await getOwnedSession({ GridSimulatorSession, sessionId: req.params.sessionId, userId: req.user.mongoId });
             const result = await processTick({

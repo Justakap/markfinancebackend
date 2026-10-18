@@ -123,6 +123,25 @@ function makeFakeSessionModel(docs) {
         assert.strictEqual(badResult.reason, "error");
     });
 
+    await test("a throwing warmLiveQuotes does not abort the whole poll cycle", async () => {
+        const session = makeSessionDoc();
+        const GridSimulatorSession = makeFakeSessionModel([session]);
+        const marketDataService = {
+            warmLiveQuotes: async () => {
+                throw new Error("Upstox down");
+            },
+            liveData: new Map(), // nothing warmed, so this session correctly reports no_data
+        };
+        let called = false;
+        const processTick = async () => {
+            called = true;
+        };
+
+        const results = await pollAllActiveSessions({ GridSimulatorSession, GridSimulatorTrade: {}, marketDataService, processTick });
+        assert.strictEqual(called, false);
+        assert.strictEqual(results[0].reason, "no_data"); // did not crash; degraded gracefully
+    });
+
     console.log(`\nGrid simulator feed tests: ${passed} passed, ${failed} failed`);
     process.exit(failed ? 1 : 0);
 })();
