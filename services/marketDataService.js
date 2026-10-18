@@ -1497,4 +1497,13 @@ module.exports = {
     // the cached-bundle read is an in-memory Map lookup, never a fetch).
     buildRow,
     buildQuickRow,
+    // Exposed for the Grid Trading Simulator (see services/gridSimulatorFeed.js,
+    // ADR-021) — zero behavior change, purely additive. Deliberately NOT using
+    // subscribe()/subscribedInstruments here: subscribe() performs a destructive
+    // set-REPLACE (unsubscribing every key not in its argument), so a second,
+    // independent caller using it would silently kill whatever watchlist a user
+    // currently has open (and vice versa). warmLiveQuotes() has no such side
+    // effect — it only ever adds/refreshes entries in the shared `liveData` map
+    // for the keys it's given, safe for multiple independent callers.
+    warmLiveQuotes,
 };

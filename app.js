@@ -13,6 +13,8 @@ const BacktestResult = require("./models/BacktestResult");
 const BacktestTrade = require("./models/BacktestTrade");
 const LiveStrategyRuntime = require("./models/LiveStrategyRuntime");
 const LiveStrategySignal = require("./models/LiveStrategySignal");
+const GridSimulatorSession = require("./models/GridSimulatorSession");
+const GridSimulatorTrade = require("./models/GridSimulatorTrade");
 const AlertConfiguration = require("./models/AlertConfiguration");
 const Notification = require("./models/Notification");
 const { requireAuth } = require("./middleware/auth");
@@ -82,6 +84,20 @@ const {
     archiveAlertConfiguration,
 } = require("./services/alertConfigurationService");
 const { startAlertProcessingPolling, stopAlertProcessingPolling } = require("./services/alertNotificationService");
+const { createGridSimulatorRoutes } = require("./routes/gridSimulatorRoutes");
+const {
+    createSession: createGridSession,
+    getOwnedSession: getOwnedGridSession,
+    startSession: startGridSession,
+    pauseSession: pauseGridSession,
+    resumeSession: resumeGridSession,
+    stopSession: stopGridSession,
+    processTick: processGridTick,
+    listSessions: listGridSessions,
+    listTrades: listGridTrades,
+    getPortfolioMetrics: getGridPortfolioMetrics,
+} = require("./services/gridSimulatorService");
+const { startGridSimulatorPolling, stopGridSimulatorPolling } = require("./services/gridSimulatorFeed");
 
 const VALIDATION_MODE =
     process.env.ENABLE_VALIDATION_MODE === "true" ||
@@ -279,6 +295,27 @@ app.use(
 
 app.use(
     "/api",
+    createGridSimulatorRoutes({
+        GridSimulatorSession,
+        GridSimulatorTrade,
+        requireAuth,
+        validateObjectId,
+        resolveInstrumentKey,
+        createSession: createGridSession,
+        getOwnedSession: getOwnedGridSession,
+        startSession: startGridSession,
+        pauseSession: pauseGridSession,
+        resumeSession: resumeGridSession,
+        stopSession: stopGridSession,
+        processTick: processGridTick,
+        listSessions: listGridSessions,
+        listTrades: listGridTrades,
+        getPortfolioMetrics: getGridPortfolioMetrics,
+    }),
+);
+
+app.use(
+    "/api",
     createAlertRoutes({
         LiveStrategyRuntime,
         AlertConfiguration,
@@ -334,6 +371,14 @@ async function startServer() {
     startAlertProcessingPolling({ LiveStrategyRuntime, LiveStrategySignal, AlertConfiguration, Notification });
     console.log("Alert notification polling enabled");
 
+    // Grid Trading Simulator (PAPER TRADING ONLY) — polls ACTIVE
+    // GridSimulatorSession documents on a short interval, reusing
+    // marketDataService's existing REST LTP path. Not a second WebSocket
+    // connection, not real order execution; see
+    // services/gridSimulatorFeed.js's file doc comment (ADR-021).
+    startGridSimulatorPolling({ GridSimulatorSession, GridSimulatorTrade, marketDataService: upstoxMarketData });
+    console.log("Grid trading simulator polling enabled (paper trading only)");
+
     server.listen(PORT, () => {
         console.log(`Server running on port ${PORT} (Socket.IO enabled)`);
     });
@@ -352,6 +397,7 @@ async function startServer() {
         forceExitTimer.unref();
 
         try {
+            stopGridSimulatorPolling();
             stopAlertProcessingPolling();
             stopLiveEnginePolling();
             upstoxMarketData.shutdown();

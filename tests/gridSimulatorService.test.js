@@ -1,0 +1,275 @@
+/**
+ * Grid Trading Simulator — tests for services/gridSimulatorService.js using
+ * in-memory fake Mongoose-like models (same convention as
+ * liveStrategyOrchestrator.test.js: findOneAndUpdate implements the same
+ * single-operation atomicity a real MongoDB server provides — no `await`
+ * between the match check and the write — so the concurrency tests below
+ * genuinely prove the claim-lock logic, not just assume it).
+ */
+const assert = require("assert");
+const mongoose = require("mongoose");
+
+const {
+    createSession,
+    getOwnedSession,
+    startSession,
+    pauseSession,
+    resumeSession,
+    stopSession,
+    processTick,
+    listTrades,
+} = require("../services/gridSimulatorService");
+
+let passed = 0;
+let failed = 0;
+
+async function test(name, fn) {
+    try {
+        await fn();
+        passed += 1;
+        console.log(`  ✓ ${name}`);
+    } catch (error) {
+        failed += 1;
+        console.error(`  ✗ ${name}`);
+        console.error(`    ${error.stack || error.message}`);
+    }
+}
+
+const CONFIG = {
+    referencePrice: 340,
+    gridInterval: 3,
+    quantityPerLevel: 100,
+    startingCapital: 1000000,
+    maxPositionSize: null,
+    commissionPct: 0,
+    slippagePct: 0,
+};
+
+function matchFilter(doc, filter = {}) {
+    return Object.entries(filter).every(([key, cond]) => {
+        if (key === "$or") return cond.some((sub) => matchFilter(doc, sub));
+        if (key === "$in") return true;
+        if (cond !== null && typeof cond === "object" && !(cond instanceof Date) && !(cond instanceof mongoose.Types.ObjectId)) {
+            if ("$lte" in cond) return doc[key] != null && new Date(doc[key]).getTime() <= new Date(cond.$lte).getTime();
+            if ("$in" in cond) return cond.$in.includes(doc[key]);
+        }
+        if (key === "_id") return String(doc._id) === String(cond);
+        if (cond === null) return doc[key] === null || doc[key] === undefined;
+        return String(doc[key]) === String(cond);
+    });
+}
+
+function applySet(doc, setOps = {}) {
+    Object.entries(setOps).forEach(([path, value]) => {
+        const parts = path.split(".");
+        let target = doc;
+        for (let i = 0; i < parts.length - 1; i += 1) {
+            target[parts[i]] = target[parts[i]] || {};
+            target = target[parts[i]];
+        }
+        target[parts[parts.length - 1]] = value;
+    });
+}
+
+function makeQuery(initialArr) {
+    let arr = initialArr;
+    const query = {
+        sort(spec) {
+            const [key, dir] = Object.entries(spec)[0];
+            arr = [...arr].sort((a, b) => (a[key] < b[key] ? -1 : a[key] > b[key] ? 1 : 0) * dir);
+            return query;
+        },
+        skip(n) {
+            arr = arr.slice(n);
+            return query;
+        },
+        limit(n) {
+            arr = arr.slice(0, n);
+            return query;
+        },
+        then(resolve, reject) {
+            return Promise.resolve(arr.map((d) => JSON.parse(JSON.stringify(d)))).then(resolve, reject);
+        },
+    };
+    return query;
+}
+
+function makeFakeSessionModel() {
+    const docs = new Map();
+    return {
+        docs,
+        async create(fields) {
+            const doc = { _id: new mongoose.Types.ObjectId(), processingLockedUntil: null, ...JSON.parse(JSON.stringify(fields)) };
+            docs.set(String(doc._id), doc);
+            return JSON.parse(JSON.stringify(doc));
+        },
+        async findOne(filter = {}) {
+            const found = [...docs.values()].find((doc) => matchFilter(doc, filter));
+            return found ? JSON.parse(JSON.stringify(found)) : null;
+        },
+        // Atomic: no `await` between match and write.
+        async findOneAndUpdate(filter, update, options = {}) {
+            const found = [...docs.values()].find((doc) => matchFilter(doc, filter));
+            if (!found) return null;
+            if (update.$set) applySet(found, update.$set);
+            return options.new ? JSON.parse(JSON.stringify(found)) : null;
+        },
+        find(filter = {}) {
+            return makeQuery([...docs.values()].filter((doc) => matchFilter(doc, filter)));
+        },
+        async countDocuments(filter = {}) {
+            return [...docs.values()].filter((doc) => matchFilter(doc, filter)).length;
+        },
+    };
+}
+
+function makeFakeTradeModel() {
+    const docs = [];
+    return {
+        docs,
+        async insertMany(items) {
+            items.forEach((item) => docs.push({ _id: new mongoose.Types.ObjectId(), ...item }));
+            return items;
+        },
+        find(filter = {}) {
+            return makeQuery(docs.filter((doc) => matchFilter(doc, filter)));
+        },
+        async countDocuments(filter = {}) {
+            return docs.filter((doc) => matchFilter(doc, filter)).length;
+        },
+    };
+}
+
+async function makeActiveSession(userId = new mongoose.Types.ObjectId()) {
+    const GridSimulatorSession = makeFakeSessionModel();
+    const GridSimulatorTrade = makeFakeTradeModel();
+    const session = await createSession({ GridSimulatorSession, userId, instrumentKey: "NSE_EQ|TEST", symbol: "TEST", config: CONFIG });
+    await startSession({ GridSimulatorSession, sessionId: session._id, userId });
+    return { GridSimulatorSession, GridSimulatorTrade, session, userId };
+}
+
+(async () => {
+    // --- validation / creation ---
+
+        await test("createSession rejects an invalid grid configuration with a 400", async () => {
+        const GridSimulatorSession = makeFakeSessionModel();
+        await assert.rejects(
+            () => createSession({ GridSimulatorSession, userId: new mongoose.Types.ObjectId(), instrumentKey: "X", symbol: "X", config: { ...CONFIG, gridInterval: -1 } }),
+            (err) => err.statusCode === 400,
+        );
+    });
+
+        await test("createSession rejects a duplicate active/paused session for the same user+instrument", async () => {
+        const GridSimulatorSession = makeFakeSessionModel();
+        const userId = new mongoose.Types.ObjectId();
+        await createSession({ GridSimulatorSession, userId, instrumentKey: "NSE_EQ|DUP", symbol: "DUP", config: CONFIG });
+        await assert.rejects(
+            () => createSession({ GridSimulatorSession, userId, instrumentKey: "NSE_EQ|DUP", symbol: "DUP", config: CONFIG }),
+            (err) => err.statusCode === 409,
+        );
+    });
+
+        await test("ownership isolation: getOwnedSession 404s for a different user", async () => {
+        const GridSimulatorSession = makeFakeSessionModel();
+        const owner = new mongoose.Types.ObjectId();
+        const other = new mongoose.Types.ObjectId();
+        const session = await createSession({ GridSimulatorSession, userId: owner, instrumentKey: "NSE_EQ|OWN", symbol: "OWN", config: CONFIG });
+        await assert.rejects(
+            () => getOwnedSession({ GridSimulatorSession, sessionId: session._id, userId: other }),
+            (err) => err.statusCode === 404,
+        );
+    });
+
+    // --- lifecycle transitions ---
+
+        await test("session lifecycle: CREATED -> ACTIVE -> PAUSED -> ACTIVE -> STOPPED", async () => {
+        const GridSimulatorSession = makeFakeSessionModel();
+        const userId = new mongoose.Types.ObjectId();
+        const session = await createSession({ GridSimulatorSession, userId, instrumentKey: "NSE_EQ|LC", symbol: "LC", config: CONFIG });
+        assert.strictEqual(session.status, "CREATED");
+
+        const started = await startSession({ GridSimulatorSession, sessionId: session._id, userId });
+        assert.strictEqual(started.status, "ACTIVE");
+
+        const paused = await pauseSession({ GridSimulatorSession, sessionId: session._id, userId });
+        assert.strictEqual(paused.status, "PAUSED");
+
+        const resumed = await resumeSession({ GridSimulatorSession, sessionId: session._id, userId });
+        assert.strictEqual(resumed.status, "ACTIVE");
+
+        const stopped = await stopSession({ GridSimulatorSession, sessionId: session._id, userId });
+        assert.strictEqual(stopped.status, "STOPPED");
+    });
+
+        await test("invalid transitions are rejected with 409 (e.g. starting an already-stopped session)", async () => {
+        const GridSimulatorSession = makeFakeSessionModel();
+        const userId = new mongoose.Types.ObjectId();
+        const session = await createSession({ GridSimulatorSession, userId, instrumentKey: "NSE_EQ|INV", symbol: "INV", config: CONFIG });
+        await startSession({ GridSimulatorSession, sessionId: session._id, userId });
+        await stopSession({ GridSimulatorSession, sessionId: session._id, userId });
+        await assert.rejects(
+            () => startSession({ GridSimulatorSession, sessionId: session._id, userId }),
+            (err) => err.statusCode === 409,
+        );
+    });
+
+    // --- tick processing / idempotency / restart recovery ---
+
+        await test("processTick only runs against an ACTIVE session", async () => {
+        const GridSimulatorSession = makeFakeSessionModel();
+        const GridSimulatorTrade = makeFakeTradeModel();
+        const userId = new mongoose.Types.ObjectId();
+        const session = await createSession({ GridSimulatorSession, userId, instrumentKey: "NSE_EQ|NA", symbol: "NA", config: CONFIG });
+        const result = await processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 336, eventTimestamp: new Date().toISOString() });
+        assert.strictEqual(result.skipped, true);
+        assert.strictEqual(result.reason, "locked-or-inactive");
+    });
+
+        await test("processTick produces a fill and persists both state and a ledger row", async () => {
+        const { GridSimulatorSession, GridSimulatorTrade, session } = await makeActiveSession();
+        const result = await processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 336, eventTimestamp: new Date(2026, 0, 1, 9, 15).toISOString() });
+        assert.strictEqual(result.trades.length, 1);
+        assert.strictEqual(result.trades[0].qtyFilled, 100);
+
+        const persisted = await GridSimulatorSession.findOne({ _id: session._id });
+        assert.strictEqual(persisted.state.holdings, 100);
+        assert.strictEqual(persisted.processingLockedUntil, null); // lock released
+
+        const ledgerRows = await listTrades({ GridSimulatorTrade, sessionId: session._id, page: 1, limit: 10 });
+        assert.strictEqual(ledgerRows.total, 1);
+        assert.strictEqual(ledgerRows.items[0].cashAfter, 1000000 - 100 * 336);
+    });
+
+        await test("a repeated identical/stale tick never duplicates a fill (idempotent restart recovery)", async () => {
+        const { GridSimulatorSession, GridSimulatorTrade, session } = await makeActiveSession();
+        const ts = new Date(2026, 0, 1, 9, 15).toISOString();
+        await processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 336, eventTimestamp: ts });
+
+        // Simulate a process restart re-delivering the exact same event.
+        const replay = await processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 336, eventTimestamp: ts });
+        assert.strictEqual(replay.skipped, true);
+        assert.strictEqual(replay.reason, "duplicate_or_out_of_order_event");
+
+        const persisted = await GridSimulatorSession.findOne({ _id: session._id });
+        assert.strictEqual(persisted.state.holdings, 100); // unchanged, not 200
+
+        const ledgerRows = await listTrades({ GridSimulatorTrade, sessionId: session._id, page: 1, limit: 10 });
+        assert.strictEqual(ledgerRows.total, 1); // no duplicate ledger row
+    });
+
+        await test("concurrency: two simultaneous ticks against the same session resolve to exactly one winner", async () => {
+        const { GridSimulatorSession, GridSimulatorTrade, session } = await makeActiveSession();
+        const [a, b] = await Promise.all([
+            processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 336, eventTimestamp: new Date(2026, 0, 1, 9, 15, 0).toISOString() }),
+            processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 330, eventTimestamp: new Date(2026, 0, 1, 9, 15, 1).toISOString() }),
+        ]);
+        const results = [a, b];
+        const winners = results.filter((r) => !r.skipped);
+        const losers = results.filter((r) => r.skipped && r.reason === "locked-or-inactive");
+        assert.strictEqual(winners.length, 1);
+        assert.strictEqual(losers.length, 1);
+    });
+
+    console.log(`\nGrid simulator service tests: ${passed} passed, ${failed} failed`);
+    process.exit(failed ? 1 : 0);
+})();
