@@ -453,7 +453,15 @@ async function fetchHistoricalRangeMaybeChunked(instrumentKey, unit, interval, f
     const spanDays = diffDaysInclusive(fromDate, toDate);
 
     if (spanDays <= maxWindowDays) {
-        const clampedFromDate = clampToIntradayRetention(fromDate);
+        // The 2022-01-01 floor is an INTRADAY-only retention limit (see this
+        // file's top-of-file comment) — applying it to "days"/"weeks"/
+        // "months" unit requests would incorrectly clamp a genuinely
+        // available multi-year daily history. Every existing caller of this
+        // function only ever passes "minutes"/"hours" (grep-verified), so
+        // this guard is a no-op for them and only matters for a new
+        // "days"-unit caller (the Grid Backtest's historical range fetch).
+        const isIntraday = unit === "minutes" || unit === "hours";
+        const clampedFromDate = isIntraday ? clampToIntradayRetention(fromDate) : fromDate;
         const retentionClamped = clampedFromDate !== fromDate;
         if (clampedFromDate > toDate) {
             return { candles: [], incomplete: false, failedRanges: [], retentionClamped: true, retentionFrom: INTRADAY_RETENTION_START };
@@ -750,6 +758,11 @@ module.exports = {
     // ~365 days instead of being capped at a single request's window).
     getCandlesWithQuality,
     fetchHistoricalCandlesWithQuality,
+    // Exposed for the Grid Backtest (ADR-025): the only existing function
+    // that takes an EXPLICIT arbitrary fromDate/toDate (not relative to
+    // "today") AND returns quality metadata — reused directly rather than
+    // duplicating chunking/cache/retry/quality-disclosure logic.
+    fetchHistoricalRangeMaybeChunked,
     splitDateRangeIntoChunks,
     getMaxWindowDaysFor,
     clampToIntradayRetention,

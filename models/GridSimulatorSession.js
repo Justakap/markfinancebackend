@@ -31,13 +31,23 @@ const gridSimulatorSessionSchema = new mongoose.Schema(
         status: { type: String, enum: ["CREATED", "ACTIVE", "PAUSED", "STOPPED"], default: "CREATED", index: true },
 
         config: {
+            // Immutable anchor R — captured from a fresh, validated live
+            // quote at session-creation time (see gridSimulatorRoutes.js's
+            // captureFreshReference()), never a user-typed value, and never
+            // changed again regardless of pause/resume/restart.
             referencePrice: { type: Number, required: true },
+            referenceCapturedAt: { type: Date, required: true },
             gridInterval: { type: Number, required: true },
             quantityPerLevel: { type: Number, required: true },
             startingCapital: { type: Number, required: true },
             maxPositionSize: { type: Number, default: null },
             commissionPct: { type: Number, default: 0 },
             slippagePct: { type: Number, default: 0 },
+            // Optional pre-existing inventory at creation — startingAvgCost
+            // is required (validated at the engine layer) only when
+            // startingHoldings > 0.
+            startingHoldings: { type: Number, default: 0 },
+            startingAvgCost: { type: Number, default: 0 },
         },
 
         state: {

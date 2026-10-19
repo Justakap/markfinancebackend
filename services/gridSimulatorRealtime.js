@@ -3,16 +3,25 @@
  * price processing. Replaces the old dedicated 5-second poll loop
  * (services/gridSimulatorFeed.js, removed) with a direct subscription to
  * marketDataService's tick events, so an ACTIVE session's grid is
- * evaluated the moment a genuine Upstox WebSocket tick (or, honestly
- * labeled, a REST-fallback price while the socket is down) arrives for
- * its instrument — not on a fixed timer, and not dependent on any
- * browser tab being open.
+ * evaluated the moment a genuine Upstox WebSocket tick arrives for its
+ * instrument — not on a fixed timer, and not dependent on any browser tab
+ * being open.
  *
- * Architecture (ADR-022, .claude/state/DECISIONS.md):
+ * ADR-023: ONLY a genuine WebSocket tick (tickEmitter "tick") may trigger
+ * an authoritative fill. A REST-fallback price (tickEmitter "fallbackTick",
+ * only ever emitted while the socket is down) is honestly surfaced as
+ * LIVE_REST_FALLBACK display/feed-health status and NOTHING ELSE — it
+ * never calls processTick(), never advances the crossing watermark, never
+ * creates a trade. See processSessionTick()'s doc comment below.
+ *
+ * Architecture (ADR-022/ADR-023, .claude/state/DECISIONS.md):
  *   Upstox WS → marketDataService.handleTick() → tickEmitter "tick"
  *     → gridSimulatorRealtime (this file) → gridSimulatorService.processTick()
  *     → persisted session state + trade ledger → Socket.IO room
  *       "grid-session:<sessionId>" → frontend
+ *   Upstox WS down → marketDataService REST fallback → tickEmitter
+ *     "fallbackTick" → gridSimulatorRealtime → display-only feed-status
+ *     update (LIVE_REST_FALLBACK) → Socket.IO room → frontend (no trade)
  *
  * Subscription safety: registers/unregisters each ACTIVE session's
  * instrument via marketDataService.pinInstrument()/unpinInstrument() —
@@ -94,10 +103,32 @@ function buildUpdatePayload(sessionDoc, result, source) {
     };
 }
 
+/**
+ * Only a genuine WebSocket tick (source "ws") may trigger an authoritative
+ * fill — a REST-fallback price (source "rest", only ever emitted while the
+ * WS socket is down) NEVER calls processTick(): it updates only the
+ * session's display/feed-health fields (lastFeedStatus=LIVE_REST_FALLBACK,
+ * lastFeedPrice) and pushes those to the frontend, with zero effect on the
+ * crossing watermark, cash, holdings, or the trade ledger. This is a hard
+ * rule, not a tunable default — see ADR-023.
+ */
 async function processSessionTick(sessionId, { price, timestamp, source }) {
     const { GridSimulatorSession, GridSimulatorTrade, io } = deps;
-    const eventTimestamp = new Date(timestamp).toISOString();
 
+    if (source !== "ws") {
+        const updated = await GridSimulatorSession.findOneAndUpdate(
+            { _id: sessionId, status: "ACTIVE" },
+            { $set: { lastFeedCheckAt: new Date(), lastFeedStatus: "LIVE_REST_FALLBACK", lastFeedPrice: price } },
+            { new: true },
+        );
+        if (!updated) return; // paused/stopped/deleted — nothing to display-update
+        if (io) {
+            io.to(`grid-session:${sessionId}`).emit("gridSimulatorUpdate", buildUpdatePayload(updated, { trades: [], state: updated.state }, source));
+        }
+        return;
+    }
+
+    const eventTimestamp = new Date(timestamp).toISOString();
     const result = await processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId, price, eventTimestamp });
 
     // Not ACTIVE (paused/stopped since registration) or lost a lock race —
@@ -105,10 +136,9 @@ async function processSessionTick(sessionId, { price, timestamp, source }) {
     // next pause/stop transition, this is just a stale in-flight tick.
     if (result.skipped && result.reason === "locked-or-inactive") return;
 
-    const feedStatus = source === "ws" ? "LIVE" : "LIVE_REST_FALLBACK";
     const updated = await GridSimulatorSession.findOneAndUpdate(
         { _id: sessionId },
-        { $set: { lastFeedCheckAt: new Date(), lastFeedStatus: feedStatus, lastFeedPrice: price } },
+        { $set: { lastFeedCheckAt: new Date(), lastFeedStatus: "LIVE", lastFeedPrice: price } },
         { new: true },
     );
     if (!updated) return; // session was deleted/not found — nothing left to push

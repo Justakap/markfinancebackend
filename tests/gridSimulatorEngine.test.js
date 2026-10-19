@@ -360,5 +360,98 @@ test("computePortfolioMetrics never fabricates equity when there is no current p
     assert.strictEqual(metrics.marketValue, null);
 });
 
+// --- Dynamic-reference strategy: starting inventory + exact task-spec oscillations ---
+
+test("validateGridConfig requires startingAvgCost only when startingHoldings > 0", () => {
+    assert.strictEqual(validateGridConfig({ ...BASE_CONFIG, startingHoldings: 200 }).valid, false);
+    assert.strictEqual(validateGridConfig({ ...BASE_CONFIG, startingHoldings: 200, startingAvgCost: 315 }).valid, true);
+    assert.strictEqual(validateGridConfig({ ...BASE_CONFIG, startingHoldings: 0 }).valid, true); // no avgCost needed
+    assert.strictEqual(validateGridConfig(BASE_CONFIG).valid, true); // startingHoldings omitted entirely
+});
+
+test("createInitialGridState seeds holdings/avgCost from starting inventory, and the crossing watermark from the captured reference", () => {
+    const state = createInitialGridState({ ...BASE_CONFIG, startingHoldings: 200, startingAvgCost: 315, referenceCapturedAt: "2026-01-01T09:00:00.000Z" });
+    assert.strictEqual(state.holdings, 200);
+    assert.strictEqual(state.avgCost, 315);
+    assert.strictEqual(state.lastPrice, BASE_CONFIG.referencePrice);
+    assert.strictEqual(state.lastEventTimestamp, "2026-01-01T09:00:00.000Z");
+});
+
+test("createInitialGridState with zero starting holdings matches the original flat-start behavior exactly", () => {
+    const state = createInitialGridState(BASE_CONFIG);
+    assert.strictEqual(state.holdings, 0);
+    assert.strictEqual(state.avgCost, 0);
+});
+
+test("exact oscillation 320 -> 317 -> 314 -> 317 -> 320 (R=320, G=3): two buys, correct re-arming, no spurious trades on reversal", () => {
+    const config = { ...BASE_CONFIG, referencePrice: 320, gridInterval: 3, startingCapital: 1000000 };
+    let state = createInitialGridState(config);
+    const t = (n) => new Date(2026, 0, 1, 9, n).toISOString();
+
+    const r1 = processPriceUpdate({ config, state, price: 317, eventTimestamp: t(1) }); // buy @317
+    assert.strictEqual(r1.trades.length, 1);
+    assert.strictEqual(r1.trades[0].type, "BUY");
+    assert.strictEqual(r1.trades[0].levelPrice, 317);
+    state = r1.state;
+
+    const r2 = processPriceUpdate({ config, state, price: 314, eventTimestamp: t(2) }); // buy @314
+    assert.strictEqual(r2.trades.length, 1);
+    assert.strictEqual(r2.trades[0].levelPrice, 314);
+    state = r2.state;
+
+    const r3 = processPriceUpdate({ config, state, price: 317, eventTimestamp: t(3) }); // reversal up — re-arm only
+    assert.strictEqual(r3.trades.length, 0);
+    state = r3.state;
+
+    const r4 = processPriceUpdate({ config, state, price: 320, eventTimestamp: t(4) }); // back to R — re-arm only
+    assert.strictEqual(r4.trades.length, 0);
+    state = r4.state;
+
+    assert.strictEqual(state.holdings, 200);
+    assert.strictEqual(state.cash, 1000000 - 100 * 317 - 100 * 314);
+});
+
+test("exact oscillation 320 -> 323 -> 326 -> 323 (R=320, G=3) with zero starting holdings: both sells skip, no negative holdings, no spurious trades on reversal", () => {
+    const config = { ...BASE_CONFIG, referencePrice: 320, gridInterval: 3, startingCapital: 1000000 };
+    let state = createInitialGridState(config); // holdings = 0
+    const t = (n) => new Date(2026, 0, 1, 10, n).toISOString();
+
+    const r1 = processPriceUpdate({ config, state, price: 323, eventTimestamp: t(1) });
+    assert.strictEqual(r1.trades.length, 1);
+    assert.strictEqual(r1.trades[0].type, "SELL");
+    assert.strictEqual(r1.trades[0].qtyFilled, 0);
+    assert.strictEqual(r1.trades[0].reason, "insufficient_holdings");
+    state = r1.state;
+
+    const r2 = processPriceUpdate({ config, state, price: 326, eventTimestamp: t(2) });
+    assert.strictEqual(r2.trades.length, 1);
+    assert.strictEqual(r2.trades[0].qtyFilled, 0);
+    state = r2.state;
+
+    const r3 = processPriceUpdate({ config, state, price: 323, eventTimestamp: t(3) }); // reversal down — re-arm only
+    assert.strictEqual(r3.trades.length, 0);
+    state = r3.state;
+
+    assert.strictEqual(state.holdings, 0);
+    assert.ok(state.holdings >= 0);
+});
+
+test("multi-level gap 320 -> 330 (R=320, G=3): sells at 323/326/329 each fill at the ACTUAL 330 event price, theoretical level recorded separately, processed lowest-to-highest", () => {
+    const config = { ...BASE_CONFIG, referencePrice: 320, gridInterval: 3, startingCapital: 0 };
+    const state = { ...createInitialGridState(config), holdings: 300, avgCost: 310, cash: 0 };
+    const result = processPriceUpdate({ config, state, price: 330, eventTimestamp: new Date(2026, 0, 1, 11, 0).toISOString() });
+
+    assert.strictEqual(result.trades.length, 3);
+    const expectedLevels = [323, 326, 329]; // lowest to highest for an upward gap
+    result.trades.forEach((trade, i) => {
+        assert.strictEqual(trade.type, "SELL");
+        assert.strictEqual(trade.levelPrice, expectedLevels[i], "theoretical grid level, in ascending order");
+        assert.strictEqual(trade.fillPrice, 330, "every fill uses the actual observed event price, never the skipped theoretical level");
+        assert.strictEqual(trade.qtyFilled, 100);
+    });
+    assert.strictEqual(result.state.holdings, 0);
+    assert.strictEqual(result.gapFill, true);
+});
+
 console.log(`\nGrid simulator engine tests: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

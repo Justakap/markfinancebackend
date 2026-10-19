@@ -98,6 +98,7 @@ axios.get = (url, config) => {
 
 const {
     getCandlesWithQuality,
+    fetchHistoricalRangeMaybeChunked,
     splitDateRangeIntoChunks,
     getMaxWindowDaysFor,
     clampToIntradayRetention,
@@ -245,6 +246,19 @@ async function test(name, fn) {
         );
         assert.strictEqual(dataQuality.incomplete, false);
         assert.strictEqual(dataQuality.retentionClamped, false);
+    });
+
+    await test("Grid Backtest fix: a 'days'-unit explicit range before 2022-01-01 is NOT retention-clamped (that floor is intraday-only)", async () => {
+        resetCounters();
+        const result = await fetchHistoricalRangeMaybeChunked(TEST_KEY, "days", "1", "2015-01-01", "2015-01-10", 500);
+        assert.strictEqual(result.retentionClamped, false, "daily candles have no 2022 retention floor");
+        assert.ok(result.candles.length > 0, "the full pre-2022 range should actually be fetched, not silently clamped away");
+    });
+
+    await test("'minutes'/'hours' units are still correctly retention-clamped (no regression from the days-unit fix)", async () => {
+        resetCounters();
+        const result = await fetchHistoricalRangeMaybeChunked(TEST_KEY, "minutes", "5", "2020-01-01", "2020-01-10", 500);
+        assert.strictEqual(result.retentionClamped, true);
     });
 
     console.log(`\n${passed} passed, ${failed} failed`);

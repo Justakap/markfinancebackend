@@ -342,6 +342,75 @@ function makeFakeIo() {
         realtime.unregisterSession(session._id);
     });
 
+    await test("17. resyncFromDb() rebuilds the registry from every currently-ACTIVE session after a (simulated) restart, without duplicating trades", async () => {
+        const activeA = makeActiveSessionDoc({ instrumentKey: "NSE_EQ|RESYNC_A" });
+        const activeB = makeActiveSessionDoc({ instrumentKey: "NSE_EQ|RESYNC_B" });
+        const paused = makeActiveSessionDoc({ instrumentKey: "NSE_EQ|RESYNC_C", status: "PAUSED" });
+        const GridSimulatorSession = makeFakeSessionModel([activeA, activeB, paused]);
+        const GridSimulatorTrade = makeFakeTradeModel();
+        realtime.init({ GridSimulatorSession, GridSimulatorTrade, io: makeFakeIo() });
+
+        // Simulate a fresh process: nothing registered yet.
+        const resyncedCount = await realtime.resyncFromDb({ GridSimulatorSession });
+        assert.strictEqual(resyncedCount, 2, "only ACTIVE sessions are resynced, not paused ones");
+        assert.ok(realtime.sessionsByInstrument.has("NSE_EQ|RESYNC_A"));
+        assert.ok(realtime.sessionsByInstrument.has("NSE_EQ|RESYNC_B"));
+        assert.ok(!realtime.sessionsByInstrument.has("NSE_EQ|RESYNC_C"), "a paused session must not be resynced into live processing");
+
+        // A genuine tick for a resynced instrument now processes correctly, exactly once.
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|RESYNC_A", ltp: 336, timestamp: Date.now() }, "ws");
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        const persisted = GridSimulatorSession.docs.get(String(activeA._id));
+        assert.strictEqual(persisted.state.holdings, 100);
+        assert.strictEqual(GridSimulatorTrade.docs.length, 1);
+
+        realtime.unregisterSession(activeA._id);
+        realtime.unregisterSession(activeB._id);
+    });
+
+    await test('18a. a genuine WS tick executes a trade; a REST fallbackTick for the same crossing never does (ADR-023)', async () => {
+        const session = makeActiveSessionDoc();
+        const GridSimulatorSession = makeFakeSessionModel([session]);
+        const GridSimulatorTrade = makeFakeTradeModel();
+        realtime.init({ GridSimulatorSession, GridSimulatorTrade, io: makeFakeIo() });
+        realtime.registerSession(session);
+
+        // A REST-fallback price that WOULD cross a level if it were authoritative.
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 336, timestamp: Date.now() }, "rest");
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        let persisted = GridSimulatorSession.docs.get(String(session._id));
+        assert.strictEqual(persisted.state.holdings, 0, "a REST fallback tick must never execute a trade");
+        assert.strictEqual(persisted.state.lastPrice, null, "the crossing watermark must be untouched by a REST fallback tick");
+        assert.strictEqual(persisted.lastFeedStatus, "LIVE_REST_FALLBACK");
+        assert.strictEqual(GridSimulatorTrade.docs.length, 0);
+
+        // The SAME price, now as a genuine WS tick, must execute for real.
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 336, timestamp: Date.now() }, "ws");
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        persisted = GridSimulatorSession.docs.get(String(session._id));
+        assert.strictEqual(persisted.state.holdings, 100);
+        assert.strictEqual(persisted.lastFeedStatus, "LIVE");
+        assert.strictEqual(GridSimulatorTrade.docs.length, 1);
+        realtime.unregisterSession(session._id);
+    });
+
+    await test("18b. a REST fallbackTick never updates a session that isn't ACTIVE (no stray feed-status writes)", async () => {
+        const session = makeActiveSessionDoc({ status: "PAUSED" });
+        const GridSimulatorSession = makeFakeSessionModel([session]);
+        const GridSimulatorTrade = makeFakeTradeModel();
+        realtime.init({ GridSimulatorSession, GridSimulatorTrade, io: makeFakeIo() });
+        realtime.registerSession(session);
+
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 336, timestamp: Date.now() }, "rest");
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        const persisted = GridSimulatorSession.docs.get(String(session._id));
+        assert.strictEqual(persisted.lastFeedStatus, "UNKNOWN", "a paused session's feed status should not be touched by fallback ticks");
+        realtime.unregisterSession(session._id);
+    });
+
     await test("14. the simulator no longer depends on a 5-second polling loop (no such module/export exists)", () => {
         assert.throws(() => require("../services/gridSimulatorFeed"), /Cannot find module/);
         assert.strictEqual(typeof realtime.registerSession, "function");

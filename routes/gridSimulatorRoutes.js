@@ -1,5 +1,28 @@
 const express = require("express");
 
+// "Sufficiently fresh" for the initial anchor quote — reject creation
+// rather than silently use a stale/cached price. Deliberately the same
+// order of magnitude as the realtime module's own staleness threshold
+// (services/gridSimulatorRealtime.js) for consistency, not coupled to it.
+const QUOTE_FRESHNESS_MS = Number(process.env.GRID_SIMULATOR_QUOTE_FRESHNESS_MS || 15_000);
+
+/**
+ * Captures the immutable initial reference (R) from a fresh, validated
+ * live quote — never a user-typed value. Actively warms the quote first
+ * (the instrument may not be subscribed/pinned by anything yet for a
+ * brand-new session), then requires a genuinely recent timestamp. Returns
+ * null (never throws) when no sufficiently fresh quote is available —
+ * the caller rejects session creation rather than silently falling back
+ * to a stale cached price.
+ */
+async function captureFreshReference(marketDataService, instrumentKey) {
+    await marketDataService.warmLiveQuotes([instrumentKey]).catch(() => {});
+    const live = marketDataService.liveData.get(instrumentKey);
+    if (!live || !Number.isFinite(Number(live.ltp)) || Number(live.ltp) <= 0) return null;
+    if (!live.timestamp || Date.now() - Number(live.timestamp) > QUOTE_FRESHNESS_MS) return null;
+    return { price: Number(live.ltp), capturedAt: new Date(live.timestamp) };
+}
+
 /**
  * Grid Trading Simulator — PAPER TRADING ONLY. Authenticated API for
  * configuring, running, and inspecting a simulated grid-trading session.
@@ -82,6 +105,7 @@ function createGridSimulatorRoutes({
     requireAuth,
     validateObjectId,
     resolveInstrumentKey,
+    marketDataService,
     createSession,
     getOwnedSession,
     startSession,
@@ -110,17 +134,23 @@ function createGridSimulatorRoutes({
             const {
                 symbol,
                 instrumentKey: bodyInstrumentKey,
-                referencePrice,
                 gridInterval,
                 quantityPerLevel,
                 startingCapital,
                 maxPositionSize,
                 commissionPct,
                 slippagePct,
+                startingHoldings,
+                startingAvgCost,
             } = req.body;
 
             if (!symbol && !bodyInstrumentKey) {
                 return res.status(400).json({ message: "symbol or instrumentKey is required" });
+            }
+
+            const holdings = startingHoldings != null ? Number(startingHoldings) : 0;
+            if (holdings > 0 && !(Number.isFinite(Number(startingAvgCost)) && Number(startingAvgCost) > 0)) {
+                return res.status(400).json({ message: "startingAvgCost is required and must be a positive number when startingHoldings > 0" });
             }
 
             const instrumentKey = await resolveInstrumentKey(symbol, bodyInstrumentKey);
@@ -130,19 +160,33 @@ function createGridSimulatorRoutes({
                 });
             }
 
+            // The initial reference is ALWAYS a fresh, server-captured live
+            // quote — any client-supplied reference price is ignored.
+            // Reject creation outright rather than silently fall back to a
+            // stale/cached price.
+            const freshQuote = await captureFreshReference(marketDataService, instrumentKey);
+            if (!freshQuote) {
+                return res.status(400).json({
+                    message: "No sufficiently fresh market quote is available for this instrument right now. Try again in a moment.",
+                });
+            }
+
             const session = await createSession({
                 GridSimulatorSession,
                 userId: req.user.mongoId,
                 instrumentKey,
                 symbol: symbol || bodyInstrumentKey,
                 config: {
-                    referencePrice: Number(referencePrice),
+                    referencePrice: freshQuote.price,
+                    referenceCapturedAt: freshQuote.capturedAt,
                     gridInterval: Number(gridInterval),
                     quantityPerLevel: Number(quantityPerLevel),
                     startingCapital: Number(startingCapital),
                     maxPositionSize: maxPositionSize != null ? Number(maxPositionSize) : null,
                     commissionPct: commissionPct != null ? Number(commissionPct) : 0,
                     slippagePct: slippagePct != null ? Number(slippagePct) : 0,
+                    startingHoldings: holdings,
+                    startingAvgCost: holdings > 0 ? Number(startingAvgCost) : 0,
                 },
             });
 

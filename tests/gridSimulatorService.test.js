@@ -37,6 +37,7 @@ async function test(name, fn) {
 
 const CONFIG = {
     referencePrice: 340,
+    referenceCapturedAt: new Date(2026, 0, 1, 9, 0), // strictly before this file's various first-tick timestamps (9:15+)
     gridInterval: 3,
     quantityPerLevel: 100,
     startingCapital: 1000000,
@@ -260,7 +261,7 @@ async function makeActiveSession(userId = new mongoose.Types.ObjectId()) {
 
     await test("a repeated identical/stale tick never duplicates a fill (idempotent restart recovery)", async () => {
         const { GridSimulatorSession, GridSimulatorTrade, session } = await makeActiveSession();
-        const ts = new Date(2026, 0, 1, 9, 15).toISOString();
+        const ts = new Date(2026, 0, 1, 9, 16).toISOString(); // strictly after CONFIG.referenceCapturedAt (9:15)
         await processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 336, eventTimestamp: ts });
 
         // Simulate a process restart re-delivering the exact same event.
@@ -278,14 +279,86 @@ async function makeActiveSession(userId = new mongoose.Types.ObjectId()) {
         await test("concurrency: two simultaneous ticks against the same session resolve to exactly one winner", async () => {
         const { GridSimulatorSession, GridSimulatorTrade, session } = await makeActiveSession();
         const [a, b] = await Promise.all([
-            processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 336, eventTimestamp: new Date(2026, 0, 1, 9, 15, 0).toISOString() }),
-            processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 330, eventTimestamp: new Date(2026, 0, 1, 9, 15, 1).toISOString() }),
+            processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 336, eventTimestamp: new Date(2026, 0, 1, 9, 16, 0).toISOString() }),
+            processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 330, eventTimestamp: new Date(2026, 0, 1, 9, 16, 1).toISOString() }),
         ]);
         const results = [a, b];
         const winners = results.filter((r) => !r.skipped);
         const losers = results.filter((r) => r.skipped && r.reason === "locked-or-inactive");
         assert.strictEqual(winners.length, 1);
         assert.strictEqual(losers.length, 1);
+    });
+
+    await test("createSession with starting inventory persists the user-provided cost basis and holdings", async () => {
+        const GridSimulatorSession = makeFakeSessionModel();
+        const userId = new mongoose.Types.ObjectId();
+        const session = await createSession({
+            GridSimulatorSession,
+            userId,
+            instrumentKey: "NSE_EQ|INV",
+            symbol: "INV",
+            config: { ...CONFIG, startingHoldings: 200, startingAvgCost: 315 },
+        });
+        assert.strictEqual(session.state.holdings, 200);
+        assert.strictEqual(session.state.avgCost, 315);
+        assert.strictEqual(session.config.startingHoldings, 200);
+        assert.strictEqual(session.config.startingAvgCost, 315);
+    });
+
+    await test("createSession with zero starting holdings never requires or fabricates an average cost", async () => {
+        const GridSimulatorSession = makeFakeSessionModel();
+        const userId = new mongoose.Types.ObjectId();
+        const session = await createSession({
+            GridSimulatorSession,
+            userId,
+            instrumentKey: "NSE_EQ|FLAT",
+            symbol: "FLAT",
+            config: CONFIG,
+        });
+        assert.strictEqual(session.state.holdings, 0);
+        assert.strictEqual(session.state.avgCost, 0);
+    });
+
+    await test("the crossing watermark is seeded from the captured reference quote at creation, not left null", async () => {
+        const GridSimulatorSession = makeFakeSessionModel();
+        const userId = new mongoose.Types.ObjectId();
+        const session = await createSession({
+            GridSimulatorSession,
+            userId,
+            instrumentKey: "NSE_EQ|WM",
+            symbol: "WM",
+            config: CONFIG,
+        });
+        assert.strictEqual(session.state.lastPrice, CONFIG.referencePrice);
+        assert.strictEqual(new Date(session.state.lastEventTimestamp).getTime(), new Date(CONFIG.referenceCapturedAt).getTime());
+    });
+
+    await test("createSession rejects a config missing referenceCapturedAt — the reference must come from a captured live quote", async () => {
+        const GridSimulatorSession = makeFakeSessionModel();
+        await assert.rejects(
+            () => createSession({ GridSimulatorSession, userId: new mongoose.Types.ObjectId(), instrumentKey: "X", symbol: "X", config: { ...CONFIG, referenceCapturedAt: undefined } }),
+            (err) => err.statusCode === 400,
+        );
+    });
+
+    await test("starting inventory establishes a correct realized-P&L baseline on a later sell (200 @ avg 315, sell 100 @ 320)", async () => {
+        const GridSimulatorSession = makeFakeSessionModel();
+        const GridSimulatorTrade = makeFakeTradeModel();
+        const userId = new mongoose.Types.ObjectId();
+        // referencePrice=340, interval=3 -> sell level +1 = 343. Use a config
+        // whose first sell level is 320 so a single tick exercises it.
+        const config = { ...CONFIG, referencePrice: 317, startingHoldings: 200, startingAvgCost: 315 };
+        const session = await createSession({ GridSimulatorSession, userId, instrumentKey: "NSE_EQ|INV2", symbol: "INV2", config });
+        await startSession({ GridSimulatorSession, sessionId: session._id, userId });
+
+        const result = await processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 320, eventTimestamp: new Date(2026, 0, 1, 9, 30).toISOString() });
+        assert.strictEqual(result.trades.length, 1);
+        assert.strictEqual(result.trades[0].type, "SELL");
+        assert.strictEqual(result.trades[0].qtyFilled, 100);
+        // Hand calculation: realizedPnL = qty * (fillPrice - avgCost) = 100 * (320 - 315) = 500.
+        assert.strictEqual(result.state.realizedPnL, 500);
+        assert.strictEqual(result.state.holdings, 100);
+        assert.strictEqual(result.state.avgCost, 315, "avg cost is unchanged by a sell");
     });
 
     console.log(`\nGrid simulator service tests: ${passed} passed, ${failed} failed`);

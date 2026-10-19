@@ -234,6 +234,32 @@ consumer; use pin/unpin instead). See ADR-022 in the frontend repo's
 currently only exists in the frontend repo's working tree, not this
 one — read it there for the complete history of this feature).
 
+## Grid Backtest (PAPER TRADING / HISTORICAL SIMULATION ONLY)
+
+Historical replay of the same Grid Trading Simulator strategy over past
+candles — never places a real broker order, and never touches a live
+`GridSimulatorSession` or its subscriptions. Own models
+(`models/GridBacktestResult.js`/`GridBacktestTrade.js`), pure replay
+engine `services/gridBacktestEngine.js` (reuses
+`gridSimulatorEngine.js`'s `createInitialGridState`/`processPriceUpdate`/
+`computePortfolioMetrics`/`roundPrice` directly, unchanged — no second
+implementation of the crossing/accounting math), DB/candle-fetch
+orchestration `services/gridBacktestService.js`,
+`routes/gridBacktestRoutes.js` (`/api/v2/grid-backtest/*`).
+
+Candle retrieval reuses `candleService.js`'s
+`fetchHistoricalRangeMaybeChunked` (now exported) for both the primary
+timeframe and an optional finer-grained fallback — no bespoke fetch
+path. Ambiguous intrabar price paths use a fixed, documented,
+unconditional Open→Low→High→Close decomposition when no finer-grained
+candle data is available (`assumedIntrabar: true` on the resulting
+trades) — never color- or outcome-dependent. The initial reference is
+always the close of the first available historical candle in the
+requested range, never the current live quote. See the frontend repo's
+`.claude/state/DECISIONS.md` ADR-025/ADR-026/ADR-027 for the full design
+writeup (that file currently only exists in the frontend repo's working
+tree, not this one).
+
 ## Important API Rules
 
 Don't rename or change the shape of these without checking the frontend
@@ -272,6 +298,11 @@ Don't rename or change the shape of these without checking the frontend
   `GET /:sessionId/trades` (paginated, `?skippedOnly=true` filter). All
   ownership-scoped via `req.user.mongoId`, same convention as every other
   route in this file.
+- `POST /api/v2/grid-backtest/backtests` (create + run synchronously,
+  returns the completed/failed result), `GET` (list, paginated), `GET
+  /:backtestId` (detail incl. dataQuality/metrics/equitySeries), `GET
+  /:backtestId/trades` (paginated ledger). See the Grid Backtest section
+  above. All ownership-scoped via `req.user.mongoId`.
 
 ## Environment Variables
 
@@ -704,6 +735,69 @@ codebase; the existing `marketTick` global broadcast is unchanged. Full
 design/reasoning in ADR-022 (frontend repo's `.claude/state/DECISIONS.md`
 — see the Grid Trading Simulator section above). 20 new/updated backend
 tests, full suite passing, production build/boot confirmed clean.
+
+### 2026-10-19 (later) — Dynamic-reference grid strategy; fixed REST ticks silently triggering trades
+
+**Uncommitted as of this entry** — this task's explicit instruction was
+not to commit/push/deploy.
+
+Audit fix (ADR-023): `services/gridSimulatorRealtime.js` previously let a
+REST `fallbackTick` drive `processTick()` exactly like a genuine `tick`
+— a real discrepancy against the requirement that only genuine WebSocket
+ticks may trigger authoritative trades. Fixed: REST fallback now only
+updates display/feed-status fields, never executes a trade.
+
+Dynamic-reference strategy (ADR-024): the grid's initial reference is
+now always captured from a fresh, validated live quote at session
+creation (`routes/gridSimulatorRoutes.js`'s `captureFreshReference()`,
+`GRID_SIMULATOR_QUOTE_FRESHNESS_MS` default 15s) — never a user-typed
+value; creation is rejected (400) if no sufficiently fresh quote exists.
+Optional starting inventory (`startingHoldings`/`startingAvgCost`, the
+latter required only when holdings > 0) seeds the initial cash/holdings/
+avgCost state. The pure crossing/accounting engine
+(`services/gridSimulatorEngine.js`) required zero changes — verified by
+replaying the task's own worked examples as exact regression tests. Full
+detail in the frontend repo's `.claude/state/DECISIONS.md` (ADR-023/
+ADR-024). 34 new/updated backend tests, full suite passing. No
+production/shared-database test was run this round (explicit safety
+constraint) — all tests use in-memory fakes.
+
+### 2026-10-19 (later still) — Grid Backtest: historical replay of the dynamic-reference grid strategy
+
+**Uncommitted as of this entry** — explicit instruction not to commit,
+push, or deploy.
+
+New `/api/v2/grid-backtest/*` feature (see the Grid Backtest section
+above for the architecture). Key points not repeated there:
+
+- `candleService.js`'s `fetchHistoricalRangeMaybeChunked` was promoted
+  from internal-only to exported (additive, no signature change) so the
+  backtest service could reuse the same chunked-fetch/cache/retry
+  infrastructure ADR-020 (frontend repo's `DECISIONS.md`) built for
+  long-range candle fetches, instead of writing a second fetch path.
+- **Real bug found and fixed while wiring this up**: the intraday
+  retention clamp (`clampToIntradayRetention`) was being applied
+  unconditionally, regardless of `unit` — a `unit: "days"` request (any
+  multi-year daily backtest) would have been silently truncated to the
+  intraday retention window with no disclosure. Fixed by gating the
+  clamp to `unit === "minutes" || unit === "hours"` only; verified both
+  pre-existing call sites only ever pass `"minutes"`, so this is fully
+  behavior-preserving for them. 2 new regression tests
+  (`tests/chunkedCandleFetch.test.js`).
+- The pure crossing/accounting engine (`services/gridSimulatorEngine.js`)
+  required zero changes to support historical replay — same finding as
+  the dynamic-reference-strategy milestone above, since it was always
+  generic over whatever `referencePrice` a config carries.
+- A backtest run never touches `GridSimulatorSession`, never pins/unpins
+  a live instrument subscription, and never emits to a live Socket.IO
+  room — complete state isolation from the live feature, enforced by
+  using entirely separate models (`GridBacktestResult`/
+  `GridBacktestTrade`) and a from-scratch in-memory engine state per run.
+
+39 new backend tests (13 engine + 17 service + 9 routes), full suite
+passing (`npm test`, exit 0, 0 real failures). No production/shared-
+database test was run this round — all tests use in-memory fakes, same
+pattern as every prior round.
 
 **Update this section whenever a future session makes a major
 architectural or security change — don't let it go stale.**

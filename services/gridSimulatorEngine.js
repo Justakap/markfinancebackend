@@ -102,6 +102,18 @@ function validateGridConfig(config = {}) {
         errors.push("slippagePct must be a non-negative number when provided");
     }
 
+    const startingHoldings = config.startingHoldings ?? 0;
+    if (!Number.isInteger(startingHoldings) || startingHoldings < 0) {
+        errors.push("startingHoldings must be a non-negative integer when provided");
+    } else if (startingHoldings > 0) {
+        // Required precisely when there's an existing inventory to establish
+        // a cost basis for — never required (and never silently fabricated)
+        // when the session starts flat.
+        if (!isFiniteNumber(config.startingAvgCost) || config.startingAvgCost <= 0) {
+            errors.push("startingAvgCost is required and must be a positive number when startingHoldings > 0");
+        }
+    }
+
     return { valid: errors.length === 0, errors };
 }
 
@@ -114,6 +126,8 @@ function normalizeConfig(config) {
         maxPositionSize: config.maxPositionSize ?? null,
         commissionPct: config.commissionPct ?? 0,
         slippagePct: config.slippagePct ?? 0,
+        startingHoldings: Math.max(0, Math.trunc(config.startingHoldings || 0)),
+        startingAvgCost: config.startingHoldings > 0 ? roundPrice(config.startingAvgCost) : 0,
     };
 }
 
@@ -121,15 +135,23 @@ function levelPrice(config, n) {
     return roundPrice(config.referencePrice + n * config.gridInterval);
 }
 
+/**
+ * `config.referenceCapturedAt` (ISO string or Date), when provided, seeds
+ * the initial crossing/dedup watermark directly from the fresh quote
+ * captured at session creation — "at session creation, initialize the
+ * crossing watermark using the initial reference quote," not left to an
+ * implicit null-fallback. `lastPrice` is likewise seeded to the anchor
+ * itself (`referencePrice`) rather than null, matching the same intent.
+ */
 function createInitialGridState(config) {
     const normalized = normalizeConfig(config);
     return {
         cash: normalized.startingCapital,
-        holdings: 0,
-        avgCost: 0,
+        holdings: normalized.startingHoldings,
+        avgCost: normalized.startingAvgCost,
         realizedPnL: 0,
-        lastPrice: null,
-        lastEventTimestamp: null,
+        lastPrice: normalized.referencePrice,
+        lastEventTimestamp: config.referenceCapturedAt ? new Date(config.referenceCapturedAt).toISOString() : null,
         levelArmed: {},
         sequence: 0,
     };
@@ -383,6 +405,43 @@ function processPriceUpdate({ config: rawConfig, state, price, eventTimestamp })
     return { state: newState, trades, skipped: false, gapFill: crossedLevels.length > 1 };
 }
 
+/**
+ * Replays a batch of the engine's already-decided trades (in their
+ * original order) over the pre-update state to recover each trade's own
+ * running cash/holdings/avgCost snapshot for the ledger — using only each
+ * trade's own recorded fields (qtyFilled/effectivePrice/type) plus the
+ * session's commissionPct, the exact same arithmetic applyBuy/applySell
+ * already used internally. This never re-decides anything
+ * (quantities/prices are already final) — it only reconstructs the audit
+ * trail the pure engine's return value doesn't carry per-trade. Shared by
+ * both the live simulator (gridSimulatorService.js) and the historical
+ * replay engine (gridBacktestEngine.js) so the ledger's running-balance
+ * math is never duplicated.
+ */
+function annotateRunningState(trades, startState, commissionPct) {
+    let cash = startState.cash;
+    let holdings = startState.holdings;
+    let avgCost = startState.avgCost;
+
+    return trades.map((trade) => {
+        if (trade.type === "BUY" && trade.qtyFilled > 0) {
+            const unitCost = roundPrice(trade.effectivePrice * (1 + commissionPct / 100));
+            const cost = roundPrice(trade.qtyFilled * unitCost);
+            const newHoldings = holdings + trade.qtyFilled;
+            avgCost = roundPrice((avgCost * holdings + cost) / newHoldings);
+            holdings = newHoldings;
+            cash = roundPrice(cash - cost);
+        } else if (trade.type === "SELL" && trade.qtyFilled > 0) {
+            const unitProceeds = roundPrice(trade.effectivePrice * (1 - commissionPct / 100));
+            const proceeds = roundPrice(trade.qtyFilled * unitProceeds);
+            holdings -= trade.qtyFilled;
+            cash = roundPrice(cash + proceeds);
+            if (holdings === 0) avgCost = 0;
+        }
+        return { ...trade, cashAfter: cash, holdingsAfter: holdings, avgCostAfter: avgCost };
+    });
+}
+
 function computePortfolioMetrics(state, currentPrice) {
     const price = isFiniteNumber(currentPrice) ? roundPrice(currentPrice) : null;
     const unrealizedPnL = price != null && state.holdings > 0 ? roundPrice(state.holdings * (price - state.avgCost)) : 0;
@@ -411,4 +470,5 @@ module.exports = {
     findCrossedLevels,
     processPriceUpdate,
     computePortfolioMetrics,
+    annotateRunningState,
 };

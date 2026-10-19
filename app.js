@@ -17,6 +17,8 @@ const LiveStrategyRuntime = require("./models/LiveStrategyRuntime");
 const LiveStrategySignal = require("./models/LiveStrategySignal");
 const GridSimulatorSession = require("./models/GridSimulatorSession");
 const GridSimulatorTrade = require("./models/GridSimulatorTrade");
+const GridBacktestResult = require("./models/GridBacktestResult");
+const GridBacktestTrade = require("./models/GridBacktestTrade");
 const AlertConfiguration = require("./models/AlertConfiguration");
 const Notification = require("./models/Notification");
 const { requireAuth } = require("./middleware/auth");
@@ -87,6 +89,13 @@ const {
 } = require("./services/alertConfigurationService");
 const { startAlertProcessingPolling, stopAlertProcessingPolling } = require("./services/alertNotificationService");
 const { createGridSimulatorRoutes } = require("./routes/gridSimulatorRoutes");
+const { createGridBacktestRoutes } = require("./routes/gridBacktestRoutes");
+const {
+    runGridBacktest,
+    getOwnedBacktest: getOwnedGridBacktest,
+    listBacktests: listGridBacktests,
+    listBacktestTrades: listGridBacktestTrades,
+} = require("./services/gridBacktestService");
 const {
     createSession: createGridSession,
     getOwnedSession: getOwnedGridSession,
@@ -303,6 +312,7 @@ app.use(
         requireAuth,
         validateObjectId,
         resolveInstrumentKey,
+        marketDataService: upstoxMarketData,
         createSession: createGridSession,
         getOwnedSession: getOwnedGridSession,
         startSession: startGridSession,
@@ -315,6 +325,21 @@ app.use(
         getPortfolioMetrics: getGridPortfolioMetrics,
         registerRealtimeSession: gridSimulatorRealtime.registerSession,
         unregisterRealtimeSession: gridSimulatorRealtime.unregisterSession,
+    }),
+);
+
+app.use(
+    "/api",
+    createGridBacktestRoutes({
+        GridBacktestResult,
+        GridBacktestTrade,
+        requireAuth,
+        validateObjectId,
+        resolveInstrumentKey,
+        runGridBacktest,
+        getOwnedBacktest: getOwnedGridBacktest,
+        listBacktests: listGridBacktests,
+        listBacktestTrades: listGridBacktestTrades,
     }),
 );
 

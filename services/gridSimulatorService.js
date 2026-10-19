@@ -21,6 +21,7 @@ const {
     processPriceUpdate,
     computePortfolioMetrics,
     roundPrice,
+    annotateRunningState,
 } = require("./gridSimulatorEngine");
 
 const LOCK_DURATION_MS = Number(process.env.GRID_SIMULATOR_LOCK_MS || 30_000);
@@ -33,7 +34,19 @@ function makeError(statusCode, message) {
     return error;
 }
 
+/**
+ * `config.referencePrice`/`config.referenceCapturedAt` must already be the
+ * result of a verified-fresh live quote by the time this is called — the
+ * actual fetch + staleness check lives in gridSimulatorRoutes.js's
+ * captureFreshReference() (it needs marketDataService, which this
+ * DB-only/pure-math service deliberately doesn't depend on). This function
+ * only requires that provenance be present, never re-derives or guesses it.
+ */
 async function createSession({ GridSimulatorSession, userId, instrumentKey, symbol, config }) {
+    if (!config.referenceCapturedAt) {
+        throw makeError(400, "referenceCapturedAt (a captured live-quote timestamp) is required — the initial reference must come from a fresh market quote, never a user-typed value");
+    }
+
     const validation = validateGridConfig(config);
     if (!validation.valid) {
         throw makeError(400, `Invalid grid configuration: ${validation.errors.join("; ")}`);
@@ -58,12 +71,15 @@ async function createSession({ GridSimulatorSession, userId, instrumentKey, symb
             status: "CREATED",
             config: {
                 referencePrice: config.referencePrice,
+                referenceCapturedAt: config.referenceCapturedAt,
                 gridInterval: config.gridInterval,
                 quantityPerLevel: config.quantityPerLevel,
                 startingCapital: config.startingCapital,
                 maxPositionSize: config.maxPositionSize ?? null,
                 commissionPct: config.commissionPct ?? 0,
                 slippagePct: config.slippagePct ?? 0,
+                startingHoldings: config.startingHoldings ?? 0,
+                startingAvgCost: config.startingHoldings > 0 ? config.startingAvgCost : 0,
             },
             state: initialState,
         });
@@ -143,40 +159,6 @@ function stateToDocFields(state) {
         "state.levelArmed": state.levelArmed,
         "state.sequence": state.sequence,
     };
-}
-
-/**
- * Replays the engine's already-decided trades (in their original order)
- * over the pre-update state to recover each trade's own running
- * cash/holdings/avgCost snapshot for the ledger — using only each trade's
- * own recorded fields (qtyFilled/effectivePrice/type) plus the session's
- * commissionPct, the exact same arithmetic gridSimulatorEngine.js's
- * applyBuy/applySell already used internally. This never re-decides
- * anything (quantities/prices are already final) — it only reconstructs
- * the audit trail the pure engine's return value doesn't carry per-trade.
- */
-function annotateRunningState(trades, startState, commissionPct) {
-    let cash = startState.cash;
-    let holdings = startState.holdings;
-    let avgCost = startState.avgCost;
-
-    return trades.map((trade) => {
-        if (trade.type === "BUY" && trade.qtyFilled > 0) {
-            const unitCost = roundPrice(trade.effectivePrice * (1 + commissionPct / 100));
-            const cost = roundPrice(trade.qtyFilled * unitCost);
-            const newHoldings = holdings + trade.qtyFilled;
-            avgCost = roundPrice((avgCost * holdings + cost) / newHoldings);
-            holdings = newHoldings;
-            cash = roundPrice(cash - cost);
-        } else if (trade.type === "SELL" && trade.qtyFilled > 0) {
-            const unitProceeds = roundPrice(trade.effectivePrice * (1 - commissionPct / 100));
-            const proceeds = roundPrice(trade.qtyFilled * unitProceeds);
-            holdings -= trade.qtyFilled;
-            cash = roundPrice(cash + proceeds);
-            if (holdings === 0) avgCost = 0;
-        }
-        return { ...trade, cashAfter: cash, holdingsAfter: holdings, avgCostAfter: avgCost };
-    });
 }
 
 function tradeToDoc({ trade, session, sequence, eventTimestamp, gapFill }) {
