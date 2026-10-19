@@ -815,5 +815,50 @@ test("ADR-034: sellVariance omitted (null) mirrors gridInterval exactly — iden
     assert.deepStrictEqual(stateA, stateB);
 });
 
+test("validateGridConfig rejects a non-positive sellQuantityPerLevel but accepts a positive integer", () => {
+    const base = { referencePrice: 100, gridInterval: 3, quantityPerLevel: 10, startingCapital: 1000 };
+    assert.strictEqual(validateGridConfig({ ...base, sellQuantityPerLevel: -1 }).valid, false);
+    assert.strictEqual(validateGridConfig({ ...base, sellQuantityPerLevel: 1.5 }).valid, false);
+    assert.strictEqual(validateGridConfig({ ...base, sellQuantityPerLevel: 4 }).valid, true);
+    assert.strictEqual(validateGridConfig(base).valid, true); // omitted entirely is fine (mirrors quantityPerLevel)
+});
+
+test("ADR-035: asymmetric buy/sell quantity — BUY fills use quantityPerLevel, SELL fills use sellQuantityPerLevel", () => {
+    const config = { referencePrice: 100, gridInterval: 3, quantityPerLevel: 10, sellQuantityPerLevel: 4, startingCapital: 1000000, commissionPct: 0, slippagePct: 0 };
+    let state = createInitialGridState(config);
+    let t = Date.parse("2026-01-01T09:00:00.000Z");
+
+    let r = processPriceUpdate({ config, state, price: 97, eventTimestamp: new Date(t += 1000).toISOString() }); // down-cross -> BUY
+    assert.strictEqual(r.trades[0].type, "BUY");
+    assert.strictEqual(r.trades[0].qtyFilled, 10);
+    state = r.state;
+    assert.strictEqual(state.holdings, 10);
+
+    r = processPriceUpdate({ config, state, price: 100, eventTimestamp: new Date(t += 1000).toISOString() }); // up-cross -> SELL
+    assert.strictEqual(r.trades[0].type, "SELL");
+    assert.strictEqual(r.trades[0].qtyFilled, 4);
+    state = r.state;
+    assert.strictEqual(state.holdings, 6);
+});
+
+test("ADR-035: sellQuantityPerLevel omitted (null) mirrors quantityPerLevel exactly — identical to the pre-ADR-035 symmetric behavior", () => {
+    const symmetricConfig = { referencePrice: 100, gridInterval: 3, quantityPerLevel: 10, startingCapital: 1000000, commissionPct: 0, slippagePct: 0 };
+    const mirroredConfig = { ...symmetricConfig, sellQuantityPerLevel: null };
+    let stateA = createInitialGridState(symmetricConfig);
+    let stateB = createInitialGridState(mirroredConfig);
+    let t = Date.parse("2026-01-01T09:00:00.000Z");
+
+    [97, 100, 103, 100].forEach((price) => {
+        t += 1000;
+        const eventTimestamp = new Date(t).toISOString();
+        const rA = processPriceUpdate({ config: symmetricConfig, state: stateA, price, eventTimestamp });
+        const rB = processPriceUpdate({ config: mirroredConfig, state: stateB, price, eventTimestamp });
+        assert.deepStrictEqual(rA.trades, rB.trades);
+        stateA = rA.state;
+        stateB = rB.state;
+    });
+    assert.deepStrictEqual(stateA, stateB);
+});
+
 console.log(`\nGrid simulator engine tests: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

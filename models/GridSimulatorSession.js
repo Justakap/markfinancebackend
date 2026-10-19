@@ -44,6 +44,11 @@ const gridSimulatorSessionSchema = new mongoose.Schema(
             // different sell variance.
             sellVariance: { type: Number, default: null },
             quantityPerLevel: { type: Number, required: true },
+            // ADR-035: optional asymmetric sell-side quantity. null means
+            // SELL fills mirror quantityPerLevel (the original symmetric
+            // behavior) — only set when the user explicitly opts into a
+            // different sell quantity.
+            sellQuantityPerLevel: { type: Number, default: null },
             startingCapital: { type: Number, required: true },
             maxPositionSize: { type: Number, default: null },
             commissionPct: { type: Number, default: 0 },
@@ -53,6 +58,12 @@ const gridSimulatorSessionSchema = new mongoose.Schema(
             // startingHoldings > 0.
             startingHoldings: { type: Number, default: 0 },
             startingAvgCost: { type: Number, default: 0 },
+            // ADR-035: immutable, captured once at session creation (same
+            // precedent as referencePrice) from the resolved instrument's
+            // type/segment — drives the DISPLAY-ONLY statutory charges
+            // estimate (services/gridChargesCalculator.js). Never affects
+            // cash/holdings/realizedPnL.
+            segmentClass: { type: String, enum: ["EQUITY_DELIVERY", "FUTURES", "OPTIONS"], default: "EQUITY_DELIVERY" },
         },
 
         state: {

@@ -21,6 +21,7 @@ const {
     listSessions,
     listTrades,
     getTradeCounts,
+    getChargesSummary,
     updateSessionConfig,
     deleteSession,
     getPortfolioMetrics,
@@ -215,6 +216,7 @@ function makeRouter(models, resolveInstrumentKey = async (symbol, key) => key ||
         listSessions,
         listTrades,
         getTradeCounts,
+        getChargesSummary,
         updateSessionConfig,
         deleteSession,
         getPortfolioMetrics,
@@ -556,6 +558,59 @@ function validConfigBody(overrides = {}) {
         assert.strictEqual(res.body.session.config.quantityPerLevel, 40);
         assert.strictEqual(res.body.session.config.gridInterval, 5);
         assert.strictEqual(res.body.session.config.sellVariance, 7);
+    });
+
+    await test("PATCH .../config applies sellQuantityPerLevel (ADR-035) when useSeparateSellQuantity is true", async () => {
+        const models = makeFakeModels();
+        const router = makeRouter(models);
+        const userId = new mongoose.Types.ObjectId();
+
+        const createRes = fakeRes();
+        await finalHandlerFor(router, "post", "/v2/grid-simulator/sessions")({ user: { mongoId: userId }, body: validConfigBody() }, createRes);
+        const sessionId = createRes.body.session.sessionId;
+        await finalHandlerFor(router, "post", "/v2/grid-simulator/sessions/:sessionId/start")({ user: { mongoId: userId }, params: { sessionId } }, fakeRes());
+        await finalHandlerFor(router, "post", "/v2/grid-simulator/sessions/:sessionId/pause")({ user: { mongoId: userId }, params: { sessionId } }, fakeRes());
+
+        const handle = finalHandlerFor(router, "patch", "/v2/grid-simulator/sessions/:sessionId/config");
+        const res = fakeRes();
+        await handle({ user: { mongoId: userId }, params: { sessionId }, body: { useSeparateSellQuantity: true, sellQuantityPerLevel: 30 } }, res);
+        assert.strictEqual(res.statusCode, 200, JSON.stringify(res.body));
+        assert.strictEqual(res.body.session.config.sellQuantityPerLevel, 30);
+    });
+
+    await test("PATCH .../config rejects useSeparateSellQuantity:true without a valid sellQuantityPerLevel", async () => {
+        const models = makeFakeModels();
+        const router = makeRouter(models);
+        const userId = new mongoose.Types.ObjectId();
+
+        const createRes = fakeRes();
+        await finalHandlerFor(router, "post", "/v2/grid-simulator/sessions")({ user: { mongoId: userId }, body: validConfigBody() }, createRes);
+        const sessionId = createRes.body.session.sessionId;
+        await finalHandlerFor(router, "post", "/v2/grid-simulator/sessions/:sessionId/start")({ user: { mongoId: userId }, params: { sessionId } }, fakeRes());
+        await finalHandlerFor(router, "post", "/v2/grid-simulator/sessions/:sessionId/pause")({ user: { mongoId: userId }, params: { sessionId } }, fakeRes());
+
+        const handle = finalHandlerFor(router, "patch", "/v2/grid-simulator/sessions/:sessionId/config");
+        const res = fakeRes();
+        await handle({ user: { mongoId: userId }, params: { sessionId }, body: { useSeparateSellQuantity: true } }, res);
+        assert.strictEqual(res.statusCode, 400);
+    });
+
+    await test("GET /sessions/:sessionId includes a charges summary (ADR-035) keyed by the session's captured segmentClass", async () => {
+        const models = makeFakeModels();
+        const router = makeRouter(models);
+        const userId = new mongoose.Types.ObjectId();
+
+        const createRes = fakeRes();
+        await finalHandlerFor(router, "post", "/v2/grid-simulator/sessions")({ user: { mongoId: userId }, body: validConfigBody() }, createRes);
+        const sessionId = createRes.body.session.sessionId;
+
+        const detailHandle = finalHandlerFor(router, "get", "/v2/grid-simulator/sessions/:sessionId");
+        const res = fakeRes();
+        await detailHandle({ user: { mongoId: userId }, params: { sessionId } }, res);
+        assert.strictEqual(res.statusCode, 200, JSON.stringify(res.body));
+        assert.ok(res.body.charges, "detail response includes a charges field");
+        assert.strictEqual(res.body.charges.segmentClass, "EQUITY_DELIVERY");
+        assert.strictEqual(res.body.charges.total, 0, "no trades yet -> zero charges");
     });
 
     await test("PATCH .../config rejects useSeparateSellVariance:true without a valid sellVariance", async () => {

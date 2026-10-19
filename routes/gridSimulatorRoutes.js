@@ -1,4 +1,5 @@
 const express = require("express");
+const { classifySegmentClass } = require("../services/gridChargesCalculator");
 
 // "Sufficiently fresh" for the initial anchor quote — reject creation
 // rather than silently use a stale/cached price. Deliberately the same
@@ -65,7 +66,7 @@ function sessionSummary(session) {
     };
 }
 
-function sessionDetail(session, getPortfolioMetrics, tradeCounts = null) {
+function sessionDetail(session, getPortfolioMetrics, tradeCounts = null, charges = null) {
     const currentPrice = session.lastFeedPrice ?? session.state.lastPrice ?? null;
     return {
         ...sessionSummary(session),
@@ -77,6 +78,7 @@ function sessionDetail(session, getPortfolioMetrics, tradeCounts = null) {
         },
         portfolio: getPortfolioMetrics(session, currentPrice),
         tradeCounts,
+        charges,
     };
 }
 
@@ -120,6 +122,7 @@ function createGridSimulatorRoutes({
     listSessions,
     listTrades,
     getTradeCounts,
+    getChargesSummary,
     updateSessionConfig,
     deleteSession,
     getPortfolioMetrics,
@@ -144,6 +147,7 @@ function createGridSimulatorRoutes({
                 gridInterval,
                 sellVariance,
                 quantityPerLevel,
+                sellQuantityPerLevel,
                 startingCapital,
                 maxPositionSize,
                 commissionPct,
@@ -162,6 +166,9 @@ function createGridSimulatorRoutes({
             }
             if (sellVariance != null && !(Number.isFinite(Number(sellVariance)) && Number(sellVariance) > 0)) {
                 return res.status(400).json({ message: "sellVariance must be a positive number when provided" });
+            }
+            if (sellQuantityPerLevel != null && !(Number.isInteger(Number(sellQuantityPerLevel)) && Number(sellQuantityPerLevel) > 0)) {
+                return res.status(400).json({ message: "sellQuantityPerLevel must be a positive integer when provided" });
             }
 
             const instrumentKey = await resolveInstrumentKey(symbol, bodyInstrumentKey);
@@ -182,6 +189,11 @@ function createGridSimulatorRoutes({
                 });
             }
 
+            // Immutable (ADR-035), captured once here from the resolved
+            // instrument's own type/segment — drives the display-only
+            // charges estimate, never re-derived or editable afterward.
+            const segmentClass = classifySegmentClass(marketDataService.getInstrumentMeta?.(instrumentKey));
+
             const session = await createSession({
                 GridSimulatorSession,
                 userId: req.user.mongoId,
@@ -193,12 +205,14 @@ function createGridSimulatorRoutes({
                     gridInterval: Number(gridInterval),
                     sellVariance: sellVariance != null ? Number(sellVariance) : null,
                     quantityPerLevel: Number(quantityPerLevel),
+                    sellQuantityPerLevel: sellQuantityPerLevel != null ? Number(sellQuantityPerLevel) : null,
                     startingCapital: Number(startingCapital),
                     maxPositionSize: maxPositionSize != null ? Number(maxPositionSize) : null,
                     commissionPct: commissionPct != null ? Number(commissionPct) : 0,
                     slippagePct: slippagePct != null ? Number(slippagePct) : 0,
                     startingHoldings: holdings,
                     startingAvgCost: holdings > 0 ? Number(startingAvgCost) : 0,
+                    segmentClass,
                 },
             });
 
@@ -284,7 +298,7 @@ function createGridSimulatorRoutes({
     // here, so a concurrent resume can't race past this check.
     router.patch("/v2/grid-simulator/sessions/:sessionId/config", requireAuth, validateObjectId("sessionId"), async (req, res) => {
         try {
-            const { quantityPerLevel, gridInterval, useSeparateSellVariance, sellVariance, addCash } = req.body;
+            const { quantityPerLevel, gridInterval, useSeparateSellVariance, sellVariance, useSeparateSellQuantity, sellQuantityPerLevel, addCash } = req.body;
             const patch = {};
 
             if (quantityPerLevel != null) {
@@ -308,6 +322,15 @@ function createGridSimulatorRoutes({
                 patch.sellVariance = Number(sellVariance);
             } else if (useSeparateSellVariance === false) {
                 patch.sellVariance = null; // mirror the (possibly also-updated) buy variance
+            }
+
+            if (useSeparateSellQuantity === true) {
+                if (!Number.isInteger(Number(sellQuantityPerLevel)) || Number(sellQuantityPerLevel) < 1) {
+                    return res.status(400).json({ message: "sellQuantityPerLevel must be a positive integer when using a separate sell quantity" });
+                }
+                patch.sellQuantityPerLevel = Number(sellQuantityPerLevel);
+            } else if (useSeparateSellQuantity === false) {
+                patch.sellQuantityPerLevel = null; // mirror the (possibly also-updated) buy quantity
             }
 
             if (addCash != null) {
@@ -354,7 +377,8 @@ function createGridSimulatorRoutes({
         try {
             const session = await getOwnedSession({ GridSimulatorSession, sessionId: req.params.sessionId, userId: req.user.mongoId });
             const tradeCounts = await getTradeCounts({ GridSimulatorTrade, sessionId: req.params.sessionId });
-            return res.json(sessionDetail(session, getPortfolioMetrics, tradeCounts));
+            const charges = await getChargesSummary({ GridSimulatorTrade, sessionId: req.params.sessionId, segmentClass: session.config.segmentClass });
+            return res.json(sessionDetail(session, getPortfolioMetrics, tradeCounts, charges));
         } catch (error) {
             return handleError(res, error, "Failed to fetch grid simulator session");
         }

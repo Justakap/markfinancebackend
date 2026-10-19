@@ -19,6 +19,7 @@ const {
     processTick,
     listTrades,
     getTradeCounts,
+    getChargesSummary,
     updateSessionConfig,
     deleteSession,
 } = require("../services/gridSimulatorService");
@@ -283,7 +284,18 @@ async function makeActiveSession(userId = new mongoose.Types.ObjectId()) {
         assert.deepStrictEqual(counts, { buyCount: 2, sellCount: 1, skippedCount: 1, partialCount: 0 });
     });
 
-        await test("trade ledger sequence numbers never collide across a multi-trade gap event followed by a later event", async () => {
+        await test("getChargesSummary (ADR-035) aggregates the display-only charges estimate across the whole ledger, keyed by the session's own segmentClass", async () => {
+        const { GridSimulatorSession, GridSimulatorTrade, session } = await makeActiveSession();
+        await processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 336, eventTimestamp: new Date(2026, 0, 1, 9, 15).toISOString() }); // BUY filled
+
+        const charges = await getChargesSummary({ GridSimulatorTrade, sessionId: session._id, segmentClass: "EQUITY_DELIVERY" });
+        assert.strictEqual(charges.segmentClass, "EQUITY_DELIVERY");
+        assert.strictEqual(charges.approximate, false);
+        assert.strictEqual(charges.brokerage, 0, "equity delivery brokerage is zero");
+        assert.ok(charges.total > 0, "a real filled BUY incurs some real charge (STT/exchange/SEBI/stamp duty)");
+    });
+
+    await test("trade ledger sequence numbers never collide across a multi-trade gap event followed by a later event", async () => {
         const { GridSimulatorSession, GridSimulatorTrade, session } = await makeActiveSession();
         // Gap from reference 340 straight to 310 crosses 10 levels in one event.
         const gapResult = await processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 310, eventTimestamp: new Date(2026, 0, 1, 9, 15).toISOString() });
@@ -428,6 +440,18 @@ async function makeActiveSession(userId = new mongoose.Types.ObjectId()) {
         assert.strictEqual(updated.config.gridInterval, 4);
         assert.strictEqual(updated.config.sellVariance, 6);
         assert.strictEqual(updated.state.cash, CONFIG.startingCapital + 25000);
+    });
+
+    await test("updateSessionConfig applies sellQuantityPerLevel (ADR-035), and clearing it mirrors quantityPerLevel again", async () => {
+        const { GridSimulatorSession, session, userId } = await makeActiveSession();
+        await pauseSession({ GridSimulatorSession, sessionId: session._id, userId });
+
+        const withSplit = await updateSessionConfig({ GridSimulatorSession, sessionId: session._id, userId, patch: { sellQuantityPerLevel: 40 } });
+        assert.strictEqual(withSplit.config.sellQuantityPerLevel, 40);
+        assert.strictEqual(withSplit.config.quantityPerLevel, CONFIG.quantityPerLevel, "quantityPerLevel (buy qty) is untouched");
+
+        const cleared = await updateSessionConfig({ GridSimulatorSession, sessionId: session._id, userId, patch: { sellQuantityPerLevel: null } });
+        assert.strictEqual(cleared.config.sellQuantityPerLevel, null);
     });
 
     await test("updateSessionConfig with useSeparateSellVariance off (sellVariance: null) clears a previously-set sellVariance — mirrors gridInterval again", async () => {

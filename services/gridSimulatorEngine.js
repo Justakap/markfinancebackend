@@ -61,6 +61,10 @@
  *   null by default, meaning the sell side simply mirrors `gridInterval` —
  *   the original symmetric behavior. Since one price update moves in only
  *   one direction, only one of the two variances is ever relevant per call.
+ * - Optional asymmetric quantity (ADR-035): `config.sellQuantityPerLevel`,
+ *   when set, is the quantity used for SELL fills, while `quantityPerLevel`
+ *   remains the quantity for BUY fills. Same null-means-mirror pattern as
+ *   sellVariance.
  * - Optional `commissionPct`/`slippagePct` (same naming/semantics as the
  *   existing backtest/live engines' two-knob cost model — see ADR-019)
  *   default to 0, i.e. fills are exact at the event price unless
@@ -117,6 +121,15 @@ function validateGridConfig(config = {}) {
         errors.push("quantityPerLevel must be a positive integer");
     }
 
+    // sellQuantityPerLevel is optional — when absent/null, SELL fills simply
+    // mirror quantityPerLevel (the "buy quantity"), same pattern as
+    // sellVariance above.
+    if (config.sellQuantityPerLevel !== undefined && config.sellQuantityPerLevel !== null) {
+        if (!Number.isInteger(config.sellQuantityPerLevel) || config.sellQuantityPerLevel < 1) {
+            errors.push("sellQuantityPerLevel must be a positive integer when provided");
+        }
+    }
+
     if (!isFiniteNumber(config.startingCapital) || config.startingCapital <= 0) {
         errors.push("startingCapital must be a positive number");
     }
@@ -167,6 +180,10 @@ function normalizeConfig(config) {
         // as the buy side, i.e. the original symmetric behavior.
         sellVariance: config.sellVariance != null ? roundPrice(config.sellVariance) : null,
         quantityPerLevel: config.quantityPerLevel,
+        // ADR-035: optional asymmetric sell-side quantity, same mirror
+        // pattern as sellVariance — null/absent means SELL fills use
+        // quantityPerLevel too (the original symmetric behavior).
+        sellQuantityPerLevel: config.sellQuantityPerLevel != null ? config.sellQuantityPerLevel : null,
         startingCapital: roundPrice(config.startingCapital),
         maxPositionSize: config.maxPositionSize ?? null,
         commissionPct: config.commissionPct ?? 0,
@@ -344,7 +361,10 @@ function applySell({ config, cash, holdings, lots, realizedPnL, fillPrice, level
     const effectivePrice = roundPrice(fillPrice * slippageMultiplier);
     const unitProceeds = roundPrice(effectivePrice * (1 - config.commissionPct / 100));
 
-    const targetQty = config.quantityPerLevel;
+    // ADR-035: SELL fills use sellQuantityPerLevel when set, else mirror
+    // quantityPerLevel (the "buy quantity") — same mirror pattern as
+    // sellVariance/gridInterval.
+    const targetQty = config.sellQuantityPerLevel ?? config.quantityPerLevel;
     const qty = Math.max(0, Math.min(targetQty, holdings));
 
     if (qty < 1) {

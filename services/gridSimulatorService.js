@@ -23,6 +23,7 @@ const {
     roundPrice,
     annotateRunningState,
 } = require("./gridSimulatorEngine");
+const { summarizeCharges } = require("./gridChargesCalculator");
 
 const LOCK_DURATION_MS = Number(process.env.GRID_SIMULATOR_LOCK_MS || 30_000);
 const NON_TERMINAL_STATUSES = ["CREATED", "ACTIVE", "PAUSED"];
@@ -75,12 +76,14 @@ async function createSession({ GridSimulatorSession, userId, instrumentKey, symb
                 gridInterval: config.gridInterval,
                 sellVariance: config.sellVariance ?? null,
                 quantityPerLevel: config.quantityPerLevel,
+                sellQuantityPerLevel: config.sellQuantityPerLevel ?? null,
                 startingCapital: config.startingCapital,
                 maxPositionSize: config.maxPositionSize ?? null,
                 commissionPct: config.commissionPct ?? 0,
                 slippagePct: config.slippagePct ?? 0,
                 startingHoldings: config.startingHoldings ?? 0,
                 startingAvgCost: config.startingHoldings > 0 ? config.startingAvgCost : 0,
+                segmentClass: config.segmentClass || "EQUITY_DELIVERY",
             },
             state: initialState,
         });
@@ -306,6 +309,17 @@ async function getTradeCounts({ GridSimulatorTrade, sessionId }) {
 }
 
 /**
+ * DISPLAY-ONLY statutory/brokerage charges estimate across a session's
+ * WHOLE ledger (ADR-035) — never affects cash/holdings/realizedPnL. Only
+ * the fields the calculator actually needs are selected, since a long-
+ * running session's ledger can run into the hundreds/thousands.
+ */
+async function getChargesSummary({ GridSimulatorTrade, sessionId, segmentClass }) {
+    const trades = await GridSimulatorTrade.find({ sessionId, qtyFilled: { $gt: 0 } });
+    return summarizeCharges(trades, segmentClass);
+}
+
+/**
  * Edits a session's live-tunable config (quantityPerLevel, gridInterval/
  * sellVariance, and a cash top-up) — ADR-034. Deliberately restricted to
  * PAUSED only: this avoids a tick being processed concurrently with a
@@ -327,6 +341,7 @@ async function updateSessionConfig({ GridSimulatorSession, sessionId, userId, pa
         gridInterval: patch.gridInterval != null ? patch.gridInterval : current.gridInterval,
         sellVariance: Object.prototype.hasOwnProperty.call(patch, "sellVariance") ? patch.sellVariance : (current.sellVariance ?? null),
         quantityPerLevel: patch.quantityPerLevel != null ? patch.quantityPerLevel : current.quantityPerLevel,
+        sellQuantityPerLevel: Object.prototype.hasOwnProperty.call(patch, "sellQuantityPerLevel") ? patch.sellQuantityPerLevel : (current.sellQuantityPerLevel ?? null),
         startingCapital: current.startingCapital,
         maxPositionSize: current.maxPositionSize,
         commissionPct: current.commissionPct,
@@ -345,6 +360,7 @@ async function updateSessionConfig({ GridSimulatorSession, sessionId, userId, pa
             "config.gridInterval": nextConfig.gridInterval,
             "config.sellVariance": nextConfig.sellVariance,
             "config.quantityPerLevel": nextConfig.quantityPerLevel,
+            "config.sellQuantityPerLevel": nextConfig.sellQuantityPerLevel,
         },
     };
     if (patch.addCash != null && patch.addCash > 0) {
@@ -387,6 +403,7 @@ module.exports = {
     listSessions,
     listTrades,
     getTradeCounts,
+    getChargesSummary,
     updateSessionConfig,
     deleteSession,
     getPortfolioMetrics,
