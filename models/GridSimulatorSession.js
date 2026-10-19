@@ -63,7 +63,11 @@ const gridSimulatorSessionSchema = new mongoose.Schema(
             // type/segment — drives the DISPLAY-ONLY statutory charges
             // estimate (services/gridChargesCalculator.js). Never affects
             // cash/holdings/realizedPnL.
-            segmentClass: { type: String, enum: ["EQUITY_DELIVERY", "FUTURES", "OPTIONS"], default: "EQUITY_DELIVERY" },
+            segmentClass: {
+                type: String,
+                enum: ["EQUITY_DELIVERY", "EQUITY_INTRADAY", "FUTURES", "OPTIONS", "COMMODITY_FUTURES", "COMMODITY_OPTIONS"],
+                default: "EQUITY_DELIVERY",
+            },
         },
 
         state: {
