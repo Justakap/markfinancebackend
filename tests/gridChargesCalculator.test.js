@@ -41,6 +41,11 @@ test("classifySegmentClass splits MCX into COMMODITY_FUTURES vs COMMODITY_OPTION
     assert.strictEqual(classifySegmentClass({ segment: "MCX_FO", type: "PE" }), "COMMODITY_OPTIONS");
 });
 
+test("classifySegmentClass also treats NSE's own commodity segment (NSE_COM) as commodity, not equity futures (real bug found via a live backfill)", () => {
+    assert.strictEqual(classifySegmentClass({ segment: "NSE_COM", type: "FUT" }), "COMMODITY_FUTURES");
+    assert.strictEqual(classifySegmentClass({ segment: "NSE_COM", type: "CE" }), "COMMODITY_OPTIONS");
+});
+
 test("classifySegmentClass defaults to EQUITY_DELIVERY ('normal') for plain equity and unrecognized input", () => {
     assert.strictEqual(classifySegmentClass({ segment: "NSE_EQ" }), "EQUITY_DELIVERY");
     assert.strictEqual(classifySegmentClass(null), "EQUITY_DELIVERY");

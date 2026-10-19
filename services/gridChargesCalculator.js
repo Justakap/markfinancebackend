@@ -107,18 +107,22 @@ function computeBrokerage(brokerageConfig, turnover) {
 /** Classifies an Upstox instrument-master entry into one of the 6 modeled
  *  segments — same OPT/CE/PE/FUT/FO detection heuristic already used by
  *  marketDataService.js's getFeedModeForInstrumentKey, applied here for
- *  charges instead of WS feed mode. MCX is checked first and split into
- *  COMMODITY_FUTURES/COMMODITY_OPTIONS (never falls back to the equity
- *  F&O rates). Plain equity defaults to EQUITY_DELIVERY — see the file
- *  doc comment for why EQUITY_INTRADAY is never auto-selected. Never
- *  throws. */
+ *  charges instead of WS feed mode. Commodity derivatives are checked
+ *  FIRST and split into COMMODITY_FUTURES/COMMODITY_OPTIONS (never fall
+ *  back to the equity F&O rates) — this includes both MCX itself and
+ *  NSE's own commodity segment (`NSE_COM`, e.g. NSE-listed crude oil
+ *  futures), confirmed via a live instrument-master lookup to be a
+ *  genuinely distinct segment string from MCX, not a typo. Plain equity
+ *  defaults to EQUITY_DELIVERY — see the file doc comment for why
+ *  EQUITY_INTRADAY is never auto-selected. Never throws. */
 function classifySegmentClass(instrumentMeta) {
     const type = String(instrumentMeta?.instrumentType || instrumentMeta?.type || "").toUpperCase();
     const segment = String(instrumentMeta?.segment || "").toUpperCase();
     const isOption = type.includes("OPT") || type === "CE" || type === "PE" || type === "CALL" || type === "PUT";
     const isFuture = type.includes("FUT") || segment.includes("FO");
+    const isCommoditySegment = segment.includes("MCX") || segment.includes("NSE_COM");
 
-    if (segment.includes("MCX")) {
+    if (isCommoditySegment) {
         return isOption ? "COMMODITY_OPTIONS" : "COMMODITY_FUTURES";
     }
     if (isOption) return "OPTIONS";
