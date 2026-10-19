@@ -73,6 +73,7 @@ async function createSession({ GridSimulatorSession, userId, instrumentKey, symb
                 referencePrice: config.referencePrice,
                 referenceCapturedAt: config.referenceCapturedAt,
                 gridInterval: config.gridInterval,
+                sellVariance: config.sellVariance ?? null,
                 quantityPerLevel: config.quantityPerLevel,
                 startingCapital: config.startingCapital,
                 maxPositionSize: config.maxPositionSize ?? null,
@@ -304,6 +305,73 @@ async function getTradeCounts({ GridSimulatorTrade, sessionId }) {
     return { buyCount, sellCount, skippedCount, partialCount };
 }
 
+/**
+ * Edits a session's live-tunable config (quantityPerLevel, gridInterval/
+ * sellVariance, and a cash top-up) — ADR-034. Deliberately restricted to
+ * PAUSED only: this avoids a tick being processed concurrently with a
+ * half-applied edit (e.g. a crossing firing against the old variance a
+ * moment before the new one takes effect). `patch.addCash` (if provided)
+ * is always a positive top-up applied via $inc, never an overwrite of
+ * cash — overwriting would silently disconnect the cash balance from the
+ * realized P&L/trade history that's supposed to explain it.
+ */
+async function updateSessionConfig({ GridSimulatorSession, sessionId, userId, patch }) {
+    const session = await getOwnedSession({ GridSimulatorSession, sessionId, userId });
+    if (session.status !== "PAUSED") {
+        throw makeError(409, "Pause the session before editing its configuration");
+    }
+
+    const current = session.config;
+    const nextConfig = {
+        referencePrice: current.referencePrice,
+        gridInterval: patch.gridInterval != null ? patch.gridInterval : current.gridInterval,
+        sellVariance: Object.prototype.hasOwnProperty.call(patch, "sellVariance") ? patch.sellVariance : (current.sellVariance ?? null),
+        quantityPerLevel: patch.quantityPerLevel != null ? patch.quantityPerLevel : current.quantityPerLevel,
+        startingCapital: current.startingCapital,
+        maxPositionSize: current.maxPositionSize,
+        commissionPct: current.commissionPct,
+        slippagePct: current.slippagePct,
+        startingHoldings: current.startingHoldings,
+        startingAvgCost: current.startingAvgCost,
+    };
+
+    const validation = validateGridConfig(nextConfig);
+    if (!validation.valid) {
+        throw makeError(400, `Invalid grid configuration: ${validation.errors.join("; ")}`);
+    }
+
+    const updateOp = {
+        $set: {
+            "config.gridInterval": nextConfig.gridInterval,
+            "config.sellVariance": nextConfig.sellVariance,
+            "config.quantityPerLevel": nextConfig.quantityPerLevel,
+        },
+    };
+    if (patch.addCash != null && patch.addCash > 0) {
+        updateOp.$inc = { "state.cash": patch.addCash };
+    }
+
+    const updated = await GridSimulatorSession.findOneAndUpdate({ _id: session._id, status: "PAUSED" }, updateOp, { new: true });
+    if (!updated) {
+        throw makeError(409, "Session status changed before the update could be applied — refresh and try again");
+    }
+    return updated;
+}
+
+/**
+ * Permanently deletes a session and its trade ledger. Allowed regardless
+ * of status — the caller (routes/gridSimulatorRoutes.js) is responsible
+ * for unregistering the session from the real-time registry first so an
+ * ACTIVE/PAUSED session's instrument pin is released and no further tick
+ * ever tries to process the now-deleted document.
+ */
+async function deleteSession({ GridSimulatorSession, GridSimulatorTrade, sessionId, userId }) {
+    const session = await getOwnedSession({ GridSimulatorSession, sessionId, userId });
+    await GridSimulatorTrade.deleteMany({ sessionId: session._id });
+    await GridSimulatorSession.deleteOne({ _id: session._id });
+    return session;
+}
+
 function getPortfolioMetrics(session, currentPrice) {
     return computePortfolioMetrics(docStateToPlain(session), currentPrice);
 }
@@ -319,6 +387,8 @@ module.exports = {
     listSessions,
     listTrades,
     getTradeCounts,
+    updateSessionConfig,
+    deleteSession,
     getPortfolioMetrics,
     docStateToPlain,
     LOCK_DURATION_MS,

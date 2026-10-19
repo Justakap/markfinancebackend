@@ -21,6 +21,8 @@ const {
     listSessions,
     listTrades,
     getTradeCounts,
+    updateSessionConfig,
+    deleteSession,
     getPortfolioMetrics,
 } = require("../services/gridSimulatorService");
 const { requireAuth } = require("../middleware/auth");
@@ -128,6 +130,18 @@ function makeFakeModels() {
             const found = [...sessions.values()].find((doc) => matchFilter(doc, filter));
             if (!found) return null;
             if (update.$set) applySet(found, update.$set);
+            if (update.$inc) {
+                Object.entries(update.$inc).forEach(([path, delta]) => {
+                    const parts = path.split(".");
+                    let target = found;
+                    for (let i = 0; i < parts.length - 1; i += 1) {
+                        target[parts[i]] = target[parts[i]] || {};
+                        target = target[parts[i]];
+                    }
+                    const last = parts[parts.length - 1];
+                    target[last] = (target[last] || 0) + delta;
+                });
+            }
             return options.new ? JSON.parse(JSON.stringify(found)) : null;
         },
         find(filter = {}) {
@@ -135,6 +149,11 @@ function makeFakeModels() {
         },
         async countDocuments(filter = {}) {
             return [...sessions.values()].filter((doc) => matchFilter(doc, filter)).length;
+        },
+        async deleteOne(filter = {}) {
+            const found = [...sessions.values()].find((doc) => matchFilter(doc, filter));
+            if (found) sessions.delete(String(found._id));
+            return { deletedCount: found ? 1 : 0 };
         },
     };
 
@@ -148,6 +167,14 @@ function makeFakeModels() {
         },
         async countDocuments(filter = {}) {
             return trades.filter((doc) => matchFilter(doc, filter)).length;
+        },
+        async deleteMany(filter = {}) {
+            const toRemove = trades.filter((doc) => matchFilter(doc, filter));
+            toRemove.forEach((doc) => {
+                const idx = trades.indexOf(doc);
+                if (idx !== -1) trades.splice(idx, 1);
+            });
+            return { deletedCount: toRemove.length };
         },
     };
 
@@ -171,7 +198,7 @@ function makeFakeMarketDataService(overrides = {}) {
     };
 }
 
-function makeRouter(models, resolveInstrumentKey = async (symbol, key) => key || `NSE_EQ|${symbol}`, marketDataService = makeFakeMarketDataService()) {
+function makeRouter(models, resolveInstrumentKey = async (symbol, key) => key || `NSE_EQ|${symbol}`, marketDataService = makeFakeMarketDataService(), extraDeps = {}) {
     return createGridSimulatorRoutes({
         ...models,
         requireAuth,
@@ -188,7 +215,10 @@ function makeRouter(models, resolveInstrumentKey = async (symbol, key) => key ||
         listSessions,
         listTrades,
         getTradeCounts,
+        updateSessionConfig,
+        deleteSession,
         getPortfolioMetrics,
+        ...extraDeps,
     });
 }
 
@@ -484,6 +514,125 @@ function validConfigBody(overrides = {}) {
         const res = fakeRes();
         await handle({ user: { mongoId: new mongoose.Types.ObjectId() }, body: validConfigBody() }, res);
         assert.strictEqual(res.statusCode, 201, JSON.stringify(res.body));
+    });
+
+    // --- PATCH .../config (ADR-034 live edit) ---
+
+    await test("PATCH .../config rejects editing a session that isn't PAUSED", async () => {
+        const models = makeFakeModels();
+        const router = makeRouter(models);
+        const userId = new mongoose.Types.ObjectId();
+        const createRes = fakeRes();
+        await finalHandlerFor(router, "post", "/v2/grid-simulator/sessions")({ user: { mongoId: userId }, body: validConfigBody() }, createRes);
+        const sessionId = createRes.body.session.sessionId;
+
+        const handle = finalHandlerFor(router, "patch", "/v2/grid-simulator/sessions/:sessionId/config");
+        const res = fakeRes();
+        await handle({ user: { mongoId: userId }, params: { sessionId }, body: { quantityPerLevel: 50 } }, res);
+        assert.strictEqual(res.statusCode, 409, JSON.stringify(res.body));
+    });
+
+    await test("PATCH .../config applies quantityPerLevel/gridInterval/addCash, and a separate sellVariance when requested, while PAUSED", async () => {
+        const models = makeFakeModels();
+        const router = makeRouter(models);
+        const userId = new mongoose.Types.ObjectId();
+
+        const createRes = fakeRes();
+        await finalHandlerFor(router, "post", "/v2/grid-simulator/sessions")({ user: { mongoId: userId }, body: validConfigBody() }, createRes);
+        const sessionId = createRes.body.session.sessionId;
+
+        const startHandle = finalHandlerFor(router, "post", "/v2/grid-simulator/sessions/:sessionId/start");
+        await startHandle({ user: { mongoId: userId }, params: { sessionId } }, fakeRes());
+        const pauseHandle = finalHandlerFor(router, "post", "/v2/grid-simulator/sessions/:sessionId/pause");
+        await pauseHandle({ user: { mongoId: userId }, params: { sessionId } }, fakeRes());
+
+        const handle = finalHandlerFor(router, "patch", "/v2/grid-simulator/sessions/:sessionId/config");
+        const res = fakeRes();
+        await handle(
+            { user: { mongoId: userId }, params: { sessionId }, body: { quantityPerLevel: 40, gridInterval: 5, useSeparateSellVariance: true, sellVariance: 7, addCash: 10000 } },
+            res,
+        );
+        assert.strictEqual(res.statusCode, 200, JSON.stringify(res.body));
+        assert.strictEqual(res.body.session.config.quantityPerLevel, 40);
+        assert.strictEqual(res.body.session.config.gridInterval, 5);
+        assert.strictEqual(res.body.session.config.sellVariance, 7);
+    });
+
+    await test("PATCH .../config rejects useSeparateSellVariance:true without a valid sellVariance", async () => {
+        const models = makeFakeModels();
+        const router = makeRouter(models);
+        const userId = new mongoose.Types.ObjectId();
+
+        const createRes = fakeRes();
+        await finalHandlerFor(router, "post", "/v2/grid-simulator/sessions")({ user: { mongoId: userId }, body: validConfigBody() }, createRes);
+        const sessionId = createRes.body.session.sessionId;
+        await finalHandlerFor(router, "post", "/v2/grid-simulator/sessions/:sessionId/start")({ user: { mongoId: userId }, params: { sessionId } }, fakeRes());
+        await finalHandlerFor(router, "post", "/v2/grid-simulator/sessions/:sessionId/pause")({ user: { mongoId: userId }, params: { sessionId } }, fakeRes());
+
+        const handle = finalHandlerFor(router, "patch", "/v2/grid-simulator/sessions/:sessionId/config");
+        const res = fakeRes();
+        await handle({ user: { mongoId: userId }, params: { sessionId }, body: { useSeparateSellVariance: true } }, res);
+        assert.strictEqual(res.statusCode, 400);
+    });
+
+    await test("PATCH .../config 404s for a different user's session (no cross-user config edits)", async () => {
+        const models = makeFakeModels();
+        const router = makeRouter(models);
+        const owner = new mongoose.Types.ObjectId();
+        const other = new mongoose.Types.ObjectId();
+
+        const createRes = fakeRes();
+        await finalHandlerFor(router, "post", "/v2/grid-simulator/sessions")({ user: { mongoId: owner }, body: validConfigBody() }, createRes);
+        const sessionId = createRes.body.session.sessionId;
+        await finalHandlerFor(router, "post", "/v2/grid-simulator/sessions/:sessionId/start")({ user: { mongoId: owner }, params: { sessionId } }, fakeRes());
+        await finalHandlerFor(router, "post", "/v2/grid-simulator/sessions/:sessionId/pause")({ user: { mongoId: owner }, params: { sessionId } }, fakeRes());
+
+        const handle = finalHandlerFor(router, "patch", "/v2/grid-simulator/sessions/:sessionId/config");
+        const res = fakeRes();
+        await handle({ user: { mongoId: other }, params: { sessionId }, body: { quantityPerLevel: 10 } }, res);
+        assert.strictEqual(res.statusCode, 404);
+    });
+
+    // --- DELETE .../sessions/:sessionId ---
+
+    await test("DELETE .../sessions/:sessionId removes the session (any status) and unregisters it from the realtime registry", async () => {
+        const models = makeFakeModels();
+        let unregisteredWith = null;
+        const router = makeRouter(models, undefined, undefined, { unregisterRealtimeSession: (sessionId) => { unregisteredWith = String(sessionId); } });
+        const userId = new mongoose.Types.ObjectId();
+
+        const createRes = fakeRes();
+        await finalHandlerFor(router, "post", "/v2/grid-simulator/sessions")({ user: { mongoId: userId }, body: validConfigBody() }, createRes);
+        const sessionId = createRes.body.session.sessionId;
+        await finalHandlerFor(router, "post", "/v2/grid-simulator/sessions/:sessionId/start")({ user: { mongoId: userId }, params: { sessionId } }, fakeRes());
+
+        const handle = finalHandlerFor(router, "delete", "/v2/grid-simulator/sessions/:sessionId");
+        const res = fakeRes();
+        await handle({ user: { mongoId: userId }, params: { sessionId } }, res);
+        assert.strictEqual(res.statusCode, 200, JSON.stringify(res.body));
+        assert.strictEqual(res.body.success, true);
+        assert.strictEqual(unregisteredWith, String(sessionId));
+
+        const detailHandle = finalHandlerFor(router, "get", "/v2/grid-simulator/sessions/:sessionId");
+        const detailRes = fakeRes();
+        await detailHandle({ user: { mongoId: userId }, params: { sessionId } }, detailRes);
+        assert.strictEqual(detailRes.statusCode, 404);
+    });
+
+    await test("DELETE .../sessions/:sessionId 404s for a different user's session (no cross-user deletion)", async () => {
+        const models = makeFakeModels();
+        const router = makeRouter(models);
+        const owner = new mongoose.Types.ObjectId();
+        const other = new mongoose.Types.ObjectId();
+
+        const createRes = fakeRes();
+        await finalHandlerFor(router, "post", "/v2/grid-simulator/sessions")({ user: { mongoId: owner }, body: validConfigBody() }, createRes);
+        const sessionId = createRes.body.session.sessionId;
+
+        const handle = finalHandlerFor(router, "delete", "/v2/grid-simulator/sessions/:sessionId");
+        const res = fakeRes();
+        await handle({ user: { mongoId: other }, params: { sessionId } }, res);
+        assert.strictEqual(res.statusCode, 404);
     });
 
     console.log(`\nGrid simulator route tests: ${passed} passed, ${failed} failed`);

@@ -38,6 +38,11 @@ const gridSimulatorSessionSchema = new mongoose.Schema(
             referencePrice: { type: Number, required: true },
             referenceCapturedAt: { type: Date, required: true },
             gridInterval: { type: Number, required: true },
+            // ADR-034: optional asymmetric sell-side spacing. null means the
+            // sell side mirrors gridInterval (the original symmetric
+            // behavior) — only set when the user explicitly opts into a
+            // different sell variance.
+            sellVariance: { type: Number, default: null },
             quantityPerLevel: { type: Number, required: true },
             startingCapital: { type: Number, required: true },
             maxPositionSize: { type: Number, default: null },

@@ -19,6 +19,8 @@ const {
     processTick,
     listTrades,
     getTradeCounts,
+    updateSessionConfig,
+    deleteSession,
 } = require("../services/gridSimulatorService");
 
 let passed = 0;
@@ -74,6 +76,19 @@ function applySet(doc, setOps = {}) {
     });
 }
 
+function applyInc(doc, incOps = {}) {
+    Object.entries(incOps).forEach(([path, delta]) => {
+        const parts = path.split(".");
+        let target = doc;
+        for (let i = 0; i < parts.length - 1; i += 1) {
+            target[parts[i]] = target[parts[i]] || {};
+            target = target[parts[i]];
+        }
+        const last = parts[parts.length - 1];
+        target[last] = (target[last] || 0) + delta;
+    });
+}
+
 function makeQuery(initialArr) {
     let arr = initialArr;
     const query = {
@@ -115,6 +130,7 @@ function makeFakeSessionModel() {
             const found = [...docs.values()].find((doc) => matchFilter(doc, filter));
             if (!found) return null;
             if (update.$set) applySet(found, update.$set);
+            if (update.$inc) applyInc(found, update.$inc);
             return options.new ? JSON.parse(JSON.stringify(found)) : null;
         },
         find(filter = {}) {
@@ -122,6 +138,11 @@ function makeFakeSessionModel() {
         },
         async countDocuments(filter = {}) {
             return [...docs.values()].filter((doc) => matchFilter(doc, filter)).length;
+        },
+        async deleteOne(filter = {}) {
+            const found = [...docs.values()].find((doc) => matchFilter(doc, filter));
+            if (found) docs.delete(String(found._id));
+            return { deletedCount: found ? 1 : 0 };
         },
     };
 }
@@ -139,6 +160,14 @@ function makeFakeTradeModel() {
         },
         async countDocuments(filter = {}) {
             return docs.filter((doc) => matchFilter(doc, filter)).length;
+        },
+        async deleteMany(filter = {}) {
+            const toRemove = docs.filter((doc) => matchFilter(doc, filter));
+            toRemove.forEach((doc) => {
+                const idx = docs.indexOf(doc);
+                if (idx !== -1) docs.splice(idx, 1);
+            });
+            return { deletedCount: toRemove.length };
         },
     };
 }
@@ -372,6 +401,82 @@ async function makeActiveSession(userId = new mongoose.Types.ObjectId()) {
         assert.strictEqual(result.state.realizedPnL, 500);
         assert.strictEqual(result.state.holdings, 100);
         assert.strictEqual(result.state.avgCost, 315, "avg cost is unchanged by a sell");
+    });
+
+    // --- updateSessionConfig (ADR-034) ---
+
+    await test("updateSessionConfig rejects editing an ACTIVE (not PAUSED) session", async () => {
+        const { GridSimulatorSession, session, userId } = await makeActiveSession();
+        await assert.rejects(
+            () => updateSessionConfig({ GridSimulatorSession, sessionId: session._id, userId, patch: { quantityPerLevel: 50 } }),
+            (err) => err.statusCode === 409,
+        );
+    });
+
+    await test("updateSessionConfig applies quantityPerLevel/gridInterval/sellVariance and a cash top-up while PAUSED", async () => {
+        const { GridSimulatorSession, session, userId } = await makeActiveSession();
+        await pauseSession({ GridSimulatorSession, sessionId: session._id, userId });
+
+        const updated = await updateSessionConfig({
+            GridSimulatorSession,
+            sessionId: session._id,
+            userId,
+            patch: { quantityPerLevel: 50, gridInterval: 4, sellVariance: 6, addCash: 25000 },
+        });
+
+        assert.strictEqual(updated.config.quantityPerLevel, 50);
+        assert.strictEqual(updated.config.gridInterval, 4);
+        assert.strictEqual(updated.config.sellVariance, 6);
+        assert.strictEqual(updated.state.cash, CONFIG.startingCapital + 25000);
+    });
+
+    await test("updateSessionConfig with useSeparateSellVariance off (sellVariance: null) clears a previously-set sellVariance — mirrors gridInterval again", async () => {
+        const { GridSimulatorSession, session, userId } = await makeActiveSession();
+        await pauseSession({ GridSimulatorSession, sessionId: session._id, userId });
+        await updateSessionConfig({ GridSimulatorSession, sessionId: session._id, userId, patch: { sellVariance: 6 } });
+
+        const updated = await updateSessionConfig({ GridSimulatorSession, sessionId: session._id, userId, patch: { sellVariance: null } });
+        assert.strictEqual(updated.config.sellVariance, null);
+        assert.strictEqual(updated.config.gridInterval, CONFIG.gridInterval, "gridInterval (buy variance) is untouched by clearing sellVariance");
+    });
+
+    await test("updateSessionConfig rejects an invalid resulting configuration (e.g. a non-positive gridInterval)", async () => {
+        const { GridSimulatorSession, session, userId } = await makeActiveSession();
+        await pauseSession({ GridSimulatorSession, sessionId: session._id, userId });
+        await assert.rejects(
+            () => updateSessionConfig({ GridSimulatorSession, sessionId: session._id, userId, patch: { gridInterval: -1 } }),
+            (err) => err.statusCode === 400,
+        );
+    });
+
+    await test("updateSessionConfig 404s for a different user's session", async () => {
+        const { GridSimulatorSession, session, userId } = await makeActiveSession();
+        await pauseSession({ GridSimulatorSession, sessionId: session._id, userId });
+        await assert.rejects(
+            () => updateSessionConfig({ GridSimulatorSession, sessionId: session._id, userId: new mongoose.Types.ObjectId(), patch: { quantityPerLevel: 10 } }),
+            (err) => err.statusCode === 404,
+        );
+    });
+
+    // --- deleteSession ---
+
+    await test("deleteSession removes the session document and its entire trade ledger, regardless of status", async () => {
+        const { GridSimulatorSession, GridSimulatorTrade, session, userId } = await makeActiveSession();
+        await processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 337, eventTimestamp: new Date(2026, 0, 1, 9, 30).toISOString() });
+        assert.ok(GridSimulatorTrade.docs.length > 0, "sanity check: a trade was actually recorded");
+
+        await deleteSession({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, userId });
+
+        assert.strictEqual(GridSimulatorSession.docs.has(String(session._id)), false);
+        assert.strictEqual(GridSimulatorTrade.docs.filter((t) => String(t.sessionId) === String(session._id)).length, 0);
+    });
+
+    await test("deleteSession 404s for a different user's session (no cross-user deletion)", async () => {
+        const { GridSimulatorSession, GridSimulatorTrade, session } = await makeActiveSession();
+        await assert.rejects(
+            () => deleteSession({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, userId: new mongoose.Types.ObjectId() }),
+            (err) => err.statusCode === 404,
+        );
     });
 
     console.log(`\nGrid simulator service tests: ${passed} passed, ${failed} failed`);

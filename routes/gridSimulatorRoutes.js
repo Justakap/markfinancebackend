@@ -120,6 +120,8 @@ function createGridSimulatorRoutes({
     listSessions,
     listTrades,
     getTradeCounts,
+    updateSessionConfig,
+    deleteSession,
     getPortfolioMetrics,
     registerRealtimeSession = () => {},
     unregisterRealtimeSession = () => {},
@@ -140,6 +142,7 @@ function createGridSimulatorRoutes({
                 symbol,
                 instrumentKey: bodyInstrumentKey,
                 gridInterval,
+                sellVariance,
                 quantityPerLevel,
                 startingCapital,
                 maxPositionSize,
@@ -156,6 +159,9 @@ function createGridSimulatorRoutes({
             const holdings = startingHoldings != null ? Number(startingHoldings) : 0;
             if (holdings > 0 && !(Number.isFinite(Number(startingAvgCost)) && Number(startingAvgCost) > 0)) {
                 return res.status(400).json({ message: "startingAvgCost is required and must be a positive number when startingHoldings > 0" });
+            }
+            if (sellVariance != null && !(Number.isFinite(Number(sellVariance)) && Number(sellVariance) > 0)) {
+                return res.status(400).json({ message: "sellVariance must be a positive number when provided" });
             }
 
             const instrumentKey = await resolveInstrumentKey(symbol, bodyInstrumentKey);
@@ -185,6 +191,7 @@ function createGridSimulatorRoutes({
                     referencePrice: freshQuote.price,
                     referenceCapturedAt: freshQuote.capturedAt,
                     gridInterval: Number(gridInterval),
+                    sellVariance: sellVariance != null ? Number(sellVariance) : null,
                     quantityPerLevel: Number(quantityPerLevel),
                     startingCapital: Number(startingCapital),
                     maxPositionSize: maxPositionSize != null ? Number(maxPositionSize) : null,
@@ -267,6 +274,68 @@ function createGridSimulatorRoutes({
             return res.json({ skipped: true, reason: "client_tick_display_only", trades: [] });
         } catch (error) {
             return handleError(res, error, "Failed to process grid simulator tick");
+        }
+    });
+
+    // Live-editable config (ADR-034) — quantityPerLevel, gridInterval ("Buy
+    // Variance"), sellVariance, and a cash top-up. Restricted to PAUSED
+    // sessions only (see updateSessionConfig's doc comment) — enforced in
+    // the service layer via the status-scoped findOneAndUpdate, not just
+    // here, so a concurrent resume can't race past this check.
+    router.patch("/v2/grid-simulator/sessions/:sessionId/config", requireAuth, validateObjectId("sessionId"), async (req, res) => {
+        try {
+            const { quantityPerLevel, gridInterval, useSeparateSellVariance, sellVariance, addCash } = req.body;
+            const patch = {};
+
+            if (quantityPerLevel != null) {
+                if (!Number.isInteger(Number(quantityPerLevel)) || Number(quantityPerLevel) < 1) {
+                    return res.status(400).json({ message: "quantityPerLevel must be a positive integer" });
+                }
+                patch.quantityPerLevel = Number(quantityPerLevel);
+            }
+
+            if (gridInterval != null) {
+                if (!Number.isFinite(Number(gridInterval)) || Number(gridInterval) <= 0) {
+                    return res.status(400).json({ message: "gridInterval must be a positive number" });
+                }
+                patch.gridInterval = Number(gridInterval);
+            }
+
+            if (useSeparateSellVariance === true) {
+                if (!Number.isFinite(Number(sellVariance)) || Number(sellVariance) <= 0) {
+                    return res.status(400).json({ message: "sellVariance must be a positive number when using a separate sell variance" });
+                }
+                patch.sellVariance = Number(sellVariance);
+            } else if (useSeparateSellVariance === false) {
+                patch.sellVariance = null; // mirror the (possibly also-updated) buy variance
+            }
+
+            if (addCash != null) {
+                if (!Number.isFinite(Number(addCash)) || Number(addCash) <= 0) {
+                    return res.status(400).json({ message: "addCash must be a positive number" });
+                }
+                patch.addCash = Number(addCash);
+            }
+
+            const updated = await updateSessionConfig({ GridSimulatorSession, sessionId: req.params.sessionId, userId: req.user.mongoId, patch });
+            return res.json({ session: sessionSummary(updated) });
+        } catch (error) {
+            return handleError(res, error, "Failed to update grid simulator session configuration");
+        }
+    });
+
+    // Deletable regardless of status — an ACTIVE/PAUSED session is first
+    // unregistered from the real-time registry (releases its instrument
+    // pin, stops any further tick from targeting it) before its document
+    // and trade ledger are removed.
+    router.delete("/v2/grid-simulator/sessions/:sessionId", requireAuth, validateObjectId("sessionId"), async (req, res) => {
+        try {
+            const session = await getOwnedSession({ GridSimulatorSession, sessionId: req.params.sessionId, userId: req.user.mongoId });
+            unregisterRealtimeSession(session._id);
+            await deleteSession({ GridSimulatorSession, GridSimulatorTrade, sessionId: req.params.sessionId, userId: req.user.mongoId });
+            return res.json({ success: true });
+        } catch (error) {
+            return handleError(res, error, "Failed to delete grid simulator session");
         }
     });
 

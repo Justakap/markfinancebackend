@@ -759,5 +759,61 @@ test("a partial sell consumes only PART of the oldest lot, leaving the remainder
     assert.deepStrictEqual(state.lots, [{ qty: 20, price: 97 }, { qty: 20, price: 94 }]); // 20 left of the first lot, untouched 94 lot
 });
 
+test("validateGridConfig rejects a non-positive sellVariance but accepts a positive one", () => {
+    const base = { referencePrice: 100, gridInterval: 3, quantityPerLevel: 10, startingCapital: 1000 };
+    assert.strictEqual(validateGridConfig({ ...base, sellVariance: -1 }).valid, false);
+    assert.strictEqual(validateGridConfig({ ...base, sellVariance: 5 }).valid, true);
+    assert.strictEqual(validateGridConfig(base).valid, true); // omitted entirely is fine (mirrors gridInterval)
+});
+
+test("ADR-034: asymmetric buy/sell variance — BUY steps use gridInterval, SELL steps use sellVariance", () => {
+    const config = { referencePrice: 100, gridInterval: 3, sellVariance: 5, quantityPerLevel: 10, startingCapital: 1000000, commissionPct: 0, slippagePct: 0 };
+    let state = createInitialGridState(config);
+    let t = Date.parse("2026-01-01T09:00:00.000Z");
+
+    // Down-cross 3 (buy variance) from 100 -> BUY at 97, reference rebases to 97.
+    let r = processPriceUpdate({ config, state, price: 97, eventTimestamp: new Date(t += 1000).toISOString() });
+    assert.strictEqual(r.trades.length, 1);
+    assert.strictEqual(r.trades[0].type, "BUY");
+    assert.strictEqual(r.trades[0].levelPrice, 97);
+    state = r.state;
+    assert.strictEqual(state.activeReference, 97);
+
+    // Up-cross 5 (sell variance, NOT 3) from 97 -> SELL at 102, reference rebases to 102.
+    r = processPriceUpdate({ config, state, price: 102, eventTimestamp: new Date(t += 1000).toISOString() });
+    assert.strictEqual(r.trades.length, 1);
+    assert.strictEqual(r.trades[0].type, "SELL");
+    assert.strictEqual(r.trades[0].levelPrice, 102);
+    state = r.state;
+    assert.strictEqual(state.activeReference, 102);
+
+    // Down-cross 3 (buy variance) from 102 -> BUY at 99, reference rebases to 99.
+    r = processPriceUpdate({ config, state, price: 99, eventTimestamp: new Date(t += 1000).toISOString() });
+    assert.strictEqual(r.trades.length, 1);
+    assert.strictEqual(r.trades[0].type, "BUY");
+    assert.strictEqual(r.trades[0].levelPrice, 99);
+    state = r.state;
+    assert.strictEqual(state.activeReference, 99);
+});
+
+test("ADR-034: sellVariance omitted (null) mirrors gridInterval exactly — identical to the pre-ADR-034 symmetric behavior", () => {
+    const symmetricConfig = { referencePrice: 100, gridInterval: 3, quantityPerLevel: 10, startingCapital: 1000000, commissionPct: 0, slippagePct: 0 };
+    const mirroredConfig = { ...symmetricConfig, sellVariance: null };
+    let stateA = createInitialGridState(symmetricConfig);
+    let stateB = createInitialGridState(mirroredConfig);
+    let t = Date.parse("2026-01-01T09:00:00.000Z");
+
+    [97, 100, 103, 100].forEach((price) => {
+        t += 1000;
+        const eventTimestamp = new Date(t).toISOString();
+        const rA = processPriceUpdate({ config: symmetricConfig, state: stateA, price, eventTimestamp });
+        const rB = processPriceUpdate({ config: mirroredConfig, state: stateB, price, eventTimestamp });
+        assert.deepStrictEqual(rA.trades, rB.trades);
+        stateA = rA.state;
+        stateB = rB.state;
+    });
+    assert.deepStrictEqual(stateA, stateB);
+});
+
 console.log(`\nGrid simulator engine tests: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

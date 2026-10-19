@@ -55,6 +55,12 @@
  *   uses it since mark-to-market valuation of the remaining position is
  *   the same number either way lots are represented. avgCost is 0 when
  *   the lot queue is empty (holdings back to exactly 0).
+ * - Optional asymmetric spacing (ADR-034): `config.sellVariance`, when set,
+ *   is the spacing used for upward (SELL) crossings, while `gridInterval`
+ *   remains the spacing for downward (BUY) crossings. `sellVariance` is
+ *   null by default, meaning the sell side simply mirrors `gridInterval` —
+ *   the original symmetric behavior. Since one price update moves in only
+ *   one direction, only one of the two variances is ever relevant per call.
  * - Optional `commissionPct`/`slippagePct` (same naming/semantics as the
  *   existing backtest/live engines' two-knob cost model — see ADR-019)
  *   default to 0, i.e. fills are exact at the event price unless
@@ -94,6 +100,17 @@ function validateGridConfig(config = {}) {
         errors.push("gridInterval must be a positive number");
     } else if (toCents(config.gridInterval) < 1) {
         errors.push("gridInterval is too small to represent at paise precision");
+    }
+
+    // sellVariance is optional — when absent/null, the sell side simply
+    // mirrors gridInterval (the "buy variance"). When provided, it must be
+    // just as valid as gridInterval itself.
+    if (config.sellVariance !== undefined && config.sellVariance !== null) {
+        if (!isFiniteNumber(config.sellVariance) || config.sellVariance <= 0) {
+            errors.push("sellVariance must be a positive number when provided");
+        } else if (toCents(config.sellVariance) < 1) {
+            errors.push("sellVariance is too small to represent at paise precision");
+        }
     }
 
     if (!Number.isInteger(config.quantityPerLevel) || config.quantityPerLevel < 1) {
@@ -145,6 +162,10 @@ function normalizeConfig(config) {
     return {
         referencePrice: roundPrice(config.referencePrice),
         gridInterval: roundPrice(config.gridInterval),
+        // ADR-034: optional asymmetric sell-side spacing. null/absent means
+        // "mirror gridInterval" — the sell side uses the exact same spacing
+        // as the buy side, i.e. the original symmetric behavior.
+        sellVariance: config.sellVariance != null ? roundPrice(config.sellVariance) : null,
         quantityPerLevel: config.quantityPerLevel,
         startingCapital: roundPrice(config.startingCapital),
         maxPositionSize: config.maxPositionSize ?? null,
@@ -418,7 +439,13 @@ function processPriceUpdate({ config: rawConfig, state, price, eventTimestamp })
 
     const activeReference = state.activeReference == null ? config.referencePrice : state.activeReference;
     const direction = roundedPrice < prevPrice ? "down" : "up";
-    const crossedLevels = findCrossedLevels(config.gridInterval, toCents(activeReference), toCents(prevPrice), toCents(roundedPrice));
+    // ADR-034: a downward move only ever crosses BUY levels (spaced by
+    // gridInterval, the "buy variance"); an upward move only ever crosses
+    // SELL levels (spaced by sellVariance, or gridInterval when sellVariance
+    // isn't set). Direction is fixed for the whole event, so only one
+    // variance is ever relevant per call.
+    const variance = direction === "down" ? config.gridInterval : (config.sellVariance ?? config.gridInterval);
+    const crossedLevels = findCrossedLevels(variance, toCents(activeReference), toCents(prevPrice), toCents(roundedPrice));
 
     let { cash, holdings, avgCost, realizedPnL } = state;
     let lots = state.lots || [];
@@ -429,7 +456,7 @@ function processPriceUpdate({ config: rawConfig, state, price, eventTimestamp })
     // fresh against the (rebasing) active reference, so there is no
     // separate armed/disarmed state to track (see ADR-031).
     crossedLevels.forEach((n) => {
-        const levelPriceValue = levelPriceFromReference(activeReference, config.gridInterval, n);
+        const levelPriceValue = levelPriceFromReference(activeReference, variance, n);
 
         if (direction === "down") {
             const result = applyBuy({ config, cash, holdings, lots, fillPrice: roundedPrice, level: n, levelPriceValue });

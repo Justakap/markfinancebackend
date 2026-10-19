@@ -107,6 +107,8 @@ const {
     listSessions: listGridSessions,
     listTrades: listGridTrades,
     getTradeCounts: getGridTradeCounts,
+    updateSessionConfig: updateGridSessionConfig,
+    deleteSession: deleteGridSession,
     getPortfolioMetrics: getGridPortfolioMetrics,
 } = require("./services/gridSimulatorService");
 const gridSimulatorRealtime = require("./services/gridSimulatorRealtime");
@@ -324,6 +326,8 @@ app.use(
         listSessions: listGridSessions,
         listTrades: listGridTrades,
         getTradeCounts: getGridTradeCounts,
+        updateSessionConfig: updateGridSessionConfig,
+        deleteSession: deleteGridSession,
         getPortfolioMetrics: getGridPortfolioMetrics,
         registerRealtimeSession: gridSimulatorRealtime.registerSession,
         unregisterRealtimeSession: gridSimulatorRealtime.unregisterSession,
