@@ -20,6 +20,7 @@ const {
     processTick,
     listSessions,
     listTrades,
+    getTradeCounts,
     getPortfolioMetrics,
 } = require("../services/gridSimulatorService");
 const { requireAuth } = require("../middleware/auth");
@@ -186,6 +187,7 @@ function makeRouter(models, resolveInstrumentKey = async (symbol, key) => key ||
         processTick,
         listSessions,
         listTrades,
+        getTradeCounts,
         getPortfolioMetrics,
     });
 }

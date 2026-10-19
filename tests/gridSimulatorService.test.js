@@ -18,6 +18,7 @@ const {
     stopSession,
     processTick,
     listTrades,
+    getTradeCounts,
 } = require("../services/gridSimulatorService");
 
 let passed = 0;
@@ -53,6 +54,7 @@ function matchFilter(doc, filter = {}) {
         if (cond !== null && typeof cond === "object" && !(cond instanceof Date) && !(cond instanceof mongoose.Types.ObjectId)) {
             if ("$lte" in cond) return doc[key] != null && new Date(doc[key]).getTime() <= new Date(cond.$lte).getTime();
             if ("$in" in cond) return cond.$in.includes(doc[key]);
+            if ("$gt" in cond) return Number(doc[key]) > Number(cond.$gt);
         }
         if (key === "_id") return String(doc._id) === String(cond);
         if (cond === null) return doc[key] === null || doc[key] === undefined;
@@ -239,6 +241,17 @@ async function makeActiveSession(userId = new mongoose.Types.ObjectId()) {
         const ledgerRows = await listTrades({ GridSimulatorTrade, sessionId: session._id, page: 1, limit: 10 });
         assert.strictEqual(ledgerRows.total, 1);
         assert.strictEqual(ledgerRows.items[0].cashAfter, 1000000 - 100 * 336);
+    });
+
+    await test("getTradeCounts reports buy/sell/skipped/partial counts across the WHOLE ledger, not just one page", async () => {
+        const { GridSimulatorSession, GridSimulatorTrade, session } = await makeActiveSession();
+
+        await processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 336, eventTimestamp: new Date(2026, 0, 1, 9, 15).toISOString() }); // BUY filled
+        await processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 345, eventTimestamp: new Date(2026, 0, 1, 9, 16).toISOString() }); // SELL filled, then SELL skipped
+        await processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 340, eventTimestamp: new Date(2026, 0, 1, 9, 17).toISOString() }); // BUY filled
+
+        const counts = await getTradeCounts({ GridSimulatorTrade, sessionId: session._id });
+        assert.deepStrictEqual(counts, { buyCount: 2, sellCount: 1, skippedCount: 1, partialCount: 0 });
     });
 
         await test("trade ledger sequence numbers never collide across a multi-trade gap event followed by a later event", async () => {

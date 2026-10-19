@@ -106,6 +106,7 @@ const {
     processTick: processGridTick,
     listSessions: listGridSessions,
     listTrades: listGridTrades,
+    getTradeCounts: getGridTradeCounts,
     getPortfolioMetrics: getGridPortfolioMetrics,
 } = require("./services/gridSimulatorService");
 const gridSimulatorRealtime = require("./services/gridSimulatorRealtime");
@@ -322,6 +323,7 @@ app.use(
         processTick: processGridTick,
         listSessions: listGridSessions,
         listTrades: listGridTrades,
+        getTradeCounts: getGridTradeCounts,
         getPortfolioMetrics: getGridPortfolioMetrics,
         registerRealtimeSession: gridSimulatorRealtime.registerSession,
         unregisterRealtimeSession: gridSimulatorRealtime.unregisterSession,

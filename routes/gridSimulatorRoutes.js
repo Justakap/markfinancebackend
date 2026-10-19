@@ -65,7 +65,7 @@ function sessionSummary(session) {
     };
 }
 
-function sessionDetail(session, getPortfolioMetrics) {
+function sessionDetail(session, getPortfolioMetrics, tradeCounts = null) {
     const currentPrice = session.lastFeedPrice ?? session.state.lastPrice ?? null;
     return {
         ...sessionSummary(session),
@@ -76,6 +76,7 @@ function sessionDetail(session, getPortfolioMetrics) {
             sequence: session.state.sequence,
         },
         portfolio: getPortfolioMetrics(session, currentPrice),
+        tradeCounts,
     };
 }
 
@@ -118,6 +119,7 @@ function createGridSimulatorRoutes({
     stopSession,
     listSessions,
     listTrades,
+    getTradeCounts,
     getPortfolioMetrics,
     registerRealtimeSession = () => {},
     unregisterRealtimeSession = () => {},
@@ -282,7 +284,8 @@ function createGridSimulatorRoutes({
     router.get("/v2/grid-simulator/sessions/:sessionId", requireAuth, validateObjectId("sessionId"), async (req, res) => {
         try {
             const session = await getOwnedSession({ GridSimulatorSession, sessionId: req.params.sessionId, userId: req.user.mongoId });
-            return res.json(sessionDetail(session, getPortfolioMetrics));
+            const tradeCounts = await getTradeCounts({ GridSimulatorTrade, sessionId: req.params.sessionId });
+            return res.json(sessionDetail(session, getPortfolioMetrics, tradeCounts));
         } catch (error) {
             return handleError(res, error, "Failed to fetch grid simulator session");
         }

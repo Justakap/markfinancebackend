@@ -287,6 +287,23 @@ async function listTrades({ GridSimulatorTrade, sessionId, page = 1, limit = 50,
     return { items, total, page, limit };
 }
 
+/**
+ * Buy/sell/skip/partial counts across the ENTIRE session's ledger —
+ * computed via countDocuments, never by loading every trade into memory
+ * (a long-running session's ledger can run into the hundreds/thousands).
+ * Mirrors gridBacktestService.js's computeTradeCounts() shape/semantics
+ * exactly, reused here for the live simulator's own trade ledger.
+ */
+async function getTradeCounts({ GridSimulatorTrade, sessionId }) {
+    const [buyCount, sellCount, skippedCount, partialCount] = await Promise.all([
+        GridSimulatorTrade.countDocuments({ sessionId, type: "BUY", qtyFilled: { $gt: 0 } }),
+        GridSimulatorTrade.countDocuments({ sessionId, type: "SELL", qtyFilled: { $gt: 0 } }),
+        GridSimulatorTrade.countDocuments({ sessionId, qtyFilled: 0 }),
+        GridSimulatorTrade.countDocuments({ sessionId, qtyFilled: { $gt: 0 }, qtySkipped: { $gt: 0 } }),
+    ]);
+    return { buyCount, sellCount, skippedCount, partialCount };
+}
+
 function getPortfolioMetrics(session, currentPrice) {
     return computePortfolioMetrics(docStateToPlain(session), currentPrice);
 }
@@ -301,6 +318,7 @@ module.exports = {
     processTick,
     listSessions,
     listTrades,
+    getTradeCounts,
     getPortfolioMetrics,
     docStateToPlain,
     LOCK_DURATION_MS,

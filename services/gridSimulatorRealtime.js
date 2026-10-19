@@ -41,12 +41,22 @@ const marketDataService = require("./marketDataService");
 const { processTick } = require("./gridSimulatorService");
 const { computePortfolioMetrics } = require("./gridSimulatorEngine");
 
-const STALE_THRESHOLD_MS = Number(process.env.GRID_SIMULATOR_STALE_MS || 15_000);
+// 15s was found too tight live: a healthy, continuously-connected feed
+// (zero logged WS disconnects) still produced 3-4 false-positive STALE
+// flips over a 30-40 minute session, because the engine only records a
+// ledger event on an actual grid-level crossing — a genuine brief lull
+// between crossings (well under the 15s threshold in observed gap data,
+// but the RAW tick stream itself can briefly quiet down between price
+// changes) was enough to trip it. 25s keeps a real multi-tens-of-seconds
+// outage caught quickly (detected within one extra watchdog tick) while
+// tolerating a normal brief lull.
+const STALE_THRESHOLD_MS = Number(process.env.GRID_SIMULATOR_STALE_MS || 25_000);
 const WATCHDOG_INTERVAL_MS = Number(process.env.GRID_SIMULATOR_WATCHDOG_MS || 5_000);
 
 const instrumentBySession = new Map(); // sessionId (string) -> instrumentKey
 const sessionsByInstrument = new Map(); // instrumentKey -> Set<sessionId (string)>
 const lastTickAtByInstrument = new Map(); // instrumentKey -> ms epoch of the last tick (any source)
+const staleSessionIds = new Set(); // sessionId (string) currently marked STALE — lets the recovery path log a transition without an extra DB read per tick
 
 let deps = null; // { GridSimulatorSession, GridSimulatorTrade, io }
 let watchdogTimer = null;
@@ -71,6 +81,7 @@ function unregisterSession(sessionId) {
     const instrumentKey = instrumentBySession.get(key);
     if (!instrumentKey) return; // not registered — idempotent
 
+    staleSessionIds.delete(key);
     instrumentBySession.delete(key);
     const set = sessionsByInstrument.get(instrumentKey);
     if (set) {
@@ -158,6 +169,15 @@ async function processSessionTick(sessionId, { price, timestamp, source }) {
     );
     if (!updated) return; // session was deleted/not found — nothing left to push
 
+    // Transition log paired with the watchdog's STALE log above — together
+    // they give an exact, permanent record of every staleness episode's
+    // start and end, so a future occurrence can be diagnosed precisely
+    // (duration, whether it correlates with a logged WS disconnect)
+    // instead of needing a one-off temporary diagnostic.
+    if (staleSessionIds.delete(String(sessionId))) {
+        console.warn(`Grid session ${sessionId} recovered from STALE — a genuine tick arrived.`);
+    }
+
     if (io) {
         io.to(`grid-session:${sessionId}`).emit("gridSimulatorUpdate", buildUpdatePayload(updated, result, source));
     }
@@ -201,6 +221,15 @@ function runStalenessWatchdog() {
                 { new: true },
             )
                 .then((updated) => {
+                    if (updated) {
+                        // Permanent transition log — lets a future staleness
+                        // episode be diagnosed precisely (exact gap duration,
+                        // whether it correlates with a logged WS disconnect)
+                        // instead of needing a one-off temporary diagnostic.
+                        const gapMs = lastTickAt ? nowMs - lastTickAt : null;
+                        console.warn(`Grid session ${sessionId} (${instrumentKey}) marked STALE — no genuine tick for ${gapMs != null ? `${(gapMs / 1000).toFixed(1)}s` : "an unknown duration (no tick ever recorded)"}.`);
+                        staleSessionIds.add(String(sessionId));
+                    }
                     if (updated && deps.io) {
                         deps.io.to(`grid-session:${sessionId}`).emit("gridSimulatorUpdate", {
                             sessionId: String(sessionId),
@@ -267,4 +296,5 @@ module.exports = {
     instrumentBySession,
     lastTickAtByInstrument,
     runStalenessWatchdog,
+    staleSessionIds,
 };

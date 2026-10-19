@@ -339,6 +339,29 @@ function makeFakeIo() {
         const persisted = GridSimulatorSession.docs.get(String(session._id));
         assert.strictEqual(persisted.lastFeedStatus, "STALE");
         assert.strictEqual(persisted.state.holdings, 0, "staleness detection must never itself trigger a trade");
+        assert.ok(realtime.staleSessionIds.has(String(session._id)), "the session must be tracked as stale");
+        realtime.unregisterSession(session._id);
+    });
+
+    await test("a session marked STALE recovers to LIVE (and is un-tracked) the moment a genuine tick arrives", async () => {
+        const session = makeActiveSessionDoc({ lastFeedStatus: "LIVE" });
+        const GridSimulatorSession = makeFakeSessionModel([session]);
+        const GridSimulatorTrade = makeFakeTradeModel();
+        realtime.init({ GridSimulatorSession, GridSimulatorTrade, io: makeFakeIo() });
+        realtime.registerSession(session);
+        realtime.lastTickAtByInstrument.set(session.instrumentKey, Date.now() - (realtime.STALE_THRESHOLD_MS + 5000));
+
+        realtime.runStalenessWatchdog();
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        assert.strictEqual(GridSimulatorSession.docs.get(String(session._id)).lastFeedStatus, "STALE");
+        assert.ok(realtime.staleSessionIds.has(String(session._id)));
+
+        realtime.handleUpstreamTick({ instrumentKey: session.instrumentKey, ltp: 336, timestamp: Date.now() }, "ws");
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        const persisted = GridSimulatorSession.docs.get(String(session._id));
+        assert.strictEqual(persisted.lastFeedStatus, "LIVE");
+        assert.ok(!realtime.staleSessionIds.has(String(session._id)), "recovered sessions must be un-tracked");
         realtime.unregisterSession(session._id);
     });
 
