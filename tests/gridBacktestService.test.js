@@ -206,8 +206,13 @@ test("validateBacktestRequest accepts a valid request", () => {
         assert.strictEqual(result.status, "COMPLETED");
         assert.strictEqual(result.initialReference.price, 320);
         const trades = GridBacktestTrade.docs.filter((t) => String(t.backtestId) === String(result._id));
-        assert.strictEqual(trades.length, 2);
-        assert.strictEqual(result.finalState.holdings, 200);
+        // ADR-031 (trailing/rebasing reference): every leg of this oscillation
+        // trades, since the reference rebases after each crossing — see
+        // gridSimulatorEngine.js's/gridBacktestEngine.test.js's own
+        // equivalent oscillation tests for the full reasoning.
+        assert.strictEqual(trades.length, 4);
+        assert.deepStrictEqual(trades.map((t) => t.type), ["BUY", "BUY", "SELL", "SELL"]);
+        assert.strictEqual(result.finalState.holdings, 0); // bought 2 lots, sold 2 lots
     });
 
     await test("runGridBacktest rejects when no historical data is available", async () => {

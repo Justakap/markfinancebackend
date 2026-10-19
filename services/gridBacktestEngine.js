@@ -77,7 +77,7 @@ function replayCandles({ config, candles, isFinerGrained }) {
 
         subEvents.forEach(({ price, msOffset }) => {
             const eventTimestamp = offsetTimestamp(candle.timestamp, msOffset);
-            const preUpdateState = { cash: state.cash, holdings: state.holdings, avgCost: state.avgCost };
+            const preUpdateState = { cash: state.cash, holdings: state.holdings, lots: state.lots };
             const result = processPriceUpdate({ config, state, price, eventTimestamp });
             state = result.state;
             const annotated = annotateRunningState(result.trades, preUpdateState, config.commissionPct ?? 0);

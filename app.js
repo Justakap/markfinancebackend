@@ -436,6 +436,20 @@ async function startServer() {
     // necessary because that registry itself is process-memory-only (the
     // session's own cash/holdings/trade-ledger state is already durable
     // in Mongo regardless).
+    // Wait for the instrument master to finish loading before resyncing —
+    // upstoxMarketData.init() above only *starts* that load (fire-and-forget,
+    // so other startup steps aren't blocked on a multi-MB download). Without
+    // this await, resyncFromDb()'s pinInstrument() calls would run against
+    // an empty instrument-metadata cache and every resynced session's WS
+    // subscription would silently never be sent — a real bug found live:
+    // a session already ACTIVE before a restart never received another
+    // tick afterward, with zero error anywhere, until this was diagnosed.
+    // loadInstruments() dedupes with the in-flight call from init() above,
+    // so this never triggers a second download.
+    await upstoxMarketData.loadInstruments().catch((error) =>
+        console.error("Instrument master load failed before grid simulator resync — pins may be rejected:", error.message),
+    );
+
     gridSimulatorRealtime.init({ GridSimulatorSession, GridSimulatorTrade, io });
     const resyncedCount = await gridSimulatorRealtime.resyncFromDb({ GridSimulatorSession });
     console.log(`Grid trading simulator real-time processing enabled (paper trading only) — resynced ${resyncedCount} active session(s)`);

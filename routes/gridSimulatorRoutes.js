@@ -71,6 +71,7 @@ function sessionDetail(session, getPortfolioMetrics) {
         ...sessionSummary(session),
         state: {
             lastPrice: session.state.lastPrice,
+            activeReference: session.state.activeReference ?? session.config.referencePrice,
             lastEventTimestamp: session.state.lastEventTimestamp,
             sequence: session.state.sequence,
         },

@@ -5,32 +5,56 @@
  * places a real broker order. Every "fill" is a simulated bookkeeping
  * entry against virtual cash/holdings.
  *
- * Design (see .claude/state/DECISIONS.md ADR-021 for the full writeup):
+ * Design (see .claude/state/DECISIONS.md ADR-021 for the original fixed-
+ * grid design and ADR-031 for the trailing/rebasing redesign below):
  *
- * - A fixed grid is anchored to `config.referencePrice`, spaced every
- *   `config.gridInterval`. Level index `n` (any nonzero integer) has
- *   price `referencePrice + n*gridInterval`. Negative `n` = BUY level
- *   (below reference), positive `n` = SELL level (above reference).
- * - A BUY level triggers only on a DOWNWARD crossing while "armed"; a
- *   SELL level triggers only on an UPWARD crossing while "armed". The
- *   opposite-direction crossing of a level re-arms it (does not trade) —
- *   this is what lets a level participate again in a later oscillation
- *   without producing a duplicate fill from the same one-way move.
+ * - `config.referencePrice` ("Initial Reference") is the immutable anchor
+ *   captured once at session creation — kept forever for audit/display,
+ *   but it does NOT define the tradeable grid levels once trading begins.
+ * - `state.activeReference` ("Active Reference") is the anchor that
+ *   ACTUALLY defines the next tradeable levels: `activeReference +
+ *   n*gridInterval`. It starts equal to `referencePrice` and REBASES to
+ *   the last grid level reached after EVERY crossing — whether that
+ *   crossing's trade filled, partially filled, or was fully skipped for
+ *   insufficient cash/holdings. Example: reference 320, interval 3, price
+ *   moves 320 -> 329 (crossing 323/326/329, all skipped for insufficient
+ *   holdings) -> activeReference becomes 329. A later pullback to 326 is
+ *   now a BUY (326 = 329 - interval), not a dead zone below the original
+ *   323/326/329 sell levels. The lattice itself (every point
+ *   `referencePrice + k*gridInterval` for any integer k) never shifts
+ *   phase — rebasing only changes which lattice point is "zero" for the
+ *   NEXT crossing, so `activeReference` is always itself a lattice point.
+ * - Because the reference always rebases to wherever price last crossed,
+ *   there is no separate "armed/disarmed" concept anymore: every crossing
+ *   is evaluated fresh against the current `activeReference`, and
+ *   direction alone decides the action — a downward crossing is always a
+ *   BUY attempt, an upward crossing is always a SELL attempt (relative to
+ *   whatever the active reference currently is).
  * - One price update (one tick, or one open-after-gap event) can cross
  *   several levels at once (e.g. an overnight gap). Every level crossed
  *   in that single update fills at the SAME actual event price — never
  *   at its own (possibly-skipped) grid price. The triggering grid level
- *   and the simulated fill price are always recorded separately.
+ *   and the simulated fill price are always recorded separately; the
+ *   active reference rebases to the LAST (farthest) level reached in that
+ *   one update, not to the raw observed price.
  * - A buy/sell that can't be filled in full (insufficient cash/holdings)
  *   fills the affordable/available remainder (if >=1 share) or is fully
- *   skipped, and the level is disarmed either way — it does not retry
- *   the unfilled remainder on subsequent ticks while price stays on the
- *   same side. It only becomes eligible again after a genuine opposite-
- *   direction re-arming crossing. This is the deterministic retry policy
- *   the spec requires: no surprise duplicate/repeated purchases.
- * - Cost basis: weighted-average cost on buys; realized P&L computed
- *   against that average cost on sells; average cost resets to 0 only
- *   when holdings return to exactly 0.
+ *   skipped — either way the reference still rebases to that level, so
+ *   the position can be revisited on the very next qualifying move in
+ *   either direction. This is the deterministic policy the spec requires.
+ * - Cost basis: FIFO lot queue (ADR-032). Every filled BUY pushes a
+ *   {qty, price} lot onto the end of `state.lots`. Every filled SELL
+ *   consumes lots from the FRONT of the queue (oldest first) until the
+ *   sold quantity is covered, possibly spanning multiple lots at
+ *   different prices; realized P&L for that sell is the sum, across
+ *   however many lots it consumes, of `consumedQty * (unitProceeds -
+ *   thatLot'sOwnPrice)` — never a single blended average. `state.avgCost`
+ *   is kept as a DERIVED display value only (the weighted average of
+ *   whatever lots currently remain) — it is never itself used to compute
+ *   realized P&L; unrealized P&L (computePortfolioMetrics) legitimately
+ *   uses it since mark-to-market valuation of the remaining position is
+ *   the same number either way lots are represented. avgCost is 0 when
+ *   the lot queue is empty (holdings back to exactly 0).
  * - Optional `commissionPct`/`slippagePct` (same naming/semantics as the
  *   existing backtest/live engines' two-knob cost model — see ADR-019)
  *   default to 0, i.e. fills are exact at the event price unless
@@ -131,8 +155,51 @@ function normalizeConfig(config) {
     };
 }
 
+/** Level price relative to the IMMUTABLE initial reference — used only for
+ *  display/audit (e.g. GridLevelsChart's static lattice lines), never for
+ *  deciding crossings (see levelPriceFromReference for that). */
 function levelPrice(config, n) {
     return roundPrice(config.referencePrice + n * config.gridInterval);
+}
+
+/** Level price relative to an explicit (possibly rebased) reference. */
+function levelPriceFromReference(reference, gridInterval, n) {
+    return roundPrice(reference + n * gridInterval);
+}
+
+/** Weighted-average cost across the current FIFO lot queue — a DISPLAY
+ *  value only (see ADR-032); 0 when the queue is empty. */
+function weightedAvgCost(lots) {
+    const totalQty = lots.reduce((sum, lot) => sum + lot.qty, 0);
+    if (totalQty <= 0) return 0;
+    const totalCost = lots.reduce((sum, lot) => sum + lot.qty * lot.price, 0);
+    return roundPrice(totalCost / totalQty);
+}
+
+/**
+ * Consumes `qty` shares from the FRONT of the FIFO lot queue (oldest lots
+ * first), computing realized P&L per lot at THAT lot's own purchase price
+ * — never a blended average. Returns the remaining lots (after removing/
+ * shrinking consumed ones) and the total realized P&L delta. Assumes
+ * `qty` never exceeds the total quantity held across all lots (the caller
+ * already clamps qty to `holdings` before calling this).
+ */
+function consumeLotsFifo(lots, qty, unitProceeds) {
+    let remaining = qty;
+    let realizedPnLDelta = 0;
+    const newLots = [];
+    let i = 0;
+    for (; i < lots.length && remaining > 0; i += 1) {
+        const lot = lots[i];
+        const consumed = Math.min(lot.qty, remaining);
+        realizedPnLDelta = roundPrice(realizedPnLDelta + consumed * (unitProceeds - lot.price));
+        remaining -= consumed;
+        if (consumed < lot.qty) {
+            newLots.push({ qty: lot.qty - consumed, price: lot.price });
+        }
+    }
+    for (; i < lots.length; i += 1) newLots.push(lots[i]);
+    return { lots: newLots, realizedPnLDelta };
 }
 
 /**
@@ -140,46 +207,41 @@ function levelPrice(config, n) {
  * the initial crossing/dedup watermark directly from the fresh quote
  * captured at session creation — "at session creation, initialize the
  * crossing watermark using the initial reference quote," not left to an
- * implicit null-fallback. `lastPrice` is likewise seeded to the anchor
- * itself (`referencePrice`) rather than null, matching the same intent.
+ * implicit null-fallback. `lastPrice` and `activeReference` are likewise
+ * seeded to the anchor itself (`referencePrice`) rather than null,
+ * matching the same intent.
  */
 function createInitialGridState(config) {
     const normalized = normalizeConfig(config);
+    const lots = normalized.startingHoldings > 0 ? [{ qty: normalized.startingHoldings, price: normalized.startingAvgCost }] : [];
     return {
         cash: normalized.startingCapital,
         holdings: normalized.startingHoldings,
-        avgCost: normalized.startingAvgCost,
+        lots, // FIFO cost-basis queue (ADR-032) — starting inventory seeds one lot
+        avgCost: normalized.startingAvgCost, // derived display value, kept in sync with `lots`
         realizedPnL: 0,
         lastPrice: normalized.referencePrice,
+        activeReference: normalized.referencePrice,
         lastEventTimestamp: config.referenceCapturedAt ? new Date(config.referenceCapturedAt).toISOString() : null,
-        levelArmed: {},
         sequence: 0,
     };
 }
 
 /**
  * Finds every grid level crossed moving from prevPrice to newPrice
- * (inclusive at BOTH ends). Returns level indices in actual traversal
- * order (closest-to-prev first), which matters because cash/holdings
- * constraints are applied sequentially within one event.
- *
- * Inclusive-both-ends is deliberate: if a prior event landed exactly on a
- * level (disarming it), the very next event moving away from it in the
- * OPPOSITE direction must still see that level as "crossed" so it can
- * re-arm — otherwise a price that touches a level exactly and bounces
- * off it could never re-arm. The resulting one-tick overlap at an exact
- * boundary (the same level appearing in two consecutive opposite-
- * direction calls) is harmless: the caller's armed-state check is the
- * only thing that decides whether a trade fires, so a level that is
- * already disarmed and reappears in a same-direction continuation simply
- * does nothing.
+ * (inclusive at BOTH ends), relative to `referenceCents` — the CURRENT
+ * active reference at the start of this event, not necessarily the
+ * immutable initial reference. Returns level offsets (integer steps from
+ * that reference) in actual traversal order (closest-to-prev first),
+ * which matters because cash/holdings constraints are applied
+ * sequentially within one event, and because the reference itself rebases
+ * to the last offset reached.
  */
-function findCrossedLevels(config, prevPriceCents, newPriceCents) {
+function findCrossedLevels(gridInterval, referenceCents, prevPriceCents, newPriceCents) {
     if (prevPriceCents === newPriceCents) return [];
 
     const direction = newPriceCents > prevPriceCents ? "up" : "down";
-    const intervalCents = toCents(config.gridInterval);
-    const referenceCents = toCents(config.referencePrice);
+    const intervalCents = toCents(gridInterval);
 
     const loCents = Math.min(prevPriceCents, newPriceCents);
     const hiCents = Math.max(prevPriceCents, newPriceCents);
@@ -198,11 +260,7 @@ function findCrossedLevels(config, prevPriceCents, newPriceCents) {
     return levels;
 }
 
-function isArmed(levelArmed, n) {
-    return levelArmed[n] !== false;
-}
-
-function applyBuy({ config, cash, holdings, avgCost, fillPrice, level, levelPriceValue }) {
+function applyBuy({ config, cash, holdings, lots, fillPrice, level, levelPriceValue }) {
     const slippageMultiplier = 1 + config.slippagePct / 100;
     const effectivePrice = roundPrice(fillPrice * slippageMultiplier);
     const unitCost = roundPrice(effectivePrice * (1 + config.commissionPct / 100));
@@ -216,7 +274,8 @@ function applyBuy({ config, cash, holdings, avgCost, fillPrice, level, levelPric
         return {
             cash,
             holdings,
-            avgCost,
+            lots,
+            avgCost: weightedAvgCost(lots),
             realizedPnLDelta: 0,
             trade: {
                 type: "BUY",
@@ -234,14 +293,15 @@ function applyBuy({ config, cash, holdings, avgCost, fillPrice, level, levelPric
     }
 
     const cost = roundPrice(qty * unitCost);
+    const newLots = [...lots, { qty, price: unitCost }]; // FIFO: new lot goes to the back of the queue
     const newHoldings = holdings + qty;
-    const newAvgCost = roundPrice((avgCost * holdings + cost) / newHoldings);
     const newCash = roundPrice(cash - cost);
 
     return {
         cash: newCash,
         holdings: newHoldings,
-        avgCost: newAvgCost,
+        lots: newLots,
+        avgCost: weightedAvgCost(newLots),
         realizedPnLDelta: 0,
         trade: {
             type: "BUY",
@@ -258,7 +318,7 @@ function applyBuy({ config, cash, holdings, avgCost, fillPrice, level, levelPric
     };
 }
 
-function applySell({ config, cash, holdings, avgCost, realizedPnL, fillPrice, level, levelPriceValue }) {
+function applySell({ config, cash, holdings, lots, realizedPnL, fillPrice, level, levelPriceValue }) {
     const slippageMultiplier = 1 - config.slippagePct / 100;
     const effectivePrice = roundPrice(fillPrice * slippageMultiplier);
     const unitProceeds = roundPrice(effectivePrice * (1 - config.commissionPct / 100));
@@ -270,7 +330,8 @@ function applySell({ config, cash, holdings, avgCost, realizedPnL, fillPrice, le
         return {
             cash,
             holdings,
-            avgCost,
+            lots,
+            avgCost: weightedAvgCost(lots),
             realizedPnL,
             trade: {
                 type: "SELL",
@@ -288,16 +349,18 @@ function applySell({ config, cash, holdings, avgCost, realizedPnL, fillPrice, le
     }
 
     const proceeds = roundPrice(qty * unitProceeds);
-    const realizedPnLDelta = roundPrice(qty * (unitProceeds - avgCost));
+    // FIFO (ADR-032): consume the OLDEST lots first, each at its own
+    // original purchase price — never a single blended average.
+    const { lots: newLots, realizedPnLDelta } = consumeLotsFifo(lots, qty, unitProceeds);
     const newHoldings = holdings - qty;
     const newCash = roundPrice(cash + proceeds);
-    const newAvgCost = newHoldings === 0 ? 0 : avgCost;
     const newRealizedPnL = roundPrice(realizedPnL + realizedPnLDelta);
 
     return {
         cash: newCash,
         holdings: newHoldings,
-        avgCost: newAvgCost,
+        lots: newLots,
+        avgCost: weightedAvgCost(newLots),
         realizedPnL: newRealizedPnL,
         trade: {
             type: "SELL",
@@ -353,52 +416,52 @@ function processPriceUpdate({ config: rawConfig, state, price, eventTimestamp })
         };
     }
 
+    const activeReference = state.activeReference == null ? config.referencePrice : state.activeReference;
     const direction = roundedPrice < prevPrice ? "down" : "up";
-    const crossedLevels = findCrossedLevels(config, toCents(prevPrice), toCents(roundedPrice));
+    const crossedLevels = findCrossedLevels(config.gridInterval, toCents(activeReference), toCents(prevPrice), toCents(roundedPrice));
 
     let { cash, holdings, avgCost, realizedPnL } = state;
-    const levelArmed = { ...state.levelArmed };
+    let lots = state.lots || [];
+    let newActiveReference = activeReference;
     const trades = [];
 
+    // Direction alone decides the action now — every crossing is evaluated
+    // fresh against the (rebasing) active reference, so there is no
+    // separate armed/disarmed state to track (see ADR-031).
     crossedLevels.forEach((n) => {
-        const levelPriceValue = levelPrice(config, n);
-        const isBuyLevel = n < 0;
-        const isSellLevel = n > 0;
+        const levelPriceValue = levelPriceFromReference(activeReference, config.gridInterval, n);
 
         if (direction === "down") {
-            if (isBuyLevel && isArmed(levelArmed, n)) {
-                const result = applyBuy({ config, cash, holdings, avgCost, fillPrice: roundedPrice, level: n, levelPriceValue });
-                cash = result.cash;
-                holdings = result.holdings;
-                avgCost = result.avgCost;
-                levelArmed[n] = false;
-                trades.push(result.trade);
-            } else if (isSellLevel) {
-                levelArmed[n] = true;
-            }
+            const result = applyBuy({ config, cash, holdings, lots, fillPrice: roundedPrice, level: n, levelPriceValue });
+            cash = result.cash;
+            holdings = result.holdings;
+            lots = result.lots;
+            avgCost = result.avgCost;
+            trades.push(result.trade);
         } else {
-            if (isSellLevel && isArmed(levelArmed, n)) {
-                const result = applySell({ config, cash, holdings, avgCost, realizedPnL, fillPrice: roundedPrice, level: n, levelPriceValue });
-                cash = result.cash;
-                holdings = result.holdings;
-                avgCost = result.avgCost;
-                realizedPnL = result.realizedPnL;
-                levelArmed[n] = false;
-                trades.push(result.trade);
-            } else if (isBuyLevel) {
-                levelArmed[n] = true;
-            }
+            const result = applySell({ config, cash, holdings, lots, realizedPnL, fillPrice: roundedPrice, level: n, levelPriceValue });
+            cash = result.cash;
+            holdings = result.holdings;
+            lots = result.lots;
+            avgCost = result.avgCost;
+            realizedPnL = result.realizedPnL;
+            trades.push(result.trade);
         }
+
+        // Rebase to the last (farthest) level reached — whether that
+        // level's trade filled, partially filled, or was fully skipped.
+        newActiveReference = levelPriceValue;
     });
 
     const newState = {
         cash,
         holdings,
+        lots,
         avgCost,
         realizedPnL,
         lastPrice: roundedPrice,
+        activeReference: newActiveReference,
         lastEventTimestamp: eventTimestamp,
-        levelArmed,
         sequence: state.sequence + 1,
     };
 
@@ -411,34 +474,36 @@ function processPriceUpdate({ config: rawConfig, state, price, eventTimestamp })
  * running cash/holdings/avgCost snapshot for the ledger — using only each
  * trade's own recorded fields (qtyFilled/effectivePrice/type) plus the
  * session's commissionPct, the exact same arithmetic applyBuy/applySell
- * already used internally. This never re-decides anything
- * (quantities/prices are already final) — it only reconstructs the audit
- * trail the pure engine's return value doesn't carry per-trade. Shared by
- * both the live simulator (gridSimulatorService.js) and the historical
- * replay engine (gridBacktestEngine.js) so the ledger's running-balance
- * math is never duplicated.
+ * already used internally (including the FIFO lot queue, ADR-032, so
+ * avgCostAfter reflects the real remaining lots, not a re-blended
+ * average). This never re-decides anything (quantities/prices, and for a
+ * SELL its realizedPnLDelta, are already final/trusted from the trade
+ * itself) — it only reconstructs the audit trail the pure engine's return
+ * value doesn't carry per-trade. Shared by both the live simulator
+ * (gridSimulatorService.js) and the historical replay engine
+ * (gridBacktestEngine.js) so the ledger's running-balance math is never
+ * duplicated.
  */
 function annotateRunningState(trades, startState, commissionPct) {
     let cash = startState.cash;
     let holdings = startState.holdings;
-    let avgCost = startState.avgCost;
+    let lots = startState.lots || [];
 
     return trades.map((trade) => {
         if (trade.type === "BUY" && trade.qtyFilled > 0) {
             const unitCost = roundPrice(trade.effectivePrice * (1 + commissionPct / 100));
             const cost = roundPrice(trade.qtyFilled * unitCost);
-            const newHoldings = holdings + trade.qtyFilled;
-            avgCost = roundPrice((avgCost * holdings + cost) / newHoldings);
-            holdings = newHoldings;
+            lots = [...lots, { qty: trade.qtyFilled, price: unitCost }];
+            holdings += trade.qtyFilled;
             cash = roundPrice(cash - cost);
         } else if (trade.type === "SELL" && trade.qtyFilled > 0) {
             const unitProceeds = roundPrice(trade.effectivePrice * (1 - commissionPct / 100));
             const proceeds = roundPrice(trade.qtyFilled * unitProceeds);
+            lots = consumeLotsFifo(lots, trade.qtyFilled, unitProceeds).lots;
             holdings -= trade.qtyFilled;
             cash = roundPrice(cash + proceeds);
-            if (holdings === 0) avgCost = 0;
         }
-        return { ...trade, cashAfter: cash, holdingsAfter: holdings, avgCostAfter: avgCost };
+        return { ...trade, cashAfter: cash, holdingsAfter: holdings, avgCostAfter: weightedAvgCost(lots) };
     });
 }
 
@@ -466,6 +531,9 @@ module.exports = {
     validateGridConfig,
     normalizeConfig,
     levelPrice,
+    levelPriceFromReference,
+    weightedAvgCost,
+    consumeLotsFifo,
     createInitialGridState,
     findCrossedLevels,
     processPriceUpdate,

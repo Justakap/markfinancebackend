@@ -192,6 +192,38 @@ const CONFIG = {
         realtime.unregisterSession(session._id);
     });
 
+    await test("ADR-031: REST and Socket.IO agree on the rebased activeReference after the user's reported 320->329->326 scenario", async () => {
+        const GridSimulatorSession = makeFakeSessionModel();
+        const GridSimulatorTrade = makeFakeTradeModel();
+        const io = makeFakeIo();
+        const userId = new mongoose.Types.ObjectId();
+        const rebaseConfig = { ...CONFIG, referencePrice: 320 };
+
+        const session = await createSession({ GridSimulatorSession, userId, instrumentKey: "NSE_EQ|GICRE", symbol: "GICRE", config: rebaseConfig });
+        await startSession({ GridSimulatorSession, sessionId: session._id, userId });
+
+        realtime.init({ GridSimulatorSession, GridSimulatorTrade, io });
+        realtime.registerSession({ _id: session._id, instrumentKey: "NSE_EQ|GICRE" });
+
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 329, timestamp: Date.now() }, "ws"); // 3 skipped sells, rebase -> 329
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 326, timestamp: Date.now() }, "ws"); // pullback -> genuine BUY
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        const lastPush = io.emitted.filter((e) => e.event === "gridSimulatorUpdate").pop().payload;
+        const restSession = await getOwnedSession({ GridSimulatorSession, sessionId: session._id, userId });
+
+        assert.strictEqual(restSession.state.activeReference, 326);
+        assert.strictEqual(lastPush.state.activeReference, restSession.state.activeReference);
+        assert.strictEqual(restSession.state.holdings, 100);
+
+        const trades = GridSimulatorTrade.docs;
+        assert.strictEqual(trades.length, 4); // 3 skipped sells + 1 buy
+        assert.strictEqual(trades.filter((t) => t.type === "BUY" && t.qtyFilled > 0).length, 1);
+
+        realtime.unregisterSession(session._id);
+    });
+
     console.log(`\nGrid simulator cross-path consistency tests: ${passed} passed, ${failed} failed`);
     process.exit(failed ? 1 : 0);
 })();

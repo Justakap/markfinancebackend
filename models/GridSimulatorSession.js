@@ -53,10 +53,27 @@ const gridSimulatorSessionSchema = new mongoose.Schema(
         state: {
             cash: { type: Number, required: true },
             holdings: { type: Number, required: true, default: 0 },
+            // ADR-032: the FIFO cost-basis lot queue — every filled BUY
+            // pushes {qty, price} to the back; every filled SELL consumes
+            // from the front (oldest first). `avgCost` below is a DERIVED
+            // display value (weighted average across these lots), never
+            // itself the source of realized P&L.
+            lots: { type: [{ qty: Number, price: Number, _id: false }], default: () => [] },
             avgCost: { type: Number, required: true, default: 0 },
             realizedPnL: { type: Number, required: true, default: 0 },
             lastPrice: { type: Number, default: null },
+            // ADR-031: the trailing/rebasing anchor that defines the NEXT
+            // tradeable levels (activeReference + n*gridInterval) — starts
+            // equal to config.referencePrice and rebases to the last grid
+            // level reached after every crossing (filled, partial, or
+            // skipped). Distinct from config.referencePrice, which stays
+            // immutable forever for audit/display.
+            activeReference: { type: Number, default: null },
             lastEventTimestamp: { type: Date, default: null },
+            // Deprecated (ADR-031): the old fixed-grid design's per-level
+            // armed/disarmed map. No longer read or written by the engine —
+            // kept only so an already-persisted pre-ADR-031 session document
+            // still validates/loads without a schema error.
             levelArmed: { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
             sequence: { type: Number, default: 0 },
             // Total trade-ledger rows ever written for this session —

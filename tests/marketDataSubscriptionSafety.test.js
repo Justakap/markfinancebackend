@@ -31,6 +31,7 @@ const {
     handleTick,
     broadcastLivePrices,
     primeInstrumentsCacheForTests,
+    getFeedModeForInstrumentKey,
 } = marketDataService;
 
 // Makes subscribe()'s internal applySubscription() run synchronously
@@ -197,6 +198,44 @@ test('the real REST-fallback broadcast (broadcastLivePrices) fires only "fallbac
         tickEmitter.off("tick", onTick);
         tickEmitter.off("fallbackTick", onFallback);
     }
+});
+
+// --- WS feed-mode resolution per instrument segment/type ---
+//
+// Real bug found live: an MCX commodity futures contract (Crude Oil,
+// segment "MCX_FO", instrumentType "FUT") was being resolved to the
+// "full_d5" depth mode via the generic FUT-type branch. Upstox silently
+// ACCEPTS that subscription (no error) but never actually streams a
+// single tick for it over the WS feed — confirmed by comparing against a
+// REST LTP call for the exact same instrument_key in the same moment,
+// which returned real, current data. "full_d5"/"full_d30" depth modes
+// are an NSE equity-derivative-specific capability; MCX only works over
+// WS at "ltpc". The MCX segment check must run BEFORE the generic
+// FUT/FO-type checks below it.
+
+test("MCX commodity futures resolve to ltpc, not the NSE-derivative full_d5 mode", () => {
+    instrumentMeta.set("MCX_FO|573422", { instrumentType: "FUT", segment: "MCX_FO", symbol: "CRUDEOIL26NOVFUT" });
+    assert.strictEqual(getFeedModeForInstrumentKey("MCX_FO|573422"), "ltpc");
+});
+
+test("an NSE F&O futures contract still resolves to full_d5 (unchanged, not broadened by the MCX fix)", () => {
+    instrumentMeta.set("NSE_FO|TESTFUT1", { instrumentType: "FUT", segment: "NSE_FO", symbol: "TESTFUT1" });
+    assert.strictEqual(getFeedModeForInstrumentKey("NSE_FO|TESTFUT1"), "full_d5");
+});
+
+test("an option contract (any segment) still resolves to option_greeks, unaffected by the MCX check", () => {
+    instrumentMeta.set("NSE_FO|TESTOPT1", { instrumentType: "CE", segment: "NSE_FO", symbol: "TESTOPT1" });
+    assert.strictEqual(getFeedModeForInstrumentKey("NSE_FO|TESTOPT1"), "option_greeks");
+
+    instrumentMeta.set("MCX_FO|TESTOPT2", { instrumentType: "CE", segment: "MCX_FO", symbol: "TESTOPT2" });
+    // MCX segment check runs first and wins — MCX options also use ltpc
+    // over this feed, consistent with the futures finding above.
+    assert.strictEqual(getFeedModeForInstrumentKey("MCX_FO|TESTOPT2"), "ltpc");
+});
+
+test("a plain NSE equity still resolves to the default ltpc mode", () => {
+    instrumentMeta.set("NSE_EQ|TESTEQ1", { instrumentType: "EQ", segment: "NSE_EQ", symbol: "TESTEQ1" });
+    assert.strictEqual(getFeedModeForInstrumentKey("NSE_EQ|TESTEQ1"), "ltpc");
 });
 
 console.log(`\nmarketDataService subscription-safety tests: ${passed} passed, ${failed} failed`);

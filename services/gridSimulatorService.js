@@ -138,11 +138,25 @@ function docStateToPlain(doc) {
     return {
         cash: s.cash,
         holdings: s.holdings,
+        // ADR-032: FIFO lot queue. A session persisted before this field
+        // existed has no `lots` at all — fall back to an empty queue (its
+        // next SELL will have nothing to consume from, matching the
+        // already-correct "no holdings to sell" skip path; such a legacy
+        // session's holdings should already be 0 in practice since the old
+        // weighted-average model never left a position without a cost
+        // basis). `.toObject()` handles a real Mongoose DocumentArray.
+        lots: Array.isArray(s.lots) ? s.lots.map((lot) => ({ qty: lot.qty, price: lot.price })) : typeof s.lots?.toObject === "function" ? s.lots.toObject() : [],
         avgCost: s.avgCost,
         realizedPnL: s.realizedPnL,
         lastPrice: s.lastPrice ?? null,
+        // ADR-031: the trailing/rebasing anchor that actually defines the
+        // next tradeable levels — distinct from the immutable
+        // config.referencePrice. Falls back to null only for a session
+        // persisted before this field existed; processPriceUpdate treats a
+        // null activeReference the same as an unset one (uses
+        // config.referencePrice), so an old session resumes safely.
+        activeReference: s.activeReference ?? null,
         lastEventTimestamp: s.lastEventTimestamp ?? null,
-        levelArmed: s.levelArmed && typeof s.levelArmed.toObject === "function" ? s.levelArmed.toObject() : { ...(s.levelArmed || {}) },
         sequence: s.sequence || 0,
         tradeSequence: s.tradeSequence || 0,
     };
@@ -152,11 +166,12 @@ function stateToDocFields(state) {
     return {
         "state.cash": state.cash,
         "state.holdings": state.holdings,
+        "state.lots": state.lots,
         "state.avgCost": state.avgCost,
         "state.realizedPnL": state.realizedPnL,
         "state.lastPrice": state.lastPrice,
+        "state.activeReference": state.activeReference,
         "state.lastEventTimestamp": state.lastEventTimestamp,
-        "state.levelArmed": state.levelArmed,
         "state.sequence": state.sequence,
     };
 }

@@ -248,18 +248,18 @@ function makeFakeIo() {
         realtime.unregisterSession(session._id);
     });
 
-    await test("6. existing gap-fill/re-arming/cash/holdings/P&L rules are unchanged under real-time delivery", async () => {
+    await test("6. existing gap-fill/rebasing/cash/holdings/P&L rules are unchanged under real-time delivery", async () => {
         const session = makeActiveSessionDoc();
         const GridSimulatorSession = makeFakeSessionModel([session]);
         const GridSimulatorTrade = makeFakeTradeModel();
         realtime.init({ GridSimulatorSession, GridSimulatorTrade, io: makeFakeIo() });
         realtime.registerSession(session);
 
-        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 336, timestamp: Date.now() }, "ws"); // buy @337
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 336, timestamp: Date.now() }, "ws"); // buy @337, rebase -> 337
         await new Promise((resolve) => setTimeout(resolve, 15));
-        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 338, timestamp: Date.now() }, "ws"); // re-arm 337
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 338, timestamp: Date.now() }, "ws"); // within the 337 band, no new level crossed
         await new Promise((resolve) => setTimeout(resolve, 15));
-        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 345, timestamp: Date.now() }, "ws"); // sell @343
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 345, timestamp: Date.now() }, "ws"); // crosses 340 (sells the 100 held) then 343 (skipped, nothing left)
         await new Promise((resolve) => setTimeout(resolve, 15));
 
         const persisted = GridSimulatorSession.docs.get(String(session._id));
@@ -475,22 +475,25 @@ function makeFakeIo() {
         realtime.unregisterSession(session._id);
     });
 
-    await test("C. after a skipped SELL, a later genuine re-arming crossing and reversal are processed normally", async () => {
+    await test("C. after a skipped SELL rebases the reference, a later genuine crossing in either direction is processed normally (ADR-031)", async () => {
         const session = makeActiveSessionDoc();
         const GridSimulatorSession = makeFakeSessionModel([session]);
         const GridSimulatorTrade = makeFakeTradeModel();
         realtime.init({ GridSimulatorSession, GridSimulatorTrade, io: makeFakeIo() });
         realtime.registerSession(session);
 
-        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 343, timestamp: Date.now() }, "ws"); // skipped SELL @343, disarm
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 343, timestamp: Date.now() }, "ws"); // skipped SELL @343, rebase -> 343
         await new Promise((resolve) => setTimeout(resolve, 15));
-        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 342, timestamp: Date.now() }, "ws"); // genuine down-cross through 343 -> re-arm
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 340, timestamp: Date.now() }, "ws"); // down-cross through the rebased reference's next level -> BUY
         await new Promise((resolve) => setTimeout(resolve, 15));
-        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 344, timestamp: Date.now() }, "ws"); // genuine up-cross again -> fires SELL again (legitimately)
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 343, timestamp: Date.now() }, "ws"); // up-cross again -> SELL (now has holdings to sell)
         await new Promise((resolve) => setTimeout(resolve, 15));
 
-        assert.strictEqual(GridSimulatorTrade.docs.length, 2, "a genuine re-arm + re-cross legitimately produces a second SELL attempt");
-        assert.ok(GridSimulatorTrade.docs.every((t) => t.type === "SELL"));
+        assert.strictEqual(GridSimulatorTrade.docs.length, 3);
+        assert.deepStrictEqual(GridSimulatorTrade.docs.map((t) => t.type), ["SELL", "BUY", "SELL"]);
+        assert.strictEqual(GridSimulatorTrade.docs[0].qtyFilled, 0); // skipped, insufficient holdings
+        assert.strictEqual(GridSimulatorTrade.docs[1].qtyFilled, 100);
+        assert.strictEqual(GridSimulatorTrade.docs[2].qtyFilled, 100);
         realtime.unregisterSession(session._id);
     });
 

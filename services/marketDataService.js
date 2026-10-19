@@ -446,6 +446,20 @@ function getFeedModeForInstrumentKey(instrumentKey) {
     const type = String(meta.instrumentType || meta.type || "").toUpperCase();
     const segment = String(meta.segment || "").toUpperCase();
 
+    // MCX commodity derivatives (segment "MCX_FO") must be checked BEFORE
+    // the generic FUT/FO branches below. Confirmed live: subscribing an MCX
+    // futures contract (e.g. a Crude Oil future) at "full_d5" is silently
+    // accepted by Upstox (no error, no rejection) but never actually
+    // streams any tick over the WS connection — REST LTP for the exact
+    // same instrument_key returns real, current data in the same moment,
+    // which rules out an account/segment-permission or instrument-key
+    // problem. "full_d5"/"full_d30" depth modes appear to be an NSE
+    // equity-derivative-specific capability that MCX does not support over
+    // this feed; "ltpc" is the mode that actually works for MCX.
+    if (segment.includes("MCX")) {
+        return process.env.UPSTOX_COMMODITY_FEED_MODE || "ltpc";
+    }
+
     if (
         type.includes("OPT") ||
         type === "CE" ||
@@ -768,6 +782,7 @@ async function refreshIndicatorsForKey(instrumentKey) {
 
 function handleTick(tick) {
     if (!tick?.instrumentKey) return;
+    if (process.env.DEBUG_TICKS === "true") console.log(`[tick] ${tick.instrumentKey} ltp=${tick.ltp}`);
 
     const previous = liveData.get(tick.instrumentKey) || {};
     const next = {
@@ -1519,7 +1534,16 @@ function subscribe(instrumentKeys = []) {
  * pin (and any watchlist subscription) is gone.
  */
 function pinInstrument(instrumentKey) {
-    if (!instrumentKey || !isValidInstrumentKey(instrumentKey)) return;
+    if (!instrumentKey) return;
+    if (!isValidInstrumentKey(instrumentKey)) {
+        // Never fail silently: a pin against an unrecognized instrument key
+        // (e.g. a key that isn't present in the currently-loaded instrument
+        // master, or a format mismatch) would otherwise leave the caller
+        // (a grid simulator session, say) permanently stuck with a stale
+        // feed and zero diagnostic trail.
+        console.warn(`pinInstrument: "${instrumentKey}" is not a recognized/loaded instrument key — no WS subscription was sent.`);
+        return;
+    }
 
     const current = pinnedInstrumentRefCounts.get(instrumentKey) || 0;
     pinnedInstrumentRefCounts.set(instrumentKey, current + 1);
@@ -1635,6 +1659,12 @@ module.exports = {
     // other.
     pinInstrument,
     unpinInstrument,
+    // Exposed for direct unit testing of WS feed-mode resolution per
+    // instrument segment/type (found a real bug here: MCX commodity
+    // futures were resolved to "full_d5", which Upstox silently never
+    // streams for that segment, even though the subscription is accepted
+    // and REST LTP for the same key works fine).
+    getFeedModeForInstrumentKey,
     // Genuine-WebSocket-tick-only event stream (see the tickEmitter doc
     // comment above) — never fired for REST-fallback data.
     tickEmitter,

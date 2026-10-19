@@ -109,6 +109,7 @@ function buildUpdatePayload(sessionDoc, result, source) {
         source,
         state: {
             lastPrice: result.state?.lastPrice ?? sessionDoc.state?.lastPrice ?? null,
+            activeReference: result.state?.activeReference ?? sessionDoc.state?.activeReference ?? sessionDoc.config?.referencePrice ?? null,
             lastEventTimestamp: result.state?.lastEventTimestamp ?? sessionDoc.state?.lastEventTimestamp ?? null,
             sequence: result.state?.sequence ?? sessionDoc.state?.sequence ?? 0,
         },

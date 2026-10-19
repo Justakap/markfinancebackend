@@ -73,7 +73,7 @@ test("findInitialReferenceCandle returns null when no valid candle exists", () =
 
 // --- finer-grained replay: exact task-spec oscillations (one engine event per candle close) ---
 
-test("finer-grained replay: 320 -> 317 -> 314 -> 317 -> 320 produces two buys, correct re-arm, no spurious reversal trades", () => {
+test("ADR-031 finer-grained replay: 320 -> 317 -> 314 -> 317 -> 320 rebases with every crossing, ending flat with profit", () => {
     const candles = [
         candle(1, { open: 320, high: 320, low: 317, close: 317 }),
         candle(2, { open: 317, high: 317, low: 314, close: 314 }),
@@ -82,16 +82,21 @@ test("finer-grained replay: 320 -> 317 -> 314 -> 317 -> 320 produces two buys, c
     ];
     const result = replayCandles({ config: BASE_CONFIG, candles, isFinerGrained: true });
 
-    assert.strictEqual(result.trades.length, 2);
-    assert.strictEqual(result.trades[0].type, "BUY");
+    // Every leg trades under the trailing/rebasing reference (ADR-031,
+    // backend/.claude/state/DECISIONS.md) — the same engine the live
+    // simulator uses, reused here unchanged.
+    assert.strictEqual(result.trades.length, 4);
+    assert.deepStrictEqual(result.trades.map((t) => t.type), ["BUY", "BUY", "SELL", "SELL"]);
     assert.strictEqual(result.trades[0].levelPrice, 317);
     assert.strictEqual(result.trades[0].assumedIntrabar, false);
     assert.strictEqual(result.trades[1].levelPrice, 314);
-    assert.strictEqual(result.state.holdings, 200);
+    assert.strictEqual(result.trades[2].levelPrice, 317);
+    assert.strictEqual(result.trades[3].levelPrice, 320);
+    assert.strictEqual(result.state.holdings, 0); // bought 2 lots, sold 2 lots
     assert.strictEqual(result.equitySeries.length, 4);
 });
 
-test("finer-grained replay: 320 -> 323 -> 326 -> 323 with zero starting holdings skips both sells, no negative holdings", () => {
+test("ADR-031 finer-grained replay: 320 -> 323 -> 326 -> 323 with zero starting holdings skips both sells, rebases, then the reversal is a genuine BUY", () => {
     const candles = [
         candle(1, { open: 320, high: 323, low: 320, close: 323 }),
         candle(2, { open: 323, high: 326, low: 323, close: 326 }),
@@ -99,13 +104,17 @@ test("finer-grained replay: 320 -> 323 -> 326 -> 323 with zero starting holdings
     ];
     const result = replayCandles({ config: BASE_CONFIG, candles, isFinerGrained: true });
 
-    assert.strictEqual(result.trades.length, 2);
-    result.trades.forEach((t) => {
-        assert.strictEqual(t.type, "SELL");
-        assert.strictEqual(t.qtyFilled, 0);
-        assert.strictEqual(t.reason, "insufficient_holdings");
-    });
-    assert.strictEqual(result.state.holdings, 0);
+    assert.strictEqual(result.trades.length, 3);
+    assert.strictEqual(result.trades[0].type, "SELL");
+    assert.strictEqual(result.trades[0].qtyFilled, 0);
+    assert.strictEqual(result.trades[0].reason, "insufficient_holdings");
+    assert.strictEqual(result.trades[1].type, "SELL");
+    assert.strictEqual(result.trades[1].qtyFilled, 0);
+    // The reversal down through the rebased 326 reference's next level
+    // (323) is now a genuine BUY, not a dead "re-arm only" zone.
+    assert.strictEqual(result.trades[2].type, "BUY");
+    assert.strictEqual(result.trades[2].qtyFilled, 100);
+    assert.strictEqual(result.state.holdings, 100);
     assert.ok(result.state.holdings >= 0);
 });
 
@@ -132,16 +141,20 @@ test("buildConservativeSubEvents visits Open, Low, High, Close in that fixed ord
 });
 
 test("the conservative fallback produces trades flagged assumedIntrabar:true, with the real candle timestamp preserved separately", () => {
-    // Open->Low->High->Close = 320 -> 317 -> 320 -> 320: crosses 317 down
-    // (BUY, trigger), then back up through 317 (re-arm, no trade), then
-    // stays at 320 (no-op) — exactly one trade.
+    // Open->Low->High->Close = 320 -> 317 -> 320 -> 320. Under ADR-031's
+    // rebasing reference: 320->317 crosses 317 (BUY, rebase -> 317), then
+    // 317->320 crosses 320 (SELL, since 320 is no longer excluded once the
+    // reference has moved off it) — two trades, not one.
     const candles = [candle(1, { open: 320, high: 320, low: 317, close: 320 })];
     const result = replayCandles({ config: BASE_CONFIG, candles, isFinerGrained: false });
 
-    assert.strictEqual(result.trades.length, 1);
-    assert.strictEqual(result.trades[0].assumedIntrabar, true);
-    assert.strictEqual(result.trades[0].candleTimestamp, candles[0].timestamp);
-    assert.notStrictEqual(result.trades[0].eventTimestamp, candles[0].timestamp, "the synthetic sub-event timestamp must differ from the real candle timestamp");
+    assert.strictEqual(result.trades.length, 2);
+    assert.deepStrictEqual(result.trades.map((t) => t.type), ["BUY", "SELL"]);
+    result.trades.forEach((trade) => {
+        assert.strictEqual(trade.assumedIntrabar, true);
+        assert.strictEqual(trade.candleTimestamp, candles[0].timestamp);
+        assert.notStrictEqual(trade.eventTimestamp, candles[0].timestamp, "the synthetic sub-event timestamp must differ from the real candle timestamp");
+    });
 });
 
 test("a single ambiguous candle crossing levels in BOTH directions is resolved deterministically via the fixed O-L-H-C order, never 'best outcome'", () => {
@@ -150,14 +163,18 @@ test("a single ambiguous candle crossing levels in BOTH directions is resolved d
     const candles = [candle(1, { open: 320, high: 323, low: 317, close: 320 })];
     const result = replayCandles({ config: BASE_CONFIG, candles, isFinerGrained: false });
 
-    // Fixed order Open(320)->Low(317)->High(323)->Close(320):
-    // 320->317 crosses 317 (BUY, armed) -> trade.
-    // 317->323 crosses 317(rearm, up through a buy level) then 323 (SELL) -> trade.
-    // 323->320 crosses 323 downward (rearm) only, no trade.
+    // Fixed order Open(320)->Low(317)->High(323)->Close(320), reference
+    // rebasing with each crossing (ADR-031):
+    // 320->317 crosses 317 (BUY) -> rebase to 317.
+    // 317->323 crosses 320 (SELL, fills the 100 held) then 323 (SELL,
+    //   skipped — nothing left) -> rebase to 323.
+    // 323->320 crosses 320 (BUY, cash available again) -> rebase to 320.
     const types = result.trades.map((t) => t.type);
-    assert.deepStrictEqual(types, ["BUY", "SELL"]);
+    assert.deepStrictEqual(types, ["BUY", "SELL", "SELL", "BUY"]);
     assert.strictEqual(result.trades[0].levelPrice, 317);
-    assert.strictEqual(result.trades[1].levelPrice, 323);
+    assert.strictEqual(result.trades[1].levelPrice, 320);
+    assert.strictEqual(result.trades[2].levelPrice, 323);
+    assert.strictEqual(result.trades[3].levelPrice, 320);
     result.trades.forEach((t) => assert.strictEqual(t.assumedIntrabar, true));
 });
 
