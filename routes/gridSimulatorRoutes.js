@@ -27,10 +27,13 @@ async function captureFreshReference(marketDataService, instrumentKey) {
  * Grid Trading Simulator — PAPER TRADING ONLY. Authenticated API for
  * configuring, running, and inspecting a simulated grid-trading session.
  * Nothing in this file (or anything it calls) places a real broker order —
- * "start"/"resume" only ever resume simulated evaluation, now driven by
- * genuine Upstox WebSocket ticks (services/gridSimulatorRealtime.js) plus
- * this route's own frontend-pushed tick endpoint, both funneling into
- * services/gridSimulatorService.processTick (ADR-022).
+ * "start"/"resume" only ever resume simulated evaluation, driven entirely
+ * by genuine Upstox WebSocket ticks (services/gridSimulatorRealtime.js),
+ * which funnels into services/gridSimulatorService.processTick (ADR-022).
+ *
+ * This route's `/tick` endpoint is display-only (ADR-028) — a client-
+ * relayed price is NEVER fed into the authoritative crossing engine. See
+ * that route's own doc comment for why.
  *
  * Own `/v2/grid-simulator` prefix — distinct from `/v2/strategies`,
  * `/v2/backtest`, `/v2/live`, `/v2/alert-configurations` (same
@@ -112,7 +115,6 @@ function createGridSimulatorRoutes({
     pauseSession,
     resumeSession,
     stopSession,
-    processTick,
     listSessions,
     listTrades,
     getPortfolioMetrics,
@@ -220,33 +222,46 @@ function createGridSimulatorRoutes({
     router.post("/v2/grid-simulator/sessions/:sessionId/resume", requireAuth, validateObjectId("sessionId"), makeTransitionHandler(resumeSession, { afterActivate: true }));
     router.post("/v2/grid-simulator/sessions/:sessionId/stop", requireAuth, validateObjectId("sessionId"), makeTransitionHandler(stopSession, { afterDeactivate: true }));
 
-    // Frontend-pushed tick: an optional, lower-latency accelerant on top of
-    // the real authoritative path — genuine Upstox WebSocket ticks routed
-    // through services/gridSimulatorRealtime.js, which keeps the session
-    // progressing even with no browser tab open at all. Both paths funnel
-    // into the exact same idempotent processTick.
+    // Frontend-pushed tick: DISPLAY-ONLY (ADR-028). This used to be routed
+    // into the same authoritative processTick() the real-time WS processor
+    // uses, as a "lower-latency accelerant." That was unsafe: the browser
+    // relays whatever price its own throttled Socket.IO subscription last
+    // saw, which can be stale or out of true chronological order relative
+    // to what services/gridSimulatorRealtime.js has already processed
+    // directly from the genuine Upstox WebSocket feed. Since the engine's
+    // dedup watermark only rejects a tick whose TIMESTAMP is <= the last
+    // one processed (and this endpoint always server-stamps a fresh,
+    // later timestamp), a stale client-relayed price was accepted as a
+    // "genuine new price update" and could cross back through an
+    // already-disarmed grid level in the opposite direction — re-arming
+    // it, so the very next genuine WS tick re-fired the same BUY/SELL
+    // signal again. This reproduced the exact "repeated SELL at the same
+    // level, reason insufficient_holdings" symptom reported against the
+    // live simulator. Fix: apply the same "only a genuine, backend-
+    // verified source may be authoritative" rule ADR-023 already applies
+    // to REST-fallback prices — a client-pushed price now only ever
+    // updates feed-health display fields, never the crossing engine. The
+    // backend's own event-driven WS processor is already fully sufficient
+    // on its own (it keeps a session progressing with zero browser tabs
+    // open at all), so this endpoint is no longer needed for correctness,
+    // only kept for feed-health display continuity.
     router.post("/v2/grid-simulator/sessions/:sessionId/tick", requireAuth, validateObjectId("sessionId"), async (req, res) => {
         try {
             const { price } = req.body;
             if (!Number.isFinite(Number(price)) || Number(price) <= 0) {
                 return res.status(400).json({ message: "price must be a positive number" });
             }
-            // Always server-stamped, never a client-supplied timestamp — this
-            // value is the monotonic dedup/out-of-order watermark
-            // (gridSimulatorEngine.js), so trusting a client clock here would
-            // let a skewed/crafted future timestamp permanently freeze the
-            // session against every subsequent genuine backend-poll tick.
-            const timestamp = new Date().toISOString();
 
-            await getOwnedSession({ GridSimulatorSession, sessionId: req.params.sessionId, userId: req.user.mongoId });
-            const result = await processTick({
-                GridSimulatorSession,
-                GridSimulatorTrade,
-                sessionId: req.params.sessionId,
-                price: Number(price),
-                eventTimestamp: timestamp,
-            });
-            return res.json({ skipped: result.skipped, reason: result.reason || null, trades: (result.trades || []).map(tradeSummary) });
+            const session = await getOwnedSession({ GridSimulatorSession, sessionId: req.params.sessionId, userId: req.user.mongoId });
+
+            if (session.status === "ACTIVE") {
+                await GridSimulatorSession.findOneAndUpdate(
+                    { _id: session._id, status: "ACTIVE" },
+                    { $set: { lastFeedCheckAt: new Date(), lastFeedPrice: Number(price) } },
+                );
+            }
+
+            return res.json({ skipped: true, reason: "client_tick_display_only", trades: [] });
         } catch (error) {
             return handleError(res, error, "Failed to process grid simulator tick");
         }

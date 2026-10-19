@@ -39,6 +39,7 @@
 
 const marketDataService = require("./marketDataService");
 const { processTick } = require("./gridSimulatorService");
+const { computePortfolioMetrics } = require("./gridSimulatorEngine");
 
 const STALE_THRESHOLD_MS = Number(process.env.GRID_SIMULATOR_STALE_MS || 15_000);
 const WATCHDOG_INTERVAL_MS = Number(process.env.GRID_SIMULATOR_WATCHDOG_MS || 5_000);
@@ -80,7 +81,25 @@ function unregisterSession(sessionId) {
     marketDataService.unpinInstrument(instrumentKey);
 }
 
+/**
+ * Builds the Socket.IO "gridSimulatorUpdate" payload from a SINGLE,
+ * internally-consistent snapshot (`sessionDoc`, the just-persisted
+ * document). Always recomputes `portfolio` via the same authoritative
+ * computePortfolioMetrics() the REST detail route uses (ADR-029) — it
+ * previously hand-built `portfolio` with only cash/holdings/avgCost/
+ * realizedPnL, omitting equity/unrealizedPnL/marketValue entirely. The
+ * frontend's merge (`{...prev.portfolio, ...payload.portfolio}`) then
+ * silently KEPT the stale equity/unrealizedPnL from an earlier push while
+ * cash/holdings/avgCost/realizedPnL updated to the latest values — an
+ * internally inconsistent snapshot (fresh holdings/cost mixed with a
+ * stale valuation), which is exactly the equity/unrealizedPnL discrepancy
+ * reported against production. Recomputing every field here, every push,
+ * from the one persisted doc guarantees cash/holdings/avgCost/equity/
+ * unrealizedPnL/marketValue are always mutually consistent.
+ */
 function buildUpdatePayload(sessionDoc, result, source) {
+    const currentPrice = sessionDoc.lastFeedPrice ?? sessionDoc.state?.lastPrice ?? null;
+    const metrics = computePortfolioMetrics(sessionDoc.state || {}, currentPrice);
     return {
         sessionId: String(sessionDoc._id),
         status: sessionDoc.status,
@@ -93,12 +112,7 @@ function buildUpdatePayload(sessionDoc, result, source) {
             lastEventTimestamp: result.state?.lastEventTimestamp ?? sessionDoc.state?.lastEventTimestamp ?? null,
             sequence: result.state?.sequence ?? sessionDoc.state?.sequence ?? 0,
         },
-        portfolio: {
-            cash: sessionDoc.state?.cash,
-            holdings: sessionDoc.state?.holdings,
-            avgCost: sessionDoc.state?.avgCost,
-            realizedPnL: sessionDoc.state?.realizedPnL,
-        },
+        portfolio: metrics,
         trades: (result.trades || []).filter((t) => t.qtyFilled > 0 || t.qtySkipped > 0),
     };
 }

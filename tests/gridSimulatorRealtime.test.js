@@ -411,6 +411,258 @@ function makeFakeIo() {
         realtime.unregisterSession(session._id);
     });
 
+    // --- Repeated-SELL-at-the-same-level regression suite (root cause:
+    // the frontend-pushed /tick "accelerant" used to feed a client-relayed,
+    // potentially stale price into the SAME authoritative processTick() the
+    // genuine WS stream uses. The dedup watermark only rejects an exact-or-
+    // earlier TIMESTAMP, not a stale PRICE, so a late/low client-relayed
+    // price could re-arm an already-disarmed level, and the next genuine WS
+    // tick would re-fire the same signal. Fixed by making the client-pushed
+    // tick display-only (ADR-028, see routes/gridSimulatorRoutes.js) — these
+    // tests exercise the real-time WS-only path directly, through the real
+    // engine, with no mocking of the crossing logic itself. ---
+
+    await test("A. repeated genuine ticks that fluctuate without crossing a NEW level never repeat a trade", async () => {
+        const session = makeActiveSessionDoc();
+        const GridSimulatorSession = makeFakeSessionModel([session]);
+        const GridSimulatorTrade = makeFakeTradeModel();
+        realtime.init({ GridSimulatorSession, GridSimulatorTrade, io: makeFakeIo() });
+        realtime.registerSession(session);
+
+        // First genuine upward crossing of 337 (reference 340, grid 3,
+        // level n=-1 buy at 337) — fires a BUY.
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 337, timestamp: Date.now() }, "ws");
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        // Fluctuate ABOVE 337 (never dip back below it) several times —
+        // none of these should re-fire the same level.
+        for (const ltp of [337.3, 337.6, 337.3, 337.15]) {
+            realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp, timestamp: Date.now() }, "ws");
+            // eslint-disable-next-line no-await-in-loop
+            await new Promise((resolve) => setTimeout(resolve, 15));
+        }
+
+        assert.strictEqual(GridSimulatorTrade.docs.length, 1, "only the first genuine crossing should have produced a trade");
+        realtime.unregisterSession(session._id);
+    });
+
+    await test("B. insufficient holdings: one skipped SELL, reference advances, no repeat on later non-crossing ticks", async () => {
+        const session = makeActiveSessionDoc(); // starts with holdings: 0
+        const GridSimulatorSession = makeFakeSessionModel([session]);
+        const GridSimulatorTrade = makeFakeTradeModel();
+        realtime.init({ GridSimulatorSession, GridSimulatorTrade, io: makeFakeIo() });
+        realtime.registerSession(session);
+
+        // Upward crossing of sell level n=1 at 343 with zero holdings.
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 343, timestamp: Date.now() }, "ws");
+        await new Promise((resolve) => setTimeout(resolve, 15));
+
+        let persisted = GridSimulatorSession.docs.get(String(session._id));
+        assert.strictEqual(GridSimulatorTrade.docs.length, 1);
+        assert.strictEqual(GridSimulatorTrade.docs[0].type, "SELL");
+        assert.strictEqual(GridSimulatorTrade.docs[0].qtyFilled, 0);
+        assert.strictEqual(GridSimulatorTrade.docs[0].reason, "insufficient_holdings");
+        assert.strictEqual(persisted.state.holdings, 0);
+        assert.strictEqual(persisted.state.lastPrice, 343, "the active reference/watermark advances even on a skipped trade");
+
+        // Further ticks that fluctuate above 343 without crossing a new
+        // level must not create another SELL record.
+        for (const ltp of [343.4, 343.1, 343.5]) {
+            realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp, timestamp: Date.now() }, "ws");
+            // eslint-disable-next-line no-await-in-loop
+            await new Promise((resolve) => setTimeout(resolve, 15));
+        }
+        assert.strictEqual(GridSimulatorTrade.docs.length, 1, "no repeated SELL for the same already-processed crossing");
+        realtime.unregisterSession(session._id);
+    });
+
+    await test("C. after a skipped SELL, a later genuine re-arming crossing and reversal are processed normally", async () => {
+        const session = makeActiveSessionDoc();
+        const GridSimulatorSession = makeFakeSessionModel([session]);
+        const GridSimulatorTrade = makeFakeTradeModel();
+        realtime.init({ GridSimulatorSession, GridSimulatorTrade, io: makeFakeIo() });
+        realtime.registerSession(session);
+
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 343, timestamp: Date.now() }, "ws"); // skipped SELL @343, disarm
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 342, timestamp: Date.now() }, "ws"); // genuine down-cross through 343 -> re-arm
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 344, timestamp: Date.now() }, "ws"); // genuine up-cross again -> fires SELL again (legitimately)
+        await new Promise((resolve) => setTimeout(resolve, 15));
+
+        assert.strictEqual(GridSimulatorTrade.docs.length, 2, "a genuine re-arm + re-cross legitimately produces a second SELL attempt");
+        assert.ok(GridSimulatorTrade.docs.every((t) => t.type === "SELL"));
+        realtime.unregisterSession(session._id);
+    });
+
+    await test("E. overlapping/duplicate dispatch of the same tick resolves to exactly one processed outcome", async () => {
+        const session = makeActiveSessionDoc();
+        const GridSimulatorSession = makeFakeSessionModel([session]);
+        const GridSimulatorTrade = makeFakeTradeModel();
+        realtime.init({ GridSimulatorSession, GridSimulatorTrade, io: makeFakeIo() });
+        realtime.registerSession(session);
+
+        const now = Date.now();
+        // Dispatch the identical tick object twice back-to-back, simulating
+        // a duplicate emit from an overlapping listener/reconnect replay.
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 336, timestamp: now }, "ws");
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 336, timestamp: now }, "ws");
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        assert.strictEqual(GridSimulatorTrade.docs.length, 1, "the duplicate dispatch must not double-process the same crossing");
+        const persisted = GridSimulatorSession.docs.get(String(session._id));
+        assert.strictEqual(persisted.state.holdings, 100);
+        realtime.unregisterSession(session._id);
+    });
+
+    await test("F. a stale/out-of-order tick cannot reverse state, but a legitimate later crossing still works", async () => {
+        const session = makeActiveSessionDoc();
+        const GridSimulatorSession = makeFakeSessionModel([session]);
+        const GridSimulatorTrade = makeFakeTradeModel();
+        realtime.init({ GridSimulatorSession, GridSimulatorTrade, io: makeFakeIo() });
+        realtime.registerSession(session);
+
+        const t1 = Date.now();
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 337, timestamp: t1 }, "ws"); // BUY @337
+        await new Promise((resolve) => setTimeout(resolve, 15));
+
+        // A stale tick with an EARLIER timestamp than the last processed one
+        // arrives late (e.g. reordered on the wire) carrying a price that
+        // would otherwise re-arm/reverse the level.
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 339, timestamp: t1 - 5000 }, "ws");
+        await new Promise((resolve) => setTimeout(resolve, 15));
+
+        let persisted = GridSimulatorSession.docs.get(String(session._id));
+        assert.strictEqual(GridSimulatorTrade.docs.length, 1, "the stale/out-of-order tick must be rejected, not processed");
+        assert.strictEqual(persisted.state.lastPrice, 337, "state must not move backward from a stale tick");
+
+        // A genuine, later-timestamped crossing (down through the next buy
+        // level, 334) still works normally.
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 333, timestamp: Date.now() }, "ws");
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        persisted = GridSimulatorSession.docs.get(String(session._id));
+        assert.strictEqual(persisted.state.holdings, 200, "a legitimate subsequent crossing must still be processed");
+        realtime.unregisterSession(session._id);
+    });
+
+    await test("H. a processed (including skipped) crossing is not re-executed after a simulated restart/resync", async () => {
+        const session = makeActiveSessionDoc();
+        const GridSimulatorSession = makeFakeSessionModel([session]);
+        const GridSimulatorTrade = makeFakeTradeModel();
+        realtime.init({ GridSimulatorSession, GridSimulatorTrade, io: makeFakeIo() });
+        realtime.registerSession(session);
+
+        // Skipped SELL (zero holdings) at 343.
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 343, timestamp: Date.now() }, "ws");
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        assert.strictEqual(GridSimulatorTrade.docs.length, 1);
+
+        // Simulate a process restart: unregister (as shutdown would leave
+        // nothing registered), then resync the in-memory registry purely
+        // from the ALREADY-PERSISTED session doc, same as server boot.
+        realtime.unregisterSession(session._id);
+        const restoredCount = await realtime.resyncFromDb({ GridSimulatorSession });
+        assert.strictEqual(restoredCount, 1);
+
+        // Further ticks that fluctuate above 343 (never dipping back below
+        // it, so the level is never legitimately re-armed) must still not
+        // re-execute the already-processed crossing.
+        for (const ltp of [343.2, 343.5, 343.3]) {
+            realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp, timestamp: Date.now() }, "ws");
+            // eslint-disable-next-line no-await-in-loop
+            await new Promise((resolve) => setTimeout(resolve, 15));
+        }
+        assert.strictEqual(GridSimulatorTrade.docs.length, 1, "the already-processed crossing must not repeat after a restart/resync");
+        realtime.unregisterSession(session._id);
+    });
+
+    // --- Equity/unrealizedPnL dashboard-discrepancy regression (ADR-029):
+    // buildUpdatePayload() previously hand-built `portfolio` with only
+    // cash/holdings/avgCost/realizedPnL, omitting equity/unrealizedPnL/
+    // marketValue — and the frontend's merge then kept a STALE equity/
+    // unrealizedPnL from an earlier push while cash/holdings/avgCost moved
+    // on, reproducing the exact reported dashboard discrepancy. Fixed by
+    // always recomputing the full portfolio snapshot via the same
+    // computePortfolioMetrics() the REST detail route uses. ---
+
+    await test("I. every pushed Socket.IO update carries a fresh, internally-consistent portfolio snapshot (equity/unrealizedPnL match the just-updated cash/holdings/avgCost)", async () => {
+        const session = makeActiveSessionDoc();
+        const GridSimulatorSession = makeFakeSessionModel([session]);
+        const GridSimulatorTrade = makeFakeTradeModel();
+        const io = makeFakeIo();
+        realtime.init({ GridSimulatorSession, GridSimulatorTrade, io });
+        realtime.registerSession(session);
+
+        // BUY @337 (down-cross from reference 340).
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 337, timestamp: Date.now() }, "ws");
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        let pushed = io.emitted.filter((e) => e.event === "gridSimulatorUpdate").pop().payload;
+        assert.strictEqual(pushed.portfolio.holdings, 100);
+        assert.strictEqual(pushed.portfolio.cash, 1000000 - 100 * 337);
+        // Equity/unrealizedPnL must be computed from the SAME snapshot, not
+        // stale/omitted.
+        assert.strictEqual(pushed.portfolio.equity, pushed.portfolio.cash + 100 * 337);
+        assert.strictEqual(pushed.portfolio.unrealizedPnL, 0); // bought at 337, valued at 337
+
+        // A further genuine price move (no new crossing) still re-prices
+        // equity/unrealizedPnL against the latest price on every push.
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 338, timestamp: Date.now() }, "ws");
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        pushed = io.emitted.filter((e) => e.event === "gridSimulatorUpdate").pop().payload;
+        assert.strictEqual(pushed.portfolio.holdings, 100, "holdings unchanged (no new crossing)");
+        assert.strictEqual(pushed.portfolio.unrealizedPnL, 100 * (338 - 337), "unrealizedPnL repriced against the latest price, not stale");
+        assert.strictEqual(pushed.portfolio.equity, pushed.portfolio.cash + 100 * 338);
+        realtime.unregisterSession(session._id);
+    });
+
+    // --- Feed-status locking review (ADR-030): evaluated applying the
+    // processTick() claim lock to the REST-fallback branch's display-only
+    // write too, to close a theoretical badge-flicker race (a REST
+    // fallback event and a genuine WS tick landing for the same session at
+    // nearly the same instant could have their lastFeedStatus/lastFeedPrice
+    // writes apply out of order). Decided NOT to change it: the lock is
+    // held for up to LOCK_DURATION_MS (30s) until explicitly released, and
+    // wrapping a simple cosmetic field update in acquire/release logic
+    // risks a bug (an early return or exception before release) blocking
+    // genuine WS trade processing for up to 30 seconds — a far worse
+    // outcome than the flicker it would fix, directly violating "must not
+    // block genuine WebSocket trade processing." This test proves the
+    // actual, bounded blast radius of the race left as-is: it can only
+    // ever affect the cosmetic lastFeedStatus/lastFeedPrice fields, never
+    // cash/holdings/avgCost/realizedPnL or the trade ledger — those are
+    // only ever written by the locked processTick() path. ---
+
+    await test("J. a REST fallback event racing a genuine WS trade cannot corrupt cash/holdings/trades — only the cosmetic feed-status fields are at risk", async () => {
+        const session = makeActiveSessionDoc();
+        const GridSimulatorSession = makeFakeSessionModel([session]);
+        const GridSimulatorTrade = makeFakeTradeModel();
+        const io = makeFakeIo();
+        realtime.init({ GridSimulatorSession, GridSimulatorTrade, io });
+        realtime.registerSession(session);
+
+        // Dispatch a genuine WS trade-triggering tick and a REST fallback
+        // tick for the SAME session back-to-back (worst-case ordering is
+        // not controllable since both are fire-and-forget, but either
+        // order must leave the authoritative state correct).
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 337, timestamp: Date.now() }, "ws"); // BUY
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 500, timestamp: Date.now() }, "rest"); // fallback, would be a huge fake gap if authoritative
+        await new Promise((resolve) => setTimeout(resolve, 25));
+
+        const persisted = GridSimulatorSession.docs.get(String(session._id));
+        // The authoritative state reflects ONLY the genuine WS trade — the
+        // REST fallback price never reached the crossing engine regardless
+        // of dispatch order.
+        assert.strictEqual(persisted.state.holdings, 100);
+        assert.strictEqual(persisted.state.lastPrice, 337);
+        assert.strictEqual(GridSimulatorTrade.docs.length, 1);
+        assert.strictEqual(GridSimulatorTrade.docs[0].fillPrice, 337);
+        // Only the feed-status/price display fields are left to whichever
+        // write landed last — by design, not a defect in this review.
+        assert.ok(["LIVE", "LIVE_REST_FALLBACK"].includes(persisted.lastFeedStatus));
+        realtime.unregisterSession(session._id);
+    });
+
     await test("14. the simulator no longer depends on a 5-second polling loop (no such module/export exists)", () => {
         assert.throws(() => require("../services/gridSimulatorFeed"), /Cannot find module/);
         assert.strictEqual(typeof realtime.registerSession, "function");

@@ -13,6 +13,7 @@ const {
     computePortfolioMetrics,
     toCents,
     levelPrice,
+    roundPrice,
 } = require("../services/gridSimulatorEngine");
 
 let passed = 0;
@@ -358,6 +359,159 @@ test("computePortfolioMetrics never fabricates equity when there is no current p
     const metrics = computePortfolioMetrics(state, null);
     assert.strictEqual(metrics.equity, null);
     assert.strictEqual(metrics.marketValue, null);
+});
+
+test("computePortfolioMetrics reports zero unrealized P&L when holdings are zero", () => {
+    const state = { cash: 100000, holdings: 0, avgCost: 0, realizedPnL: 0 };
+    const metrics = computePortfolioMetrics(state, 23077.1);
+    assert.strictEqual(metrics.unrealizedPnL, 0);
+    assert.strictEqual(metrics.equity, 100000);
+});
+
+// Independently hand-calculated against the exact numbers reported against a
+// (non-production, synthetic) session: cash ₹83,81,115.60, holdings 70,
+// avgCost ₹23,079.39, last price ₹23,077.10. The reported dashboard showed
+// equity ₹99,97,744.50 and unrealized P&L -₹2,255.40 — both wrong versus
+// computePortfolioMetrics itself (confirming the bug was NOT in this pure
+// function, but in gridSimulatorRealtime.js's Socket.IO push omitting these
+// fields and the frontend merge keeping a stale prior snapshot — see
+// buildUpdatePayload's fix and its own test in gridSimulatorRealtime.test.js).
+test("computePortfolioMetrics reconciles the reported equity/unrealizedPnL discrepancy by hand", () => {
+    const state = { cash: 8381115.6, holdings: 70, avgCost: 23079.39, realizedPnL: -3327 };
+    const metrics = computePortfolioMetrics(state, 23077.1);
+    assert.strictEqual(metrics.marketValue, 1615397); // 70 * 23077.10
+    assert.strictEqual(metrics.equity, 9996512.6); // 8381115.60 + 1615397.00
+    assert.strictEqual(roundPrice(metrics.unrealizedPnL), -160.3); // 70 * (23077.10 - 23079.39)
+});
+
+// --- Required numerical fixture: a profitable BUY-then-SELL cycle ---
+//
+// NOTE on the exact prices: the task's own worked example (BUY @100, SELL
+// @103, gridInterval 3) is mathematically impossible to reach as two
+// genuine grid-level crossings in THIS engine — sell levels sit strictly
+// above the reference and buy levels strictly below it, so two valid
+// (non-reference, index != 0) levels exactly G=3 apart are always adjacent
+// indices n and n+1; for n<0<n+1 the only such pair is n=-1 and n+1=0,
+// and index 0 is the reference itself (excluded, never a tradeable level —
+// see findCrossedLevels's own doc comment and the `if (n === 0) continue`
+// guard). The fill price is always the genuine OBSERVED tick price (not
+// the theoretical level), so this fixture reproduces the identical
+// 100 -> 103 buy/sell PRICE MOVEMENT and the exact same formula pattern
+// (profit = qty * (sellPrice - buyPrice)) by crossing buy level 97 and
+// sell level 103 instead of 100/103 — the accounting identities below are
+// what the task's fixture is actually testing, not the specific numerals.
+test("fixture: a profitable BUY-then-SELL cycle reconciles cash/holdings/realizedPnL/equity exactly", () => {
+    const config = {
+        referencePrice: 100,
+        gridInterval: 3,
+        quantityPerLevel: 10,
+        startingCapital: 100000,
+        commissionPct: 0,
+        slippagePct: 0,
+    };
+    let state = createInitialGridState(config);
+
+    // Down-cross through buy level 97.
+    let result = processPriceUpdate({ config, state, price: 97, eventTimestamp: "2026-01-01T09:16:00.000Z" });
+    state = result.state;
+    assert.strictEqual(result.trades.length, 1);
+    assert.strictEqual(result.trades[0].type, "BUY");
+    assert.strictEqual(result.trades[0].effectivePrice, 97);
+
+    // Up-cross through sell level 103 (re-armed automatically — crossing
+    // back up through the reference at 100 does not require a separate
+    // re-arm step for a level above it that was never disarmed).
+    result = processPriceUpdate({ config, state, price: 103, eventTimestamp: "2026-01-01T09:17:00.000Z" });
+    state = result.state;
+    assert.strictEqual(result.trades.length, 1);
+    assert.strictEqual(result.trades[0].type, "SELL");
+    assert.strictEqual(result.trades[0].effectivePrice, 103);
+
+    assert.strictEqual(state.cash, 100060); // 100000 - (10*97) + (10*103)
+    assert.strictEqual(state.holdings, 0);
+    assert.strictEqual(state.realizedPnL, 60); // 10 * (103 - 97)
+
+    const metrics = computePortfolioMetrics(state, 103);
+    assert.strictEqual(metrics.unrealizedPnL, 0); // zero holdings
+    assert.strictEqual(metrics.equity, 100060);
+    // Total P&L reconciles with realized + unrealized under zero external deposits.
+    const totalPnL = roundPrice(metrics.equity - config.startingCapital);
+    assert.strictEqual(totalPnL, roundPrice(metrics.realizedPnL + metrics.unrealizedPnL));
+    assert.strictEqual(totalPnL, 60);
+});
+
+test("fixture: starting inventory sold at a loss reconciles cash/holdings/realizedPnL/equity exactly", () => {
+    // Sell levels are always ABOVE the reference by construction, so a
+    // losing SELL (effective price below cost basis) is modeled via
+    // starting inventory acquired at a higher cost than the sell level —
+    // the same approach the existing dynamic-reference tests use for
+    // starting-inventory scenarios.
+    const config = {
+        referencePrice: 94,
+        gridInterval: 3,
+        quantityPerLevel: 10,
+        startingCapital: 100000,
+        commissionPct: 0,
+        slippagePct: 0,
+        startingHoldings: 10,
+        startingAvgCost: 103,
+    };
+    let state = createInitialGridState(config);
+    assert.strictEqual(state.cash, 100000); // starting capital is independent of inventory cost basis
+
+    const result = processPriceUpdate({ config, state, price: 97, eventTimestamp: "2026-01-01T09:16:00.000Z" }); // up-cross through sell level 97
+    state = result.state;
+
+    assert.strictEqual(result.trades.length, 1);
+    assert.strictEqual(result.trades[0].type, "SELL");
+    assert.strictEqual(result.trades[0].effectivePrice, 97);
+    assert.strictEqual(result.trades[0].realizedPnLDelta, -60); // 10 * (97 - 103)
+
+    assert.strictEqual(state.holdings, 0);
+    assert.strictEqual(state.cash, 100970); // 100000 + 10*97
+    assert.strictEqual(state.realizedPnL, -60);
+    assert.strictEqual(state.avgCost, 0); // resets once holdings return to zero
+
+    const metrics = computePortfolioMetrics(state, 97);
+    assert.strictEqual(metrics.unrealizedPnL, 0);
+    assert.strictEqual(metrics.equity, 100970);
+});
+
+test("fixture: commission and slippage are reflected in cash and realized P&L, not double-counted", () => {
+    const config = {
+        referencePrice: 100,
+        gridInterval: 3,
+        quantityPerLevel: 10,
+        startingCapital: 100000,
+        commissionPct: 1, // 1%
+        slippagePct: 1, // 1%
+    };
+    let state = createInitialGridState(config);
+
+    // BUY: slippage raises the paid price, commission raises the paid cost.
+    let result = processPriceUpdate({ config, state, price: 97, eventTimestamp: "2026-01-01T09:16:00.000Z" });
+    state = result.state;
+    const buy = result.trades[0];
+    const expectedBuyEffective = roundPrice(97 * 1.01); // slippage
+    const expectedUnitCost = roundPrice(expectedBuyEffective * 1.01); // commission on top
+    assert.strictEqual(buy.effectivePrice, expectedBuyEffective);
+    assert.strictEqual(state.cash, roundPrice(100000 - 10 * expectedUnitCost));
+    assert.strictEqual(state.avgCost, expectedUnitCost);
+
+    // SELL: slippage lowers the received price, commission reduces proceeds.
+    result = processPriceUpdate({ config, state, price: 103, eventTimestamp: "2026-01-01T09:17:00.000Z" });
+    state = result.state;
+    const sell = result.trades[0];
+    const expectedSellEffective = roundPrice(103 * 0.99); // slippage
+    const expectedUnitProceeds = roundPrice(expectedSellEffective * 0.99); // commission
+    assert.strictEqual(sell.effectivePrice, expectedSellEffective);
+    assert.strictEqual(sell.realizedPnLDelta, roundPrice(10 * (expectedUnitProceeds - expectedUnitCost)));
+    assert.strictEqual(state.holdings, 0);
+
+    // Costs show up exactly once each in cash, not duplicated into realizedPnL
+    // beyond their effect on the buy/sell unit prices already applied above.
+    const metrics = computePortfolioMetrics(state, 103);
+    assert.strictEqual(metrics.equity, state.cash); // zero holdings -> equity is cash alone
 });
 
 // --- Dynamic-reference strategy: starting inventory + exact task-spec oscillations ---

@@ -297,12 +297,11 @@ function validConfigBody(overrides = {}) {
         assert.strictEqual(res.statusCode, 404);
     });
 
-    await test("full lifecycle via routes: create -> start -> tick -> pause -> resume -> stop", async () => {
+    await test("full lifecycle via routes: create -> start -> pause -> resume -> stop", async () => {
         const models = makeFakeModels();
         const router = makeRouter(models);
         const createHandle = finalHandlerFor(router, "post", "/v2/grid-simulator/sessions");
         const startHandle = finalHandlerFor(router, "post", "/v2/grid-simulator/sessions/:sessionId/start");
-        const tickHandle = finalHandlerFor(router, "post", "/v2/grid-simulator/sessions/:sessionId/tick");
         const pauseHandle = finalHandlerFor(router, "post", "/v2/grid-simulator/sessions/:sessionId/pause");
         const resumeHandle = finalHandlerFor(router, "post", "/v2/grid-simulator/sessions/:sessionId/resume");
         const stopHandle = finalHandlerFor(router, "post", "/v2/grid-simulator/sessions/:sessionId/stop");
@@ -316,18 +315,6 @@ function validConfigBody(overrides = {}) {
         const startRes = fakeRes();
         await startHandle({ user: { mongoId: userId }, params: { sessionId } }, startRes);
         assert.strictEqual(startRes.body.session.status, "ACTIVE");
-
-        // The tick endpoint always server-stamps its own eventTimestamp (never
-        // trusts a client-supplied one — see the route's doc comment); a tiny
-        // delay here guarantees it lands strictly after the just-captured
-        // reference quote's own timestamp, avoiding a millisecond-collision
-        // false rejection in this fast, fully-synchronous test environment.
-        await new Promise((resolve) => setTimeout(resolve, 5));
-
-        const tickRes = fakeRes();
-        await tickHandle({ user: { mongoId: userId }, params: { sessionId }, body: { price: 336 } }, tickRes);
-        assert.strictEqual(tickRes.body.trades.length, 1);
-        assert.strictEqual(tickRes.body.trades[0].qtyFilled, 100);
 
         const pauseRes = fakeRes();
         await pauseHandle({ user: { mongoId: userId }, params: { sessionId } }, pauseRes);
@@ -343,8 +330,46 @@ function validConfigBody(overrides = {}) {
 
         const tradesRes = fakeRes();
         await tradesHandle({ user: { mongoId: userId }, params: { sessionId }, query: {} }, tradesRes);
-        assert.strictEqual(tradesRes.body.total, 1);
-        assert.strictEqual(tradesRes.body.items[0].isSimulated, true);
+        assert.strictEqual(tradesRes.body.total, 0); // no WS/processTick activity was simulated in this route-level test
+    });
+
+    // ADR-028: the frontend-pushed /tick endpoint is DISPLAY-ONLY — a
+    // client-relayed price must never reach the authoritative crossing
+    // engine (same "only a genuine, backend-verified source is
+    // authoritative" rule as ADR-023's REST-fallback restriction). These
+    // tests replace the old ones that asserted it executed a trade.
+    await test("tick endpoint never executes a trade (display-only, ADR-028)", async () => {
+        const models = makeFakeModels();
+        const router = makeRouter(models);
+        const createHandle = finalHandlerFor(router, "post", "/v2/grid-simulator/sessions");
+        const startHandle = finalHandlerFor(router, "post", "/v2/grid-simulator/sessions/:sessionId/start");
+        const tickHandle = finalHandlerFor(router, "post", "/v2/grid-simulator/sessions/:sessionId/tick");
+        const detailHandle = finalHandlerFor(router, "get", "/v2/grid-simulator/sessions/:sessionId");
+        const tradesHandle = finalHandlerFor(router, "get", "/v2/grid-simulator/sessions/:sessionId/trades");
+
+        const userId = new mongoose.Types.ObjectId();
+        const createRes = fakeRes();
+        await createHandle({ user: { mongoId: userId }, body: validConfigBody({ referencePrice: 340, gridInterval: 3 }) }, createRes);
+        const sessionId = String(createRes.body.session.sessionId);
+        await startHandle({ user: { mongoId: userId }, params: { sessionId } }, fakeRes());
+
+        // A price that would cross a grid level (340 -> 336 crosses 337) if
+        // this endpoint were still authoritative.
+        const tickRes = fakeRes();
+        await tickHandle({ user: { mongoId: userId }, params: { sessionId }, body: { price: 336 } }, tickRes);
+        assert.strictEqual(tickRes.body.skipped, true);
+        assert.strictEqual(tickRes.body.reason, "client_tick_display_only");
+        assert.deepStrictEqual(tickRes.body.trades, []);
+
+        const detailRes = fakeRes();
+        await detailHandle({ user: { mongoId: userId }, params: { sessionId } }, detailRes);
+        assert.strictEqual(detailRes.body.portfolio.holdings, 0); // unchanged
+        assert.strictEqual(detailRes.body.state.lastPrice, 340); // crossing watermark untouched
+        assert.strictEqual(detailRes.body.lastFeedPrice, 336); // display field IS updated
+
+        const tradesRes = fakeRes();
+        await tradesHandle({ user: { mongoId: userId }, params: { sessionId }, query: {} }, tradesRes);
+        assert.strictEqual(tradesRes.body.total, 0); // no ledger row was created
     });
 
     await test("tick endpoint rejects a non-positive price (never fabricates a fill)", async () => {
