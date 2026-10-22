@@ -12,7 +12,7 @@ const mongoose = require("mongoose");
 const {
     createSession,
     getOwnedSession,
-    startSession,
+    startSessionWithInitialBuy,
     pauseSession,
     resumeSession,
     stopSession,
@@ -39,9 +39,14 @@ async function test(name, fn) {
     }
 }
 
+// ADR-038: the reference is no longer part of the create-time config — it's
+// captured at Start. These two constants stand in for "the fresh live quote
+// captureFreshReference() would have fetched," passed explicitly to
+// startSessionWithInitialBuy() by every test that needs an ACTIVE session.
+const REFERENCE_PRICE = 340;
+const REFERENCE_CAPTURED_AT = new Date(2026, 0, 1, 9, 0); // strictly before this file's various first-tick timestamps (9:15+)
+
 const CONFIG = {
-    referencePrice: 340,
-    referenceCapturedAt: new Date(2026, 0, 1, 9, 0), // strictly before this file's various first-tick timestamps (9:15+)
     gridInterval: 3,
     quantityPerLevel: 100,
     startingCapital: 1000000,
@@ -173,11 +178,15 @@ function makeFakeTradeModel() {
     };
 }
 
-async function makeActiveSession(userId = new mongoose.Types.ObjectId()) {
+// ADR-038: Start now ALWAYS executes one immediate BUY at the captured
+// reference price — so a freshly-"active" session already has
+// quantityPerLevel (100) shares (cost 340), not a flat 0-holdings start.
+// Every test using this helper accounts for that initial fill.
+async function makeActiveSession(userId = new mongoose.Types.ObjectId(), { referencePrice = REFERENCE_PRICE, referenceCapturedAt = REFERENCE_CAPTURED_AT } = {}) {
     const GridSimulatorSession = makeFakeSessionModel();
     const GridSimulatorTrade = makeFakeTradeModel();
-    const session = await createSession({ GridSimulatorSession, userId, instrumentKey: "NSE_EQ|TEST", symbol: "TEST", config: CONFIG });
-    await startSession({ GridSimulatorSession, sessionId: session._id, userId });
+    const created = await createSession({ GridSimulatorSession, userId, instrumentKey: "NSE_EQ|TEST", symbol: "TEST", config: CONFIG });
+    const session = await startSessionWithInitialBuy({ GridSimulatorSession, GridSimulatorTrade, sessionId: created._id, userId, referencePrice, referenceCapturedAt });
     return { GridSimulatorSession, GridSimulatorTrade, session, userId };
 }
 
@@ -217,18 +226,23 @@ async function makeActiveSession(userId = new mongoose.Types.ObjectId()) {
 
         await test("session lifecycle: CREATED -> ACTIVE -> PAUSED -> ACTIVE -> STOPPED", async () => {
         const GridSimulatorSession = makeFakeSessionModel();
+        const GridSimulatorTrade = makeFakeTradeModel();
         const userId = new mongoose.Types.ObjectId();
         const session = await createSession({ GridSimulatorSession, userId, instrumentKey: "NSE_EQ|LC", symbol: "LC", config: CONFIG });
         assert.strictEqual(session.status, "CREATED");
+        assert.strictEqual(session.config.referencePrice, null, "no reference yet before Start (ADR-038)");
 
-        const started = await startSession({ GridSimulatorSession, sessionId: session._id, userId });
+        const started = await startSessionWithInitialBuy({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, userId, referencePrice: REFERENCE_PRICE, referenceCapturedAt: REFERENCE_CAPTURED_AT });
         assert.strictEqual(started.status, "ACTIVE");
+        assert.strictEqual(started.config.referencePrice, REFERENCE_PRICE);
+        assert.strictEqual(started.state.holdings, 100, "Start immediately buys at the reference price");
 
         const paused = await pauseSession({ GridSimulatorSession, sessionId: session._id, userId });
         assert.strictEqual(paused.status, "PAUSED");
 
         const resumed = await resumeSession({ GridSimulatorSession, sessionId: session._id, userId });
         assert.strictEqual(resumed.status, "ACTIVE");
+        assert.strictEqual(resumed.state.holdings, 100, "Resume never re-buys");
 
         const stopped = await stopSession({ GridSimulatorSession, sessionId: session._id, userId });
         assert.strictEqual(stopped.status, "STOPPED");
@@ -236,12 +250,13 @@ async function makeActiveSession(userId = new mongoose.Types.ObjectId()) {
 
         await test("invalid transitions are rejected with 409 (e.g. starting an already-stopped session)", async () => {
         const GridSimulatorSession = makeFakeSessionModel();
+        const GridSimulatorTrade = makeFakeTradeModel();
         const userId = new mongoose.Types.ObjectId();
         const session = await createSession({ GridSimulatorSession, userId, instrumentKey: "NSE_EQ|INV", symbol: "INV", config: CONFIG });
-        await startSession({ GridSimulatorSession, sessionId: session._id, userId });
+        await startSessionWithInitialBuy({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, userId, referencePrice: REFERENCE_PRICE, referenceCapturedAt: REFERENCE_CAPTURED_AT });
         await stopSession({ GridSimulatorSession, sessionId: session._id, userId });
         await assert.rejects(
-            () => startSession({ GridSimulatorSession, sessionId: session._id, userId }),
+            () => startSessionWithInitialBuy({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, userId, referencePrice: REFERENCE_PRICE, referenceCapturedAt: REFERENCE_CAPTURED_AT }),
             (err) => err.statusCode === 409,
         );
     });
@@ -260,28 +275,30 @@ async function makeActiveSession(userId = new mongoose.Types.ObjectId()) {
 
         await test("processTick produces a fill and persists both state and a ledger row", async () => {
         const { GridSimulatorSession, GridSimulatorTrade, session } = await makeActiveSession();
+        assert.strictEqual(session.state.holdings, 100, "sanity check: Start already bought 100 @ 340");
         const result = await processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 336, eventTimestamp: new Date(2026, 0, 1, 9, 15).toISOString() });
         assert.strictEqual(result.trades.length, 1);
         assert.strictEqual(result.trades[0].qtyFilled, 100);
 
         const persisted = await GridSimulatorSession.findOne({ _id: session._id });
-        assert.strictEqual(persisted.state.holdings, 100);
+        assert.strictEqual(persisted.state.holdings, 200); // 100 from Start + 100 from this tick
         assert.strictEqual(persisted.processingLockedUntil, null); // lock released
 
         const ledgerRows = await listTrades({ GridSimulatorTrade, sessionId: session._id, page: 1, limit: 10 });
-        assert.strictEqual(ledgerRows.total, 1);
-        assert.strictEqual(ledgerRows.items[0].cashAfter, 1000000 - 100 * 336);
+        assert.strictEqual(ledgerRows.total, 2); // the initial Start buy + this tick's buy
+        const thisTick = ledgerRows.items.find((t) => t.fillPrice === 336);
+        assert.strictEqual(thisTick.cashAfter, 1000000 - 100 * REFERENCE_PRICE - 100 * 336);
     });
 
     await test("getTradeCounts reports buy/sell/skipped/partial counts across the WHOLE ledger, not just one page", async () => {
-        const { GridSimulatorSession, GridSimulatorTrade, session } = await makeActiveSession();
+        const { GridSimulatorSession, GridSimulatorTrade, session } = await makeActiveSession(); // Start itself is 1 BUY (100 @ 340)
 
-        await processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 336, eventTimestamp: new Date(2026, 0, 1, 9, 15).toISOString() }); // BUY filled
-        await processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 345, eventTimestamp: new Date(2026, 0, 1, 9, 16).toISOString() }); // SELL filled, then SELL skipped
+        await processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 336, eventTimestamp: new Date(2026, 0, 1, 9, 15).toISOString() }); // BUY filled (200 held)
+        await processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 345, eventTimestamp: new Date(2026, 0, 1, 9, 16).toISOString() }); // both armed SELLs fill fully (200 held covers both)
         await processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 340, eventTimestamp: new Date(2026, 0, 1, 9, 17).toISOString() }); // BUY filled
 
         const counts = await getTradeCounts({ GridSimulatorTrade, sessionId: session._id });
-        assert.deepStrictEqual(counts, { buyCount: 2, sellCount: 1, skippedCount: 1, partialCount: 0 });
+        assert.deepStrictEqual(counts, { buyCount: 3, sellCount: 2, skippedCount: 0, partialCount: 0 });
     });
 
         await test("getChargesSummary (ADR-035) aggregates the display-only charges estimate across the whole ledger, keyed by the session's own segmentClass", async () => {
@@ -296,8 +313,8 @@ async function makeActiveSession(userId = new mongoose.Types.ObjectId()) {
     });
 
     await test("trade ledger sequence numbers never collide across a multi-trade gap event followed by a later event", async () => {
-        const { GridSimulatorSession, GridSimulatorTrade, session } = await makeActiveSession();
-        // Gap from reference 340 straight to 310 crosses 10 levels in one event.
+        const { GridSimulatorSession, GridSimulatorTrade, session } = await makeActiveSession(); // Start = 1 ledger row already
+        // Gap from 340 straight to 310 crosses 10 levels in one event.
         const gapResult = await processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 310, eventTimestamp: new Date(2026, 0, 1, 9, 15).toISOString() });
         assert.strictEqual(gapResult.trades.length, 10);
 
@@ -305,12 +322,12 @@ async function makeActiveSession(userId = new mongoose.Types.ObjectId()) {
         await processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 307, eventTimestamp: new Date(2026, 0, 1, 9, 16).toISOString() });
 
         const ledgerRows = await listTrades({ GridSimulatorTrade, sessionId: session._id, page: 1, limit: 50 });
-        assert.strictEqual(ledgerRows.total, 11);
+        assert.strictEqual(ledgerRows.total, 12); // 1 (Start) + 10 (gap) + 1 (later event)
         const sequences = ledgerRows.items.map((t) => t.sequence);
         const uniqueSequences = new Set(sequences);
         assert.strictEqual(uniqueSequences.size, sequences.length, `sequence numbers must never collide: ${sequences.join(",")}`);
         // The later event's trade must sort strictly after every trade from the gap event.
-        assert.strictEqual(Math.max(...sequences), 11);
+        assert.strictEqual(Math.max(...sequences), 12);
     });
 
     await test("a repeated identical/stale tick never duplicates a fill (idempotent restart recovery)", async () => {
@@ -324,10 +341,10 @@ async function makeActiveSession(userId = new mongoose.Types.ObjectId()) {
         assert.strictEqual(replay.reason, "duplicate_or_out_of_order_event");
 
         const persisted = await GridSimulatorSession.findOne({ _id: session._id });
-        assert.strictEqual(persisted.state.holdings, 100); // unchanged, not 200
+        assert.strictEqual(persisted.state.holdings, 200); // 100 (Start) + 100 (this tick) — unchanged by the replay, not 300
 
         const ledgerRows = await listTrades({ GridSimulatorTrade, sessionId: session._id, page: 1, limit: 10 });
-        assert.strictEqual(ledgerRows.total, 1); // no duplicate ledger row
+        assert.strictEqual(ledgerRows.total, 2); // Start + this tick — no duplicate ledger row from the replay
     });
 
         await test("concurrency: two simultaneous ticks against the same session resolve to exactly one winner", async () => {
@@ -373,7 +390,7 @@ async function makeActiveSession(userId = new mongoose.Types.ObjectId()) {
         assert.strictEqual(session.state.avgCost, 0);
     });
 
-    await test("the crossing watermark is seeded from the captured reference quote at creation, not left null", async () => {
+    await test("ADR-038: creation has no reference/crossing watermark at all — both are null until Start", async () => {
         const GridSimulatorSession = makeFakeSessionModel();
         const userId = new mongoose.Types.ObjectId();
         const session = await createSession({
@@ -383,36 +400,58 @@ async function makeActiveSession(userId = new mongoose.Types.ObjectId()) {
             symbol: "WM",
             config: CONFIG,
         });
-        assert.strictEqual(session.state.lastPrice, CONFIG.referencePrice);
-        assert.strictEqual(new Date(session.state.lastEventTimestamp).getTime(), new Date(CONFIG.referenceCapturedAt).getTime());
+        assert.strictEqual(session.config.referencePrice, null);
+        assert.strictEqual(session.config.referenceCapturedAt, null);
+        assert.strictEqual(session.state.lastPrice, null);
+        assert.strictEqual(session.state.lastEventTimestamp, null);
+        assert.deepStrictEqual(session.state.pendingBuyLevels, []);
     });
 
-    await test("createSession rejects a config missing referenceCapturedAt — the reference must come from a captured live quote", async () => {
-        const GridSimulatorSession = makeFakeSessionModel();
-        await assert.rejects(
-            () => createSession({ GridSimulatorSession, userId: new mongoose.Types.ObjectId(), instrumentKey: "X", symbol: "X", config: { ...CONFIG, referenceCapturedAt: undefined } }),
-            (err) => err.statusCode === 400,
-        );
-    });
-
-    await test("starting inventory establishes a correct realized-P&L baseline on a later sell (200 @ avg 315, sell 100 @ 320)", async () => {
+    await test("ADR-038: Start captures the reference and seeds the crossing watermark from it, immediately executing one BUY", async () => {
         const GridSimulatorSession = makeFakeSessionModel();
         const GridSimulatorTrade = makeFakeTradeModel();
         const userId = new mongoose.Types.ObjectId();
-        // referencePrice=340, interval=3 -> sell level +1 = 343. Use a config
-        // whose first sell level is 320 so a single tick exercises it.
-        const config = { ...CONFIG, referencePrice: 317, startingHoldings: 200, startingAvgCost: 315 };
-        const session = await createSession({ GridSimulatorSession, userId, instrumentKey: "NSE_EQ|INV2", symbol: "INV2", config });
-        await startSession({ GridSimulatorSession, sessionId: session._id, userId });
+        const created = await createSession({ GridSimulatorSession, userId, instrumentKey: "NSE_EQ|WM2", symbol: "WM2", config: CONFIG });
+        const started = await startSessionWithInitialBuy({ GridSimulatorSession, GridSimulatorTrade, sessionId: created._id, userId, referencePrice: REFERENCE_PRICE, referenceCapturedAt: REFERENCE_CAPTURED_AT });
 
-        const result = await processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, price: 320, eventTimestamp: new Date(2026, 0, 1, 9, 30).toISOString() });
-        assert.strictEqual(result.trades.length, 1);
-        assert.strictEqual(result.trades[0].type, "SELL");
-        assert.strictEqual(result.trades[0].qtyFilled, 100);
-        // Hand calculation: realizedPnL = qty * (fillPrice - avgCost) = 100 * (320 - 315) = 500.
-        assert.strictEqual(result.state.realizedPnL, 500);
-        assert.strictEqual(result.state.holdings, 100);
-        assert.strictEqual(result.state.avgCost, 315, "avg cost is unchanged by a sell");
+        assert.strictEqual(started.config.referencePrice, REFERENCE_PRICE);
+        assert.strictEqual(started.state.lastPrice, REFERENCE_PRICE);
+        assert.strictEqual(new Date(started.state.lastEventTimestamp).getTime(), new Date(REFERENCE_CAPTURED_AT).getTime());
+        assert.strictEqual(started.state.holdings, 100);
+        assert.strictEqual(started.state.cash, CONFIG.startingCapital - 100 * REFERENCE_PRICE);
+
+        const ledgerRows = await listTrades({ GridSimulatorTrade, sessionId: created._id, page: 1, limit: 10 });
+        assert.strictEqual(ledgerRows.total, 1);
+        assert.strictEqual(ledgerRows.items[0].type, "BUY");
+        assert.strictEqual(ledgerRows.items[0].fillPrice, REFERENCE_PRICE);
+        assert.strictEqual(ledgerRows.items[0].qtyFilled, 100);
+    });
+
+    await test("starting inventory establishes a correct realized-P&L baseline on a later sell (200 @ avg 315, Start buys 100 more @ 317, sell 320 crosses both armed sell targets)", async () => {
+        const GridSimulatorSession = makeFakeSessionModel();
+        const GridSimulatorTrade = makeFakeTradeModel();
+        const userId = new mongoose.Types.ObjectId();
+        const config = { ...CONFIG, startingHoldings: 200, startingAvgCost: 315 };
+        const created = await createSession({ GridSimulatorSession, userId, instrumentKey: "NSE_EQ|INV2", symbol: "INV2", config });
+        // ADR-038: Start itself immediately buys 100 more @ 317 (the captured
+        // reference), on top of the 200 starting shares — arming its own
+        // sell target (320) alongside the starting lot's (318).
+        const started = await startSessionWithInitialBuy({ GridSimulatorSession, GridSimulatorTrade, sessionId: created._id, userId, referencePrice: 317, referenceCapturedAt: new Date(2026, 0, 1, 9, 0) });
+        assert.strictEqual(started.state.holdings, 300);
+        assert.deepStrictEqual(started.state.pendingSellLevels, [318, 320]);
+
+        // A move to 320 crosses BOTH armed sell targets in one event.
+        const result = await processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId: started._id, price: 320, eventTimestamp: new Date(2026, 0, 1, 9, 30).toISOString() });
+        assert.strictEqual(result.trades.length, 2);
+        result.trades.forEach((trade) => {
+            assert.strictEqual(trade.type, "SELL");
+            assert.strictEqual(trade.qtyFilled, 100);
+        });
+        // FIFO: both sells consume the OLDEST (315) lot first — each
+        // realizedPnLDelta = 100 * (320 - 315) = 500, for 1000 total.
+        assert.strictEqual(result.state.realizedPnL, 1000);
+        assert.strictEqual(result.state.holdings, 100); // only the 317 lot remains
+        assert.strictEqual(result.state.avgCost, 317, "avg cost is now just the remaining 317 lot's own price");
     });
 
     // --- updateSessionConfig (ADR-034) ---
@@ -439,7 +478,8 @@ async function makeActiveSession(userId = new mongoose.Types.ObjectId()) {
         assert.strictEqual(updated.config.quantityPerLevel, 50);
         assert.strictEqual(updated.config.gridInterval, 4);
         assert.strictEqual(updated.config.sellVariance, 6);
-        assert.strictEqual(updated.state.cash, CONFIG.startingCapital + 25000);
+        // ADR-038: Start itself already bought 100 @ 340 (REFERENCE_PRICE) before this top-up.
+        assert.strictEqual(updated.state.cash, CONFIG.startingCapital - 100 * REFERENCE_PRICE + 25000);
     });
 
     await test("updateSessionConfig applies sellQuantityPerLevel (ADR-035), and clearing it mirrors quantityPerLevel again", async () => {

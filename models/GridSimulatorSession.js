@@ -11,9 +11,9 @@ const mongoose = require("mongoose");
  * it is the ONLY place that state lives; a restart reads it back and
  * resumes from exactly where it left off (see services/gridSimulatorRealtime.js).
  * `state.lastEventTimestamp` is the monotonic dedup/out-of-order watermark;
- * `state.levelArmed` is a sparse map (grid-level-index -> armed boolean,
- * default true when absent — see gridSimulatorEngine.js's file doc comment
- * for the full crossing/re-arming model).
+ * `state.pendingBuyLevels`/`state.pendingSellLevels` (ADR-037) are the set
+ * of currently-armed trigger prices — see gridSimulatorEngine.js's file doc
+ * comment for the full per-fill paired-trigger crossing model.
  *
  * `processingLockedUntil` is a short-TTL claim, same idiom as
  * LiveStrategyRuntime.processingLockedUntil — prevents two concurrent
@@ -31,12 +31,15 @@ const gridSimulatorSessionSchema = new mongoose.Schema(
         status: { type: String, enum: ["CREATED", "ACTIVE", "PAUSED", "STOPPED"], default: "CREATED", index: true },
 
         config: {
-            // Immutable anchor R — captured from a fresh, validated live
-            // quote at session-creation time (see gridSimulatorRoutes.js's
-            // captureFreshReference()), never a user-typed value, and never
-            // changed again regardless of pause/resume/restart.
-            referencePrice: { type: Number, required: true },
-            referenceCapturedAt: { type: Date, required: true },
+            // Immutable anchor R — null until the session is actually
+            // started (ADR-038): captured from a fresh, validated live
+            // quote the moment the user clicks Start (see
+            // gridSimulatorRoutes.js's captureFreshReference()), never a
+            // user-typed value, and never changed again once set,
+            // regardless of pause/resume/restart. A CREATED session (not
+            // yet started) genuinely has no reference yet.
+            referencePrice: { type: Number, default: null },
+            referenceCapturedAt: { type: Date, default: null },
             gridInterval: { type: Number, required: true },
             // ADR-034: optional asymmetric sell-side spacing. null means the
             // sell side mirrors gridInterval (the original symmetric
@@ -51,8 +54,6 @@ const gridSimulatorSessionSchema = new mongoose.Schema(
             sellQuantityPerLevel: { type: Number, default: null },
             startingCapital: { type: Number, required: true },
             maxPositionSize: { type: Number, default: null },
-            commissionPct: { type: Number, default: 0 },
-            slippagePct: { type: Number, default: 0 },
             // Optional pre-existing inventory at creation — startingAvgCost
             // is required (validated at the engine layer) only when
             // startingHoldings > 0.
@@ -82,13 +83,20 @@ const gridSimulatorSessionSchema = new mongoose.Schema(
             avgCost: { type: Number, required: true, default: 0 },
             realizedPnL: { type: Number, required: true, default: 0 },
             lastPrice: { type: Number, default: null },
-            // ADR-031: the trailing/rebasing anchor that defines the NEXT
-            // tradeable levels (activeReference + n*gridInterval) — starts
-            // equal to config.referencePrice and rebases to the last grid
-            // level reached after every crossing (filled, partial, or
-            // skipped). Distinct from config.referencePrice, which stays
-            // immutable forever for audit/display.
+            // Deprecated (ADR-037): the old single rebasing-reference
+            // anchor. No longer read or written by the engine — kept only
+            // so an already-persisted pre-ADR-037 session document still
+            // validates/loads without a schema error until migrated (see
+            // scripts/backfillGridPendingLevels.js).
             activeReference: { type: Number, default: null },
+            // ADR-037: every currently-armed trigger price of that type.
+            // Every filled/skipped/partial BUY at P arms a new SELL at
+            // `P + sellVariance` and a new BUY at `P - buyVariance`;
+            // every SELL at P arms a new BUY at `P - buyVariance` and a new
+            // SELL at `P + sellVariance` — see gridSimulatorEngine.js's file
+            // doc comment for the full design. Replaces `activeReference`.
+            pendingBuyLevels: { type: [Number], default: () => [] },
+            pendingSellLevels: { type: [Number], default: () => [] },
             lastEventTimestamp: { type: Date, default: null },
             // Deprecated (ADR-031): the old fixed-grid design's per-level
             // armed/disarmed map. No longer read or written by the engine —

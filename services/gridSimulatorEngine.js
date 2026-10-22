@@ -6,42 +6,65 @@
  * entry against virtual cash/holdings.
  *
  * Design (see .claude/state/DECISIONS.md ADR-021 for the original fixed-
- * grid design and ADR-031 for the trailing/rebasing redesign below):
+ * grid design, ADR-031 for the trailing/rebasing redesign, ADR-037 for the
+ * per-fill paired-trigger redesign which replaces ADR-031's single
+ * `activeReference`, and ADR-038 below):
  *
  * - `config.referencePrice` ("Initial Reference") is the immutable anchor
- *   captured once at session creation — kept forever for audit/display,
- *   but it does NOT define the tradeable grid levels once trading begins.
- * - `state.activeReference` ("Active Reference") is the anchor that
- *   ACTUALLY defines the next tradeable levels: `activeReference +
- *   n*gridInterval`. It starts equal to `referencePrice` and REBASES to
- *   the last grid level reached after EVERY crossing — whether that
- *   crossing's trade filled, partially filled, or was fully skipped for
- *   insufficient cash/holdings. Example: reference 320, interval 3, price
- *   moves 320 -> 329 (crossing 323/326/329, all skipped for insufficient
- *   holdings) -> activeReference becomes 329. A later pullback to 326 is
- *   now a BUY (326 = 329 - interval), not a dead zone below the original
- *   323/326/329 sell levels. The lattice itself (every point
- *   `referencePrice + k*gridInterval` for any integer k) never shifts
- *   phase — rebasing only changes which lattice point is "zero" for the
- *   NEXT crossing, so `activeReference` is always itself a lattice point.
- * - Because the reference always rebases to wherever price last crossed,
- *   there is no separate "armed/disarmed" concept anymore: every crossing
- *   is evaluated fresh against the current `activeReference`, and
- *   direction alone decides the action — a downward crossing is always a
- *   BUY attempt, an upward crossing is always a SELL attempt (relative to
- *   whatever the active reference currently is).
- * - One price update (one tick, or one open-after-gap event) can cross
- *   several levels at once (e.g. an overnight gap). Every level crossed
- *   in that single update fills at the SAME actual event price — never
- *   at its own (possibly-skipped) grid price. The triggering grid level
- *   and the simulated fill price are always recorded separately; the
- *   active reference rebases to the LAST (farthest) level reached in that
- *   one update, not to the raw observed price.
+ *   — kept forever for audit/display, but it does NOT define the tradeable
+ *   grid levels once trading begins. ADR-038: captured at session START
+ *   (not creation) from a fresh live quote, and the session's first trade
+ *   is an IMMEDIATE BUY at that exact price (`startWithInitialBuy()`),
+ *   establishing an initial position right away instead of waiting for a
+ *   crossing. `createInitialGridState()` below is still used to build the
+ *   pre-trade "shell" (seeds `pendingBuyLevels` at `referencePrice -
+ *   buyVariance` — which, not coincidentally, IS this initial buy's own
+ *   continuation target, so it needs no further adjustment);
+ *   `startWithInitialBuy()` then applies the one real fill on top of it and
+ *   arms that fill's own sell target. Session CREATION, by contrast, has no
+ *   reference yet at all — `createShellState()` builds a reference-free
+ *   shell (cash/holdings from config only) for display between creation
+ *   and the user clicking Start.
+ * - `state.pendingBuyLevels`/`state.pendingSellLevels` (ADR-037) are arrays
+ *   of prices — every currently-armed trigger of that type. Every FILLED
+ *   (or skipped/partially-filled) BUY at price P consumes itself and arms
+ *   TWO new levels: a SELL at `P + sellVariance` (that specific buy's own
+ *   take-profit target — never a shared/rebasing reference) and a BUY at
+ *   `P - buyVariance` (continues the accumulation ladder if price keeps
+ *   falling). Symmetrically, every SELL at price P arms a BUY at
+ *   `P - buyVariance` and a SELL at `P + sellVariance`. This is the
+ *   standard "replace a filled order with two new ones" grid-bot rule.
+ *   `pendingBuyLevels` seeds with one entry at `referencePrice -
+ *   buyVariance`; `pendingSellLevels` seeds empty (or with one entry at
+ *   `startingAvgCost + sellVariance` when the session starts with existing
+ *   holdings).
+ * - A newly-armed SELL level is always ABOVE current price at the moment
+ *   it's created (it's created exactly when a buy just happened at a lower
+ *   price), and a newly-armed BUY level is always BELOW current price at
+ *   creation — this is an invariant that holds for the lifetime of every
+ *   level, not just at creation. So a downward price move can only ever
+ *   cross pending BUY-type levels, and an upward move can only ever cross
+ *   pending SELL-type levels — never a mix within one event, which keeps
+ *   direction alone sufficient to decide which array to scan (same
+ *   dispatch simplicity as ADR-031's "direction alone decides the
+ *   action").
+ * - One price update (one tick, or one open-after-gap event) can still
+ *   cross several levels at once (e.g. an overnight gap) — this now
+ *   requires an iterative cascade (pop the nearest in-range level, fire
+ *   it, arm its two follow-on levels, check again) since there's no
+ *   closed-form lattice to compute the whole crossed set from in one shot
+ *   the way ADR-031's single reference allowed. The cascade is bounded:
+ *   each step moves the remaining range closer by at least one
+ *   buyVariance/sellVariance. Every level crossed in that single update
+ *   fills at the SAME actual event price — never at its own (possibly-
+ *   skipped) level price. The triggering level and the simulated fill
+ *   price are always recorded separately.
  * - A buy/sell that can't be filled in full (insufficient cash/holdings)
  *   fills the affordable/available remainder (if >=1 share) or is fully
- *   skipped — either way the reference still rebases to that level, so
- *   the position can be revisited on the very next qualifying move in
- *   either direction. This is the deterministic policy the spec requires.
+ *   skipped — either way it still consumes its own triggering level and
+ *   still arms both follow-on levels, so the ladder keeps moving
+ *   deterministically regardless of fill success. This is the same
+ *   philosophy ADR-031 used for its single reference, applied per-level.
  * - Cost basis: FIFO lot queue (ADR-032). Every filled BUY pushes a
  *   {qty, price} lot onto the end of `state.lots`. Every filled SELL
  *   consumes lots from the FRONT of the queue (oldest first) until the
@@ -54,7 +77,9 @@
  *   realized P&L; unrealized P&L (computePortfolioMetrics) legitimately
  *   uses it since mark-to-market valuation of the remaining position is
  *   the same number either way lots are represented. avgCost is 0 when
- *   the lot queue is empty (holdings back to exactly 0).
+ *   the lot queue is empty (holdings back to exactly 0). ADR-037 does NOT
+ *   change any of this — a SELL always consumes the oldest lot(s) first,
+ *   regardless of which pending level fired it, exactly as before.
  * - Optional asymmetric spacing (ADR-034): `config.sellVariance`, when set,
  *   is the spacing used for upward (SELL) crossings, while `gridInterval`
  *   remains the spacing for downward (BUY) crossings. `sellVariance` is
@@ -65,11 +90,20 @@
  *   when set, is the quantity used for SELL fills, while `quantityPerLevel`
  *   remains the quantity for BUY fills. Same null-means-mirror pattern as
  *   sellVariance.
- * - Optional `commissionPct`/`slippagePct` (same naming/semantics as the
- *   existing backtest/live engines' two-knob cost model — see ADR-019)
- *   default to 0, i.e. fills are exact at the event price unless
- *   explicitly configured otherwise. This model has the same disclosed
- *   limitation as ADR-019: no STT/exchange/GST/SEBI/stamp-duty modeling.
+ * - ADR-039: zero-friction fills. There is no slippage/commission knob —
+ *   every BUY/SELL fills at the exact observed event price, full stop. An
+ *   earlier revision modeled a synthetic `commissionPct`/`slippagePct`
+ *   two-knob cost (same shape as the professional backtest/live engines'
+ *   model), but for a grid strategy with a small per-level variance, that
+ *   synthetic round-trip cost could dwarf the variance itself and make
+ *   every cycle a guaranteed loser regardless of price direction — a
+ *   confusing, unrealistic result. Real transaction-cost estimation (STT,
+ *   exchange charges, GST, SEBI fee, stamp duty, Zerodha-style brokerage)
+ *   is modeled separately and accurately by `gridChargesCalculator.js`
+ *   (ADR-035) and shown as a dedicated, informational-only "Charges"
+ *   summary — it never adjusts the actual fill price or cash/realizedPnL,
+ *   by design, so the core P&L stays simple and exactly reconcilable from
+ *   the trade ledger's own fillPrice/qtyFilled columns.
  */
 
 const PRICE_SCALE = 100; // 2 decimal places (paise-level precision)
@@ -142,20 +176,6 @@ function validateGridConfig(config = {}) {
         errors.push("maxPositionSize must be a positive integer when provided");
     }
 
-    if (
-        config.commissionPct !== undefined &&
-        (!isFiniteNumber(config.commissionPct) || config.commissionPct < 0)
-    ) {
-        errors.push("commissionPct must be a non-negative number when provided");
-    }
-
-    if (
-        config.slippagePct !== undefined &&
-        (!isFiniteNumber(config.slippagePct) || config.slippagePct < 0)
-    ) {
-        errors.push("slippagePct must be a non-negative number when provided");
-    }
-
     const startingHoldings = config.startingHoldings ?? 0;
     if (!Number.isInteger(startingHoldings) || startingHoldings < 0) {
         errors.push("startingHoldings must be a non-negative integer when provided");
@@ -186,23 +206,16 @@ function normalizeConfig(config) {
         sellQuantityPerLevel: config.sellQuantityPerLevel != null ? config.sellQuantityPerLevel : null,
         startingCapital: roundPrice(config.startingCapital),
         maxPositionSize: config.maxPositionSize ?? null,
-        commissionPct: config.commissionPct ?? 0,
-        slippagePct: config.slippagePct ?? 0,
         startingHoldings: Math.max(0, Math.trunc(config.startingHoldings || 0)),
         startingAvgCost: config.startingHoldings > 0 ? roundPrice(config.startingAvgCost) : 0,
     };
 }
 
 /** Level price relative to the IMMUTABLE initial reference — used only for
- *  display/audit (e.g. GridLevelsChart's static lattice lines), never for
- *  deciding crossings (see levelPriceFromReference for that). */
+ *  display/audit, never for deciding crossings (ADR-037 crossings are
+ *  decided against `state.pendingBuyLevels`/`pendingSellLevels` instead). */
 function levelPrice(config, n) {
     return roundPrice(config.referencePrice + n * config.gridInterval);
-}
-
-/** Level price relative to an explicit (possibly rebased) reference. */
-function levelPriceFromReference(reference, gridInterval, n) {
-    return roundPrice(reference + n * gridInterval);
 }
 
 /** Weighted-average cost across the current FIFO lot queue — a DISPLAY
@@ -245,13 +258,20 @@ function consumeLotsFifo(lots, qty, unitProceeds) {
  * the initial crossing/dedup watermark directly from the fresh quote
  * captured at session creation — "at session creation, initialize the
  * crossing watermark using the initial reference quote," not left to an
- * implicit null-fallback. `lastPrice` and `activeReference` are likewise
- * seeded to the anchor itself (`referencePrice`) rather than null,
- * matching the same intent.
+ * implicit null-fallback. `lastPrice` is likewise seeded to the anchor
+ * itself (`referencePrice`) rather than null, matching the same intent.
+ *
+ * ADR-037: `pendingBuyLevels` seeds with exactly one entry
+ * (`referencePrice - buyVariance`) — the only trigger needed before any
+ * fill has ever happened. `pendingSellLevels` seeds empty UNLESS the
+ * session starts with existing holdings, in which case that starting
+ * position gets its own sell target too (`startingAvgCost +
+ * sellVariance`), symmetric to how a real BUY fill would arm one.
  */
 function createInitialGridState(config) {
     const normalized = normalizeConfig(config);
     const lots = normalized.startingHoldings > 0 ? [{ qty: normalized.startingHoldings, price: normalized.startingAvgCost }] : [];
+    const sellVariance = normalized.sellVariance ?? normalized.gridInterval;
     return {
         cash: normalized.startingCapital,
         holdings: normalized.startingHoldings,
@@ -259,49 +279,127 @@ function createInitialGridState(config) {
         avgCost: normalized.startingAvgCost, // derived display value, kept in sync with `lots`
         realizedPnL: 0,
         lastPrice: normalized.referencePrice,
-        activeReference: normalized.referencePrice,
+        pendingBuyLevels: [roundPrice(normalized.referencePrice - normalized.gridInterval)],
+        pendingSellLevels: normalized.startingHoldings > 0 ? [roundPrice(normalized.startingAvgCost + sellVariance)] : [],
         lastEventTimestamp: config.referenceCapturedAt ? new Date(config.referenceCapturedAt).toISOString() : null,
         sequence: 0,
     };
 }
 
 /**
- * Finds every grid level crossed moving from prevPrice to newPrice
- * (inclusive at BOTH ends), relative to `referenceCents` — the CURRENT
- * active reference at the start of this event, not necessarily the
- * immutable initial reference. Returns level offsets (integer steps from
- * that reference) in actual traversal order (closest-to-prev first),
- * which matters because cash/holdings constraints are applied
- * sequentially within one event, and because the reference itself rebases
- * to the last offset reached.
+ * ADR-038: a reference-free "shell" state for a session that's been
+ * created but not yet started — cash/holdings/lots are already known from
+ * config (startingCapital/startingHoldings/startingAvgCost), but there is
+ * no referencePrice yet (that's only captured when the user clicks Start),
+ * so there are no pending trigger levels and no lastPrice either.
  */
-function findCrossedLevels(gridInterval, referenceCents, prevPriceCents, newPriceCents) {
-    if (prevPriceCents === newPriceCents) return [];
+function createShellState(config) {
+    const startingHoldings = Math.max(0, Math.trunc(config.startingHoldings || 0));
+    const startingAvgCost = startingHoldings > 0 ? roundPrice(config.startingAvgCost) : 0;
+    const lots = startingHoldings > 0 ? [{ qty: startingHoldings, price: startingAvgCost }] : [];
+    return {
+        cash: roundPrice(config.startingCapital),
+        holdings: startingHoldings,
+        lots,
+        avgCost: startingAvgCost,
+        realizedPnL: 0,
+        lastPrice: null,
+        pendingBuyLevels: [],
+        pendingSellLevels: [],
+        lastEventTimestamp: null,
+        sequence: 0,
+    };
+}
 
-    const direction = newPriceCents > prevPriceCents ? "up" : "down";
-    const intervalCents = toCents(gridInterval);
+/**
+ * ADR-038: the live simulator's "Start" action — `rawConfig.referencePrice`
+ * must already be a freshly-captured, validated live quote (same
+ * provenance guarantee ADR-023/024 required at creation; the fetch/
+ * freshness check itself lives in gridSimulatorRoutes.js's
+ * captureFreshReference(), which needs marketDataService that this
+ * DB-only/pure-math service deliberately doesn't depend on).
+ *
+ * Composes two already-proven building blocks rather than duplicating
+ * their logic: `createInitialGridState()` (unchanged — its seeded
+ * `pendingBuyLevels` at `referencePrice - buyVariance` already IS this
+ * initial buy's own continuation target, needing no further adjustment)
+ * and `applyBuy()` (unchanged — the exact same slippage/commission/qty-
+ * clamp/FIFO-lot logic every other buy fill uses), executed immediately
+ * at the reference price itself rather than triggered by a crossing. Only
+ * the resulting fill's own SELL target needs arming on top of whatever
+ * `createInitialGridState()` already seeded.
+ */
+function startWithInitialBuy(rawConfig, referenceCapturedAt) {
+    const config = normalizeConfig(rawConfig);
+    const seeded = createInitialGridState(rawConfig);
+    const buyResult = applyBuy({
+        config,
+        cash: seeded.cash,
+        holdings: seeded.holdings,
+        lots: seeded.lots,
+        fillPrice: config.referencePrice,
+        level: 0, // marks the one-time initial buy — distinct from the signed per-event counters used elsewhere
+        levelPriceValue: config.referencePrice,
+    });
 
-    const loCents = Math.min(prevPriceCents, newPriceCents);
-    const hiCents = Math.max(prevPriceCents, newPriceCents);
+    const sellVariance = config.sellVariance ?? config.gridInterval;
+    const pendingSellLevels = addPendingLevel([...seeded.pendingSellLevels], roundPrice(config.referencePrice + sellVariance));
 
-    const nLo = Math.floor((loCents - referenceCents) / intervalCents) - 1;
-    const nHi = Math.ceil((hiCents - referenceCents) / intervalCents) + 1;
+    return {
+        state: {
+            cash: buyResult.cash,
+            holdings: buyResult.holdings,
+            lots: buyResult.lots,
+            avgCost: buyResult.avgCost,
+            realizedPnL: 0,
+            lastPrice: config.referencePrice,
+            pendingBuyLevels: seeded.pendingBuyLevels,
+            pendingSellLevels,
+            lastEventTimestamp: new Date(referenceCapturedAt).toISOString(),
+            sequence: 1,
+        },
+        trade: buyResult.trade,
+    };
+}
 
-    const levels = [];
-    for (let n = nLo; n <= nHi; n += 1) {
-        if (n === 0) continue;
-        const lCents = referenceCents + n * intervalCents;
-        if (lCents >= loCents && lCents <= hiCents) levels.push(n);
-    }
-
-    levels.sort((a, b) => (direction === "down" ? b - a : a - b));
+/**
+ * Adds `priceValue` to `levels` unless a level at that exact price (to
+ * paise precision) already exists — a harmless de-dup against the rare
+ * case of two independent fills arming the same exact trigger price.
+ * Mutates and returns `levels` for convenient chaining.
+ */
+function addPendingLevel(levels, priceValue) {
+    const cents = toCents(priceValue);
+    if (!levels.some((p) => toCents(p) === cents)) levels.push(roundPrice(priceValue));
     return levels;
 }
 
+/**
+ * ADR-037: repeatedly pops the nearest pending level of the active
+ * direction that still falls within `[loCents, hiCents]`, in traversal
+ * order (closest-to-prev first — same discipline ADR-031's single-
+ * reference lattice used). Returns the ordered list of fired level prices;
+ * the caller (processPriceUpdate) is responsible for actually applying
+ * each fill and arming its two follow-on levels before the next iteration
+ * can see them — this function only discovers WHICH existing levels are in
+ * range at the moment it's called, it does not arm new ones itself (it has
+ * no visibility into fills/follow-ons, which depend on cash/holdings state
+ * this pure discovery step doesn't touch).
+ */
+function findNearestInRangeLevel(levels, loCents, hiCents, direction) {
+    const inRange = levels.filter((p) => {
+        const c = toCents(p);
+        return c >= loCents && c <= hiCents;
+    });
+    if (inRange.length === 0) return null;
+    // "Nearest to prevPrice" means: largest remaining value on a down move
+    // (prevPrice is at the top of the range), smallest on an up move
+    // (prevPrice is at the bottom of the range).
+    return roundPrice(direction === "down" ? Math.max(...inRange) : Math.min(...inRange));
+}
+
 function applyBuy({ config, cash, holdings, lots, fillPrice, level, levelPriceValue }) {
-    const slippageMultiplier = 1 + config.slippagePct / 100;
-    const effectivePrice = roundPrice(fillPrice * slippageMultiplier);
-    const unitCost = roundPrice(effectivePrice * (1 + config.commissionPct / 100));
+    const unitCost = roundPrice(fillPrice);
 
     const targetQty = config.quantityPerLevel;
     const affordableByCash = unitCost > 0 ? Math.floor(cash / unitCost) : 0;
@@ -320,7 +418,6 @@ function applyBuy({ config, cash, holdings, lots, fillPrice, level, levelPriceVa
                 level,
                 levelPrice: levelPriceValue,
                 fillPrice,
-                effectivePrice,
                 qtyRequested: targetQty,
                 qtyFilled: 0,
                 qtySkipped: targetQty,
@@ -346,7 +443,6 @@ function applyBuy({ config, cash, holdings, lots, fillPrice, level, levelPriceVa
             level,
             levelPrice: levelPriceValue,
             fillPrice,
-            effectivePrice,
             qtyRequested: targetQty,
             qtyFilled: qty,
             qtySkipped: targetQty - qty,
@@ -357,9 +453,7 @@ function applyBuy({ config, cash, holdings, lots, fillPrice, level, levelPriceVa
 }
 
 function applySell({ config, cash, holdings, lots, realizedPnL, fillPrice, level, levelPriceValue }) {
-    const slippageMultiplier = 1 - config.slippagePct / 100;
-    const effectivePrice = roundPrice(fillPrice * slippageMultiplier);
-    const unitProceeds = roundPrice(effectivePrice * (1 - config.commissionPct / 100));
+    const unitProceeds = roundPrice(fillPrice);
 
     // ADR-035: SELL fills use sellQuantityPerLevel when set, else mirror
     // quantityPerLevel (the "buy quantity") — same mirror pattern as
@@ -379,7 +473,6 @@ function applySell({ config, cash, holdings, lots, realizedPnL, fillPrice, level
                 level,
                 levelPrice: levelPriceValue,
                 fillPrice,
-                effectivePrice,
                 qtyRequested: targetQty,
                 qtyFilled: 0,
                 qtySkipped: targetQty,
@@ -408,7 +501,6 @@ function applySell({ config, cash, holdings, lots, realizedPnL, fillPrice, level
             level,
             levelPrice: levelPriceValue,
             fillPrice,
-            effectivePrice,
             qtyRequested: targetQty,
             qtyFilled: qty,
             qtySkipped: targetQty - qty,
@@ -457,48 +549,55 @@ function processPriceUpdate({ config: rawConfig, state, price, eventTimestamp })
         };
     }
 
-    const activeReference = state.activeReference == null ? config.referencePrice : state.activeReference;
     const direction = roundedPrice < prevPrice ? "down" : "up";
-    // ADR-034: a downward move only ever crosses BUY levels (spaced by
-    // gridInterval, the "buy variance"); an upward move only ever crosses
-    // SELL levels (spaced by sellVariance, or gridInterval when sellVariance
-    // isn't set). Direction is fixed for the whole event, so only one
-    // variance is ever relevant per call.
-    const variance = direction === "down" ? config.gridInterval : (config.sellVariance ?? config.gridInterval);
-    const crossedLevels = findCrossedLevels(variance, toCents(activeReference), toCents(prevPrice), toCents(roundedPrice));
+    const buyVariance = config.gridInterval;
+    const sellVariance = config.sellVariance ?? config.gridInterval;
+    const loCents = Math.min(toCents(prevPrice), toCents(roundedPrice));
+    const hiCents = Math.max(toCents(prevPrice), toCents(roundedPrice));
 
     let { cash, holdings, avgCost, realizedPnL } = state;
     let lots = state.lots || [];
-    let newActiveReference = activeReference;
+    let pendingBuyLevels = [...(state.pendingBuyLevels || [])];
+    let pendingSellLevels = [...(state.pendingSellLevels || [])];
     const trades = [];
 
-    // Direction alone decides the action now — every crossing is evaluated
-    // fresh against the (rebasing) active reference, so there is no
-    // separate armed/disarmed state to track (see ADR-031).
-    crossedLevels.forEach((n) => {
-        const levelPriceValue = levelPriceFromReference(activeReference, variance, n);
+    // ADR-037: direction alone decides which array is even reachable this
+    // event (see the file doc comment's invariant — a newly-armed SELL
+    // level is always above current price at creation, a newly-armed BUY
+    // level always below, so a downward move can never reach a pending
+    // SELL and vice versa). Iterative because there's no closed-form
+    // lattice anymore: firing a level arms a new same-direction level that
+    // may ALSO fall within the remaining range — a gap must still cascade
+    // through every level it passes, exactly as ADR-031 did.
+    for (;;) {
+        const levelPriceValue = findNearestInRangeLevel(direction === "down" ? pendingBuyLevels : pendingSellLevels, loCents, hiCents, direction);
+        if (levelPriceValue == null) break;
 
         if (direction === "down") {
-            const result = applyBuy({ config, cash, holdings, lots, fillPrice: roundedPrice, level: n, levelPriceValue });
+            pendingBuyLevels = pendingBuyLevels.filter((p) => toCents(p) !== toCents(levelPriceValue));
+            const result = applyBuy({ config, cash, holdings, lots, fillPrice: roundedPrice, level: -(trades.length + 1), levelPriceValue });
             cash = result.cash;
             holdings = result.holdings;
             lots = result.lots;
             avgCost = result.avgCost;
             trades.push(result.trade);
+
+            addPendingLevel(pendingSellLevels, levelPriceValue + sellVariance);
+            addPendingLevel(pendingBuyLevels, levelPriceValue - buyVariance);
         } else {
-            const result = applySell({ config, cash, holdings, lots, realizedPnL, fillPrice: roundedPrice, level: n, levelPriceValue });
+            pendingSellLevels = pendingSellLevels.filter((p) => toCents(p) !== toCents(levelPriceValue));
+            const result = applySell({ config, cash, holdings, lots, realizedPnL, fillPrice: roundedPrice, level: trades.length + 1, levelPriceValue });
             cash = result.cash;
             holdings = result.holdings;
             lots = result.lots;
             avgCost = result.avgCost;
             realizedPnL = result.realizedPnL;
             trades.push(result.trade);
-        }
 
-        // Rebase to the last (farthest) level reached — whether that
-        // level's trade filled, partially filled, or was fully skipped.
-        newActiveReference = levelPriceValue;
-    });
+            addPendingLevel(pendingBuyLevels, levelPriceValue - buyVariance);
+            addPendingLevel(pendingSellLevels, levelPriceValue + sellVariance);
+        }
+    }
 
     const newState = {
         cash,
@@ -507,44 +606,44 @@ function processPriceUpdate({ config: rawConfig, state, price, eventTimestamp })
         avgCost,
         realizedPnL,
         lastPrice: roundedPrice,
-        activeReference: newActiveReference,
+        pendingBuyLevels,
+        pendingSellLevels,
         lastEventTimestamp: eventTimestamp,
         sequence: state.sequence + 1,
     };
 
-    return { state: newState, trades, skipped: false, gapFill: crossedLevels.length > 1 };
+    return { state: newState, trades, skipped: false, gapFill: trades.length > 1 };
 }
 
 /**
  * Replays a batch of the engine's already-decided trades (in their
  * original order) over the pre-update state to recover each trade's own
  * running cash/holdings/avgCost snapshot for the ledger — using only each
- * trade's own recorded fields (qtyFilled/effectivePrice/type) plus the
- * session's commissionPct, the exact same arithmetic applyBuy/applySell
- * already used internally (including the FIFO lot queue, ADR-032, so
- * avgCostAfter reflects the real remaining lots, not a re-blended
- * average). This never re-decides anything (quantities/prices, and for a
- * SELL its realizedPnLDelta, are already final/trusted from the trade
- * itself) — it only reconstructs the audit trail the pure engine's return
- * value doesn't carry per-trade. Shared by both the live simulator
- * (gridSimulatorService.js) and the historical replay engine
- * (gridBacktestEngine.js) so the ledger's running-balance math is never
- * duplicated.
+ * trade's own recorded fields (qtyFilled/fillPrice/type), the exact same
+ * arithmetic applyBuy/applySell already used internally (including the
+ * FIFO lot queue, ADR-032, so avgCostAfter reflects the real remaining
+ * lots, not a re-blended average). This never re-decides anything
+ * (quantities/prices, and for a SELL its realizedPnLDelta, are already
+ * final/trusted from the trade itself) — it only reconstructs the audit
+ * trail the pure engine's return value doesn't carry per-trade. Shared by
+ * both the live simulator (gridSimulatorService.js) and the historical
+ * replay engine (gridBacktestEngine.js) so the ledger's running-balance
+ * math is never duplicated.
  */
-function annotateRunningState(trades, startState, commissionPct) {
+function annotateRunningState(trades, startState) {
     let cash = startState.cash;
     let holdings = startState.holdings;
     let lots = startState.lots || [];
 
     return trades.map((trade) => {
         if (trade.type === "BUY" && trade.qtyFilled > 0) {
-            const unitCost = roundPrice(trade.effectivePrice * (1 + commissionPct / 100));
+            const unitCost = roundPrice(trade.fillPrice);
             const cost = roundPrice(trade.qtyFilled * unitCost);
             lots = [...lots, { qty: trade.qtyFilled, price: unitCost }];
             holdings += trade.qtyFilled;
             cash = roundPrice(cash - cost);
         } else if (trade.type === "SELL" && trade.qtyFilled > 0) {
-            const unitProceeds = roundPrice(trade.effectivePrice * (1 - commissionPct / 100));
+            const unitProceeds = roundPrice(trade.fillPrice);
             const proceeds = roundPrice(trade.qtyFilled * unitProceeds);
             lots = consumeLotsFifo(lots, trade.qtyFilled, unitProceeds).lots;
             holdings -= trade.qtyFilled;
@@ -578,11 +677,13 @@ module.exports = {
     validateGridConfig,
     normalizeConfig,
     levelPrice,
-    levelPriceFromReference,
     weightedAvgCost,
     consumeLotsFifo,
     createInitialGridState,
-    findCrossedLevels,
+    createShellState,
+    startWithInitialBuy,
+    addPendingLevel,
+    findNearestInRangeLevel,
     processPriceUpdate,
     computePortfolioMetrics,
     annotateRunningState,

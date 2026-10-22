@@ -17,7 +17,8 @@
 
 const {
     validateGridConfig,
-    createInitialGridState,
+    createShellState,
+    startWithInitialBuy,
     processPriceUpdate,
     computePortfolioMetrics,
     roundPrice,
@@ -36,19 +37,17 @@ function makeError(statusCode, message) {
 }
 
 /**
- * `config.referencePrice`/`config.referenceCapturedAt` must already be the
- * result of a verified-fresh live quote by the time this is called — the
- * actual fetch + staleness check lives in gridSimulatorRoutes.js's
- * captureFreshReference() (it needs marketDataService, which this
- * DB-only/pure-math service deliberately doesn't depend on). This function
- * only requires that provenance be present, never re-derives or guesses it.
+ * ADR-038: the reference price is captured at START time, not creation —
+ * a session is created with NO reference yet (`config.referencePrice`/
+ * `referenceCapturedAt` both null) and a reference-free "shell" state
+ * (`createShellState()`). `validateGridConfig` is still run against a
+ * placeholder referencePrice (same precedent as gridBacktestService.js,
+ * which validates before its own real reference — the first candle's
+ * close — is known) so every OTHER field (variance, qty, capital, etc.)
+ * is still fully validated now, at creation.
  */
 async function createSession({ GridSimulatorSession, userId, instrumentKey, symbol, config }) {
-    if (!config.referenceCapturedAt) {
-        throw makeError(400, "referenceCapturedAt (a captured live-quote timestamp) is required — the initial reference must come from a fresh market quote, never a user-typed value");
-    }
-
-    const validation = validateGridConfig(config);
+    const validation = validateGridConfig({ ...config, referencePrice: config.referencePrice || 1 });
     if (!validation.valid) {
         throw makeError(400, `Invalid grid configuration: ${validation.errors.join("; ")}`);
     }
@@ -62,7 +61,7 @@ async function createSession({ GridSimulatorSession, userId, instrumentKey, symb
         throw makeError(409, "A grid simulator session for this instrument is already running or paused. Stop it before creating a new one.");
     }
 
-    const initialState = createInitialGridState(config);
+    const initialState = createShellState(config);
 
     try {
         const session = await GridSimulatorSession.create({
@@ -71,16 +70,14 @@ async function createSession({ GridSimulatorSession, userId, instrumentKey, symb
             symbol,
             status: "CREATED",
             config: {
-                referencePrice: config.referencePrice,
-                referenceCapturedAt: config.referenceCapturedAt,
+                referencePrice: null,
+                referenceCapturedAt: null,
                 gridInterval: config.gridInterval,
                 sellVariance: config.sellVariance ?? null,
                 quantityPerLevel: config.quantityPerLevel,
                 sellQuantityPerLevel: config.sellQuantityPerLevel ?? null,
                 startingCapital: config.startingCapital,
                 maxPositionSize: config.maxPositionSize ?? null,
-                commissionPct: config.commissionPct ?? 0,
-                slippagePct: config.slippagePct ?? 0,
                 startingHoldings: config.startingHoldings ?? 0,
                 startingAvgCost: config.startingHoldings > 0 ? config.startingAvgCost : 0,
                 segmentClass: config.segmentClass || "EQUITY_DELIVERY",
@@ -121,10 +118,6 @@ async function transitionStatus({ GridSimulatorSession, sessionId, userId, from,
     return updated;
 }
 
-function startSession(deps) {
-    return transitionStatus({ ...deps, from: ["CREATED", "PAUSED"], to: "ACTIVE", extraSet: { startedAt: new Date() } });
-}
-
 function pauseSession(deps) {
     return transitionStatus({ ...deps, from: ["ACTIVE"], to: "PAUSED" });
 }
@@ -135,6 +128,67 @@ function resumeSession(deps) {
 
 function stopSession(deps) {
     return transitionStatus({ ...deps, from: ["CREATED", "ACTIVE", "PAUSED"], to: "STOPPED", extraSet: { stoppedAt: new Date() } });
+}
+
+/**
+ * ADR-038: the ONLY way a CREATED session becomes ACTIVE — captures the
+ * reference price right now (the caller, gridSimulatorRoutes.js, must
+ * already have fetched+validated a fresh live quote, same provenance
+ * requirement ADR-023/024 used to apply at creation) and immediately
+ * executes one real BUY fill at that exact price
+ * (`startWithInitialBuy()`), recording it as the session's first ledger
+ * row even if it's skipped/partial (never silently dropped — same
+ * discipline `processTick` already applies to every other fill attempt).
+ * Resuming a PAUSED session (`resumeSession`) is a completely separate,
+ * unchanged path — it never re-captures a reference or re-buys.
+ */
+async function startSessionWithInitialBuy({ GridSimulatorSession, GridSimulatorTrade, sessionId, userId, referencePrice, referenceCapturedAt }) {
+    const session = await getOwnedSession({ GridSimulatorSession, sessionId, userId });
+    if (session.status !== "CREATED") {
+        throw makeError(409, `Cannot start from its current state (${session.status})`);
+    }
+
+    const config = {
+        referencePrice,
+        gridInterval: session.config.gridInterval,
+        sellVariance: session.config.sellVariance ?? null,
+        quantityPerLevel: session.config.quantityPerLevel,
+        sellQuantityPerLevel: session.config.sellQuantityPerLevel ?? null,
+        startingCapital: session.config.startingCapital,
+        maxPositionSize: session.config.maxPositionSize,
+        startingHoldings: session.config.startingHoldings,
+        startingAvgCost: session.config.startingAvgCost,
+    };
+
+    const { state, trade } = startWithInitialBuy(config, referenceCapturedAt);
+
+    const updated = await GridSimulatorSession.findOneAndUpdate(
+        { _id: session._id, status: "CREATED" },
+        {
+            $set: {
+                status: "ACTIVE",
+                startedAt: new Date(),
+                "config.referencePrice": referencePrice,
+                "config.referenceCapturedAt": referenceCapturedAt,
+                ...stateToDocFields(state),
+                "state.tradeSequence": 1,
+            },
+        },
+        { new: true },
+    );
+    if (!updated) {
+        throw makeError(409, "Session status changed before it could be started — refresh and try again");
+    }
+
+    const startState = {
+        cash: config.startingCapital,
+        holdings: config.startingHoldings,
+        lots: config.startingHoldings > 0 ? [{ qty: config.startingHoldings, price: config.startingAvgCost }] : [],
+    };
+    const [annotated] = annotateRunningState([trade], startState).map((t) => ({ ...t, sequence: 1, gapFill: false, eventTimestamp: referenceCapturedAt }));
+    await GridSimulatorTrade.insertMany([tradeToDoc({ trade: annotated, session: updated, sequence: 1, eventTimestamp: referenceCapturedAt, gapFill: false })]);
+
+    return updated;
 }
 
 function docStateToPlain(doc) {
@@ -153,13 +207,28 @@ function docStateToPlain(doc) {
         avgCost: s.avgCost,
         realizedPnL: s.realizedPnL,
         lastPrice: s.lastPrice ?? null,
-        // ADR-031: the trailing/rebasing anchor that actually defines the
-        // next tradeable levels — distinct from the immutable
-        // config.referencePrice. Falls back to null only for a session
-        // persisted before this field existed; processPriceUpdate treats a
-        // null activeReference the same as an unset one (uses
-        // config.referencePrice), so an old session resumes safely.
-        activeReference: s.activeReference ?? null,
+        // ADR-037: a session with a non-empty pendingBuyLevels has already
+        // migrated (every real session, new or old-but-migrated, always
+        // keeps at least one armed buy level — see the engine's doc
+        // comment). A session that's never been migrated has an empty
+        // array (the schema default) but a non-null `activeReference` —
+        // lazily synthesize its starting pending levels from that old
+        // anchor the same way scripts/backfillGridPendingLevels.js does,
+        // so an un-migrated session keeps working even before that script
+        // runs. `.toObject()`-free: these are plain Number arrays already.
+        ...(() => {
+            const hasMigrated = Array.isArray(s.pendingBuyLevels) && s.pendingBuyLevels.length > 0;
+            if (hasMigrated) {
+                return { pendingBuyLevels: s.pendingBuyLevels, pendingSellLevels: s.pendingSellLevels || [] };
+            }
+            const legacyReference = s.activeReference ?? doc.config.referencePrice;
+            const buyVariance = doc.config.gridInterval;
+            const sellVariance = doc.config.sellVariance ?? doc.config.gridInterval;
+            return {
+                pendingBuyLevels: [roundPrice(legacyReference - buyVariance)],
+                pendingSellLevels: s.holdings > 0 ? [roundPrice(legacyReference + sellVariance)] : [],
+            };
+        })(),
         lastEventTimestamp: s.lastEventTimestamp ?? null,
         sequence: s.sequence || 0,
         tradeSequence: s.tradeSequence || 0,
@@ -174,7 +243,8 @@ function stateToDocFields(state) {
         "state.avgCost": state.avgCost,
         "state.realizedPnL": state.realizedPnL,
         "state.lastPrice": state.lastPrice,
-        "state.activeReference": state.activeReference,
+        "state.pendingBuyLevels": state.pendingBuyLevels,
+        "state.pendingSellLevels": state.pendingSellLevels,
         "state.lastEventTimestamp": state.lastEventTimestamp,
         "state.sequence": state.sequence,
     };
@@ -189,7 +259,6 @@ function tradeToDoc({ trade, session, sequence, eventTimestamp, gapFill }) {
         level: trade.level,
         levelPrice: trade.levelPrice,
         fillPrice: trade.fillPrice,
-        effectivePrice: trade.effectivePrice,
         qtyRequested: trade.qtyRequested,
         qtyFilled: trade.qtyFilled,
         qtySkipped: trade.qtySkipped,
@@ -249,7 +318,7 @@ async function processTick({ GridSimulatorSession, GridSimulatorTrade, sessionId
 
         let ledgerTrades = result.trades;
         if (result.trades.length) {
-            const annotated = annotateRunningState(result.trades, state, claimed.config.commissionPct ?? 0).map((trade, i) => ({
+            const annotated = annotateRunningState(result.trades, state).map((trade, i) => ({
                 ...trade,
                 sequence: state.tradeSequence + 1 + i,
                 gapFill: result.gapFill,
@@ -344,8 +413,6 @@ async function updateSessionConfig({ GridSimulatorSession, sessionId, userId, pa
         sellQuantityPerLevel: Object.prototype.hasOwnProperty.call(patch, "sellQuantityPerLevel") ? patch.sellQuantityPerLevel : (current.sellQuantityPerLevel ?? null),
         startingCapital: current.startingCapital,
         maxPositionSize: current.maxPositionSize,
-        commissionPct: current.commissionPct,
-        slippagePct: current.slippagePct,
         startingHoldings: current.startingHoldings,
         startingAvgCost: current.startingAvgCost,
     };
@@ -392,10 +459,45 @@ function getPortfolioMetrics(session, currentPrice) {
     return computePortfolioMetrics(docStateToPlain(session), currentPrice);
 }
 
+/**
+ * ADR-037: the single "Active Reference" display concept is replaced by
+ * the two NEAREST currently-armed trigger prices (the full
+ * pendingBuyLevels/pendingSellLevels sets are internal engine state, not
+ * exposed in full — see gridSimulatorEngine.js's file doc comment for why
+ * they can grow over a long session). Falls back to deriving from the
+ * legacy `activeReference` for a session not yet migrated (same formula
+ * as docStateToPlain() above and scripts/backfillGridPendingLevels.js).
+ * Pure/stateless — takes a plain `{ state, config }`-shaped object, same
+ * precedent as gridChargesCalculator.js's classifySegmentClass (imported
+ * directly where needed, not DI-injected).
+ */
+function nearestPendingLevels({ state, config }) {
+    const hasMigrated = Array.isArray(state.pendingBuyLevels) && state.pendingBuyLevels.length > 0;
+    if (hasMigrated) {
+        const sells = state.pendingSellLevels || [];
+        return {
+            nextBuyLevel: Math.max(...state.pendingBuyLevels),
+            nextSellLevel: sells.length ? Math.min(...sells) : null,
+        };
+    }
+    // ADR-038: a CREATED session not yet started has no reference at all
+    // (neither the legacy activeReference nor config.referencePrice) —
+    // genuinely nothing to report yet, never fabricate a number from null.
+    const legacyReference = state.activeReference ?? config.referencePrice;
+    if (legacyReference == null) {
+        return { nextBuyLevel: null, nextSellLevel: null };
+    }
+    const sellVariance = config.sellVariance ?? config.gridInterval;
+    return {
+        nextBuyLevel: legacyReference - config.gridInterval,
+        nextSellLevel: state.holdings > 0 ? legacyReference + sellVariance : null,
+    };
+}
+
 module.exports = {
     createSession,
     getOwnedSession,
-    startSession,
+    startSessionWithInitialBuy,
     pauseSession,
     resumeSession,
     stopSession,
@@ -407,6 +509,7 @@ module.exports = {
     updateSessionConfig,
     deleteSession,
     getPortfolioMetrics,
+    nearestPendingLevels,
     docStateToPlain,
     LOCK_DURATION_MS,
 };

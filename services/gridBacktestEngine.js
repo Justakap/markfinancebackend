@@ -80,7 +80,7 @@ function replayCandles({ config, candles, isFinerGrained }) {
             const preUpdateState = { cash: state.cash, holdings: state.holdings, lots: state.lots };
             const result = processPriceUpdate({ config, state, price, eventTimestamp });
             state = result.state;
-            const annotated = annotateRunningState(result.trades, preUpdateState, config.commissionPct ?? 0);
+            const annotated = annotateRunningState(result.trades, preUpdateState);
             annotated.forEach((trade) => {
                 trades.push({
                     ...trade,

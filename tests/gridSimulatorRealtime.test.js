@@ -468,14 +468,19 @@ function makeFakeIo() {
         realtime.unregisterSession(session._id);
     });
 
-    await test("B. insufficient holdings: one skipped SELL, reference advances, no repeat on later non-crossing ticks", async () => {
-        const session = makeActiveSessionDoc(); // starts with holdings: 0
+    await test("B. insufficient holdings: one skipped SELL, the ladder keeps moving, no repeat on later non-crossing ticks", async () => {
+        // ADR-037: a pending sell level only exists once something has been
+        // bought — manually arm one (as if an earlier buy had armed it)
+        // against a session that still holds zero shares, to exercise the
+        // same insufficient_holdings skip path the old single-reference
+        // model exercised unconditionally.
+        const session = makeActiveSessionDoc({ state: { ...makeActiveSessionDoc().state, pendingBuyLevels: [337], pendingSellLevels: [343] } });
         const GridSimulatorSession = makeFakeSessionModel([session]);
         const GridSimulatorTrade = makeFakeTradeModel();
         realtime.init({ GridSimulatorSession, GridSimulatorTrade, io: makeFakeIo() });
         realtime.registerSession(session);
 
-        // Upward crossing of sell level n=1 at 343 with zero holdings.
+        // Upward crossing of the armed sell level at 343 with zero holdings.
         realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 343, timestamp: Date.now() }, "ws");
         await new Promise((resolve) => setTimeout(resolve, 15));
 
@@ -485,7 +490,7 @@ function makeFakeIo() {
         assert.strictEqual(GridSimulatorTrade.docs[0].qtyFilled, 0);
         assert.strictEqual(GridSimulatorTrade.docs[0].reason, "insufficient_holdings");
         assert.strictEqual(persisted.state.holdings, 0);
-        assert.strictEqual(persisted.state.lastPrice, 343, "the active reference/watermark advances even on a skipped trade");
+        assert.strictEqual(persisted.state.lastPrice, 343, "the watermark advances even on a skipped trade");
 
         // Further ticks that fluctuate above 343 without crossing a new
         // level must not create another SELL record.
@@ -498,16 +503,16 @@ function makeFakeIo() {
         realtime.unregisterSession(session._id);
     });
 
-    await test("C. after a skipped SELL rebases the reference, a later genuine crossing in either direction is processed normally (ADR-031)", async () => {
-        const session = makeActiveSessionDoc();
+    await test("C. after a skipped SELL arms its follow-on levels, later genuine crossings in either direction are processed normally (ADR-037)", async () => {
+        const session = makeActiveSessionDoc({ state: { ...makeActiveSessionDoc().state, pendingBuyLevels: [337], pendingSellLevels: [343] } });
         const GridSimulatorSession = makeFakeSessionModel([session]);
         const GridSimulatorTrade = makeFakeTradeModel();
         realtime.init({ GridSimulatorSession, GridSimulatorTrade, io: makeFakeIo() });
         realtime.registerSession(session);
 
-        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 343, timestamp: Date.now() }, "ws"); // skipped SELL @343, rebase -> 343
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 343, timestamp: Date.now() }, "ws"); // skipped SELL @343 (0 holdings), arms BUY@340
         await new Promise((resolve) => setTimeout(resolve, 15));
-        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 340, timestamp: Date.now() }, "ws"); // down-cross through the rebased reference's next level -> BUY
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 340, timestamp: Date.now() }, "ws"); // down-cross the armed 340 level -> BUY
         await new Promise((resolve) => setTimeout(resolve, 15));
         realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 343, timestamp: Date.now() }, "ws"); // up-cross again -> SELL (now has holdings to sell)
         await new Promise((resolve) => setTimeout(resolve, 15));
@@ -571,7 +576,7 @@ function makeFakeIo() {
     });
 
     await test("H. a processed (including skipped) crossing is not re-executed after a simulated restart/resync", async () => {
-        const session = makeActiveSessionDoc();
+        const session = makeActiveSessionDoc({ state: { ...makeActiveSessionDoc().state, pendingBuyLevels: [337], pendingSellLevels: [343] } });
         const GridSimulatorSession = makeFakeSessionModel([session]);
         const GridSimulatorTrade = makeFakeTradeModel();
         realtime.init({ GridSimulatorSession, GridSimulatorTrade, io: makeFakeIo() });

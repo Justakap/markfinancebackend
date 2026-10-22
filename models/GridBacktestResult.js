@@ -32,8 +32,6 @@ const gridBacktestResultSchema = new mongoose.Schema(
             quantityPerLevel: { type: Number, required: true },
             startingCapital: { type: Number, required: true },
             maxPositionSize: { type: Number, default: null },
-            commissionPct: { type: Number, default: 0 },
-            slippagePct: { type: Number, default: 0 },
             startingHoldings: { type: Number, default: 0 },
             startingAvgCost: { type: Number, default: 0 },
         },

@@ -38,7 +38,7 @@
  */
 
 const marketDataService = require("./marketDataService");
-const { processTick } = require("./gridSimulatorService");
+const { processTick, nearestPendingLevels } = require("./gridSimulatorService");
 const { computePortfolioMetrics } = require("./gridSimulatorEngine");
 
 // 15s was found too tight live: a healthy, continuously-connected feed
@@ -120,7 +120,15 @@ function buildUpdatePayload(sessionDoc, result, source) {
         source,
         state: {
             lastPrice: result.state?.lastPrice ?? sessionDoc.state?.lastPrice ?? null,
-            activeReference: result.state?.activeReference ?? sessionDoc.state?.activeReference ?? sessionDoc.config?.referencePrice ?? null,
+            ...nearestPendingLevels({
+                state: {
+                    pendingBuyLevels: result.state?.pendingBuyLevels ?? sessionDoc.state?.pendingBuyLevels,
+                    pendingSellLevels: result.state?.pendingSellLevels ?? sessionDoc.state?.pendingSellLevels,
+                    activeReference: result.state?.activeReference ?? sessionDoc.state?.activeReference,
+                    holdings: result.state?.holdings ?? sessionDoc.state?.holdings,
+                },
+                config: sessionDoc.config || {},
+            }),
             lastEventTimestamp: result.state?.lastEventTimestamp ?? sessionDoc.state?.lastEventTimestamp ?? null,
             sequence: result.state?.sequence ?? sessionDoc.state?.sequence ?? 0,
         },

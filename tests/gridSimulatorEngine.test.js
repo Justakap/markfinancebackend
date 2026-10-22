@@ -8,7 +8,8 @@ const assert = require("assert");
 const {
     validateGridConfig,
     createInitialGridState,
-    findCrossedLevels,
+    addPendingLevel,
+    findNearestInRangeLevel,
     processPriceUpdate,
     computePortfolioMetrics,
     toCents,
@@ -79,26 +80,31 @@ test("levelPrice computes downward and upward levels around the reference", () =
     assert.strictEqual(levelPrice(BASE_CONFIG, 2), 346);
 });
 
-test("findCrossedLevels finds a single downward level between two prices", () => {
-    const levels = findCrossedLevels(BASE_CONFIG.gridInterval, toCents(BASE_CONFIG.referencePrice), toCents(340), toCents(336));
-    assert.deepStrictEqual(levels, [-1]); // 337 only
+test("addPendingLevel appends a new price, but de-dupes an exact-price collision", () => {
+    const levels = [100, 103];
+    addPendingLevel(levels, 106);
+    assert.deepStrictEqual(levels, [100, 103, 106]);
+    addPendingLevel(levels, 103); // exact collision — not re-added
+    assert.deepStrictEqual(levels, [100, 103, 106]);
 });
 
-test("findCrossedLevels finds multiple levels in traversal order for a gap", () => {
-    const down = findCrossedLevels(BASE_CONFIG.gridInterval, toCents(BASE_CONFIG.referencePrice), toCents(340), toCents(310));
-    assert.deepStrictEqual(down, [-1, -2, -3, -4, -5, -6, -7, -8, -9, -10]); // 337..310
-
-    const up = findCrossedLevels(BASE_CONFIG.gridInterval, toCents(BASE_CONFIG.referencePrice), toCents(340), toCents(350));
-    assert.deepStrictEqual(up, [1, 2, 3]); // 343,346,349
+test("findNearestInRangeLevel picks the nearest-to-prevPrice level within range, per direction", () => {
+    // Moving down from 340 to 330: nearest-to-prev (340) in-range level is
+    // the LARGEST one in range.
+    assert.strictEqual(findNearestInRangeLevel([337, 334, 331, 320], toCents(330), toCents(340), "down"), 337);
+    // Moving up from 340 to 350: nearest-to-prev (340) in-range level is the
+    // SMALLEST one in range.
+    assert.strictEqual(findNearestInRangeLevel([343, 346, 349, 360], toCents(340), toCents(350), "up"), 343);
 });
 
-test("findCrossedLevels includes the exact boundary (inclusive both ends)", () => {
-    // Moving from exactly 337 (n=-1) further down to 334 (n=-2) re-includes
-    // 337 in the raw level-crossing list. Harmless at the pure level-
-    // finding layer: under the rebasing engine (ADR-031) every crossing is
-    // evaluated fresh, so this never caused a duplicate trade either way.
-    const levels = findCrossedLevels(BASE_CONFIG.gridInterval, toCents(BASE_CONFIG.referencePrice), toCents(337), toCents(334));
-    assert.deepStrictEqual(levels, [-1, -2]);
+test("findNearestInRangeLevel returns null when nothing is in range", () => {
+    assert.strictEqual(findNearestInRangeLevel([300, 500], toCents(330), toCents(340), "down"), null);
+    assert.strictEqual(findNearestInRangeLevel([], toCents(330), toCents(340), "down"), null);
+});
+
+test("findNearestInRangeLevel includes the exact boundary (inclusive both ends)", () => {
+    assert.strictEqual(findNearestInRangeLevel([334], toCents(334), toCents(337), "up"), 334);
+    assert.strictEqual(findNearestInRangeLevel([337], toCents(334), toCents(337), "down"), 337);
 });
 
 // --- single downward crossing triggers a buy at the ACTUAL price ---
@@ -121,14 +127,13 @@ test("a single downward crossing buys at the actual tick price, not the grid pri
     assert.strictEqual(result.state.cash, 100000 - 100 * 336);
 });
 
-test("a single upward move sells at the actual tick price, rebasing after each crossed level (ADR-031)", () => {
+test("a single upward move sells at the actual tick price, cascading through the sell level the BUY armed plus its own follow-on (ADR-037)", () => {
     let state = createInitialGridState(BASE_CONFIG);
-    state = processPriceUpdate({ config: BASE_CONFIG, state, price: 336, eventTimestamp: tick(1) }).state; // buy 100 @ 336, activeReference -> 337
+    state = processPriceUpdate({ config: BASE_CONFIG, state, price: 336, eventTimestamp: tick(1) }).state; // BUY 100 @336 arms SELL@340, BUY@334
 
-    // Price rises to 345. Relative to the REBASED activeReference (337),
-    // this crosses TWO sell levels (340 and 343) — 340 is no longer special
-    // just because it equals the immutable initial reference; only the
-    // CURRENT activeReference's own n=0 point is excluded.
+    // Price rises to 345: crosses the armed SELL@340 (fills all 100 held),
+    // which arms a follow-on SELL@343 — which is ALSO within [336,345], so
+    // the cascade fires it too (fully skipped, nothing left to sell).
     const result = processPriceUpdate({ config: BASE_CONFIG, state, price: 345, eventTimestamp: tick(2) });
     assert.strictEqual(result.trades.length, 2);
 
@@ -146,47 +151,44 @@ test("a single upward move sells at the actual tick price, rebasing after each c
     assert.strictEqual(result.state.holdings, 0);
     assert.strictEqual(result.state.avgCost, 0); // reset when flat
     assert.strictEqual(result.state.realizedPnL, 100 * (345 - 336));
-    assert.strictEqual(result.state.activeReference, 343); // rebased to the farthest level reached
+    assert.deepStrictEqual(result.state.pendingBuyLevels, [334, 337, 340]); // original continuation + each sell's own buy-back target
+    assert.deepStrictEqual(result.state.pendingSellLevels, [346]); // 343's own follow-on
 });
 
 // --- ADR-031: trailing/rebasing active reference ---
 
-test("a fluctuation that does not cross a NEW level relative to the current active reference produces no trade", () => {
+test("a fluctuation that does not cross any pending level produces no trade", () => {
     let state = createInitialGridState(BASE_CONFIG);
-    state = processPriceUpdate({ config: BASE_CONFIG, state, price: 336, eventTimestamp: tick(1) }).state; // buy @337, activeReference -> 337
+    state = processPriceUpdate({ config: BASE_CONFIG, state, price: 336, eventTimestamp: tick(1) }).state; // BUY @336 arms SELL@340, BUY@334
 
-    // Price wiggles within the same interval band around 337 (334 < price < 340).
+    // Price wiggles within the same band (334 < price < 340).
     state = processPriceUpdate({ config: BASE_CONFIG, state, price: 335.5, eventTimestamp: tick(2) }).state;
     const noRetrigger = processPriceUpdate({ config: BASE_CONFIG, state, price: 336.2, eventTimestamp: tick(3) });
     assert.strictEqual(noRetrigger.trades.length, 0);
     assert.strictEqual(noRetrigger.state.holdings, 100); // unchanged
-    assert.strictEqual(noRetrigger.state.activeReference, 337); // unchanged — no new level crossed
+    assert.deepStrictEqual(noRetrigger.state.pendingBuyLevels, [334]); // unchanged — no level crossed
+    assert.deepStrictEqual(noRetrigger.state.pendingSellLevels, [340]);
 });
 
-test("the user's worked example: 320 -> 329 (skipped sells, insufficient holdings) rebases the reference to 329, then a pullback to 326 is a BUY", () => {
+test("ADR-037: with zero starting holdings, an upward move before any BUY has ever happened finds no pending sell level to cross (nothing to sell since nothing was ever bought) — zero trades", () => {
     const config = { ...BASE_CONFIG, referencePrice: 320, startingCapital: 100000 };
-    let state = createInitialGridState(config); // holdings = 0
+    const state = createInitialGridState(config); // holdings = 0, pendingSellLevels seeds empty
+    assert.deepStrictEqual(state.pendingSellLevels, []);
 
     const up = processPriceUpdate({ config, state, price: 329, eventTimestamp: tick(1) });
-    assert.strictEqual(up.trades.length, 3); // crosses 323, 326, 329
-    up.trades.forEach((trade) => {
-        assert.strictEqual(trade.type, "SELL");
-        assert.strictEqual(trade.qtyFilled, 0);
-        assert.strictEqual(trade.reason, "insufficient_holdings");
-    });
-    assert.strictEqual(up.state.activeReference, 329); // rebased to the farthest level reached, even though every sell was skipped
-    state = up.state;
+    assert.strictEqual(up.trades.length, 0); // no pending sell level exists to even attempt
+    assert.strictEqual(up.state.holdings, 0);
+    assert.deepStrictEqual(up.state.pendingBuyLevels, [317]); // the original seed is untouched
 
-    const pullback = processPriceUpdate({ config, state, price: 326, eventTimestamp: tick(2) });
+    // The ladder still works normally for its actual job: a pullback to the
+    // original seeded BUY level still buys.
+    const pullback = processPriceUpdate({ config, state: up.state, price: 317, eventTimestamp: tick(2) });
     assert.strictEqual(pullback.trades.length, 1);
-    assert.strictEqual(pullback.trades[0].type, "BUY"); // 326 is now BELOW the rebased 329 reference
-    assert.strictEqual(pullback.trades[0].levelPrice, 326);
+    assert.strictEqual(pullback.trades[0].type, "BUY");
     assert.strictEqual(pullback.trades[0].qtyFilled, 100);
-    assert.strictEqual(pullback.state.holdings, 100);
-    assert.strictEqual(pullback.state.activeReference, 326);
 });
 
-test("rebasing is symmetric on the BUY side: a skipped BUY also moves the reference, enabling a later SELL at a price below the original reference", () => {
+test("ADR-037: a skipped (insufficient-cash) BUY still arms both follow-on levels, so a later bounce can sell at the level it armed", () => {
     const config = { ...BASE_CONFIG, referencePrice: 320, startingCapital: 0 }; // zero cash -> every buy skips
     let state = createInitialGridState(config);
 
@@ -197,14 +199,87 @@ test("rebasing is symmetric on the BUY side: a skipped BUY also moves the refere
         assert.strictEqual(trade.qtyFilled, 0);
         assert.strictEqual(trade.reason, "insufficient_cash");
     });
-    assert.strictEqual(down.state.activeReference, 311);
+    assert.deepStrictEqual(down.state.pendingBuyLevels, [308]); // continuation ladder kept going
+    assert.deepStrictEqual(down.state.pendingSellLevels, [320, 317, 314]); // each skipped buy still armed its own sell target
     state = { ...down.state, holdings: 100, avgCost: 311, cash: 0 }; // simulate already owning shares for the sell leg
 
     const bounce = processPriceUpdate({ config, state, price: 314, eventTimestamp: tick(2) });
     assert.strictEqual(bounce.trades.length, 1);
-    assert.strictEqual(bounce.trades[0].type, "SELL"); // 314 is now ABOVE the rebased 311 reference
+    assert.strictEqual(bounce.trades[0].type, "SELL"); // 314 was armed by the skipped buy at that level
     assert.strictEqual(bounce.trades[0].levelPrice, 314);
     assert.strictEqual(bounce.trades[0].qtyFilled, 100);
+});
+
+test("ADR-037 primary regression: the exact worked example (ref 50, buyVariance 2, sellVariance 3) — sells fire at 49 then 51, NOT 52", () => {
+    const config = { referencePrice: 50, gridInterval: 2, sellVariance: 3, quantityPerLevel: 10, startingCapital: 1000000, commissionPct: 0, slippagePct: 0 };
+    let state = createInitialGridState(config);
+    let t = Date.parse("2026-01-01T09:00:00.000Z");
+    const nextTick = () => new Date((t += 1000)).toISOString();
+
+    let r = processPriceUpdate({ config, state, price: 48, eventTimestamp: nextTick() }); // BUY @48
+    assert.strictEqual(r.trades[0].type, "BUY");
+    assert.strictEqual(r.trades[0].levelPrice, 48);
+    state = r.state;
+    assert.deepStrictEqual(state.pendingSellLevels, [51]); // 48's own sell target
+
+    r = processPriceUpdate({ config, state, price: 46, eventTimestamp: nextTick() }); // BUY @46
+    assert.strictEqual(r.trades[0].type, "BUY");
+    assert.strictEqual(r.trades[0].levelPrice, 46);
+    state = r.state;
+    assert.deepStrictEqual(state.pendingSellLevels, [51, 49]); // 46's own sell target, independent of 48's
+
+    r = processPriceUpdate({ config, state, price: 49, eventTimestamp: nextTick() }); // SELL @49 — the 46-lot's own target
+    assert.strictEqual(r.trades.length, 1);
+    assert.strictEqual(r.trades[0].type, "SELL");
+    assert.strictEqual(r.trades[0].levelPrice, 49);
+    state = r.state;
+
+    r = processPriceUpdate({ config, state, price: 51, eventTimestamp: nextTick() }); // SELL @51 — the 48-lot's own target, NOT 52
+    assert.strictEqual(r.trades.length, 1);
+    assert.strictEqual(r.trades[0].type, "SELL");
+    assert.strictEqual(r.trades[0].levelPrice, 51);
+});
+
+test("ADR-037 fully symmetric: 2 sells before any buy each arm their own independent pending BUY level", () => {
+    const config = { referencePrice: 40, gridInterval: 2, sellVariance: 3, quantityPerLevel: 10, startingCapital: 1000000, startingHoldings: 20, startingAvgCost: 40, commissionPct: 0, slippagePct: 0 };
+    let state = createInitialGridState(config);
+    assert.deepStrictEqual(state.pendingSellLevels, [43]); // seeded from starting inventory (40 + 3)
+    assert.deepStrictEqual(state.pendingBuyLevels, [38]); // original seed (40 - 2)
+    let t = Date.parse("2026-01-01T09:00:00.000Z");
+    const nextTick = () => new Date((t += 1000)).toISOString();
+
+    let r = processPriceUpdate({ config, state, price: 43, eventTimestamp: nextTick() }); // SELL @43 arms BUY@41, SELL@46
+    state = r.state;
+    assert.deepStrictEqual(state.pendingBuyLevels, [38, 41]); // [original seed, this sell's buy-back target]
+
+    r = processPriceUpdate({ config, state, price: 46, eventTimestamp: nextTick() }); // SELL @46 arms BUY@44, SELL@49
+    state = r.state;
+    assert.deepStrictEqual(state.pendingBuyLevels, [38, 41, 44]); // 2 independent sell-armed buy targets, not one shared/overwritten anchor
+
+    // Price falls: the NEARER buy-back target (44) fires first, not the
+    // original seed (38) or the other buy-back target (41).
+    r = processPriceUpdate({ config, state, price: 44, eventTimestamp: nextTick() });
+    assert.strictEqual(r.trades.length, 1);
+    assert.strictEqual(r.trades[0].type, "BUY");
+    assert.strictEqual(r.trades[0].levelPrice, 44);
+});
+
+test("ADR-037 gap cascade: a single large downward move still fires every pending level it passes, same as before this redesign", () => {
+    const config = { ...BASE_CONFIG, startingCapital: 1000000 };
+    const state = createInitialGridState(config); // pendingBuyLevels = [337]
+    const result = processPriceUpdate({ config, state, price: 328, eventTimestamp: tick(1) }); // passes 337, 334, 331, 328
+
+    assert.strictEqual(result.trades.length, 4);
+    assert.deepStrictEqual(result.trades.map((t) => t.levelPrice), [337, 334, 331, 328]);
+    result.trades.forEach((t) => {
+        assert.strictEqual(t.type, "BUY");
+        assert.strictEqual(t.fillPrice, 328); // every fill at the actual event price
+        assert.strictEqual(t.qtyFilled, 100);
+    });
+    assert.strictEqual(result.state.holdings, 400);
+    assert.deepStrictEqual(result.state.pendingBuyLevels, [325]);
+    assert.deepStrictEqual(result.state.pendingSellLevels, [340, 337, 334, 331]); // each fired level's own sell target
+    assert.strictEqual(result.gapFill, true);
 });
 
 // --- overnight / multi-level gaps ---
@@ -263,33 +338,33 @@ test("insufficient cash: partial fill when some but not a full 100 shares are af
     assert.strictEqual(result.state.cash, 19090 - 56 * 337);
 });
 
-test("insufficient cash: full skip when not even one share is affordable, and it rebases without re-logging the same level", () => {
+test("insufficient cash: full skip when not even one share is affordable, and it still arms its follow-on levels without duplicating", () => {
     const config = { ...BASE_CONFIG, startingCapital: 100 };
     let state = createInitialGridState(config);
     const first = processPriceUpdate({ config, state, price: 337, eventTimestamp: tick(1) });
     assert.strictEqual(first.trades[0].qtyFilled, 0);
     assert.strictEqual(first.trades[0].qtySkipped, 100);
     assert.strictEqual(first.trades[0].reason, "insufficient_cash");
-    assert.strictEqual(first.state.activeReference, 337);
+    assert.deepStrictEqual(first.state.pendingBuyLevels, [334]);
 
-    // Price stays within the same interval band around the rebased 337
-    // reference — no new level crossed, so no duplicate skip-log.
+    // Price stays within the same band — no new level crossed, so no
+    // duplicate skip-log.
     const second = processPriceUpdate({ config, state: first.state, price: 336, eventTimestamp: tick(2) });
     assert.strictEqual(second.trades.length, 0);
 });
 
-test("after a cash-skipped BUY rebases the reference, continuing further in the same direction fires a fresh BUY attempt at the next level", () => {
+test("after a cash-skipped BUY arms its continuation level, continuing further in the same direction fires a fresh BUY attempt at the next level", () => {
     const config = { ...BASE_CONFIG, startingCapital: 100 };
     let state = createInitialGridState(config);
-    state = processPriceUpdate({ config, state, price: 337, eventTimestamp: tick(1) }).state; // skipped @337, rebase -> 337
-    assert.strictEqual(state.activeReference, 337);
+    state = processPriceUpdate({ config, state, price: 337, eventTimestamp: tick(1) }).state; // skipped @337, arms BUY@334
+    assert.deepStrictEqual(state.pendingBuyLevels, [334]);
 
-    const result = processPriceUpdate({ config, state, price: 334, eventTimestamp: tick(2) }); // next level down from the rebased reference
+    const result = processPriceUpdate({ config, state, price: 334, eventTimestamp: tick(2) }); // the armed continuation level
     assert.strictEqual(result.trades.length, 1);
     assert.strictEqual(result.trades[0].type, "BUY");
     assert.strictEqual(result.trades[0].levelPrice, 334);
     assert.strictEqual(result.trades[0].reason, "insufficient_cash");
-    assert.strictEqual(result.state.activeReference, 334);
+    assert.deepStrictEqual(result.state.pendingBuyLevels, [331]);
 });
 
 // --- insufficient virtual holdings ---
@@ -297,8 +372,8 @@ test("after a cash-skipped BUY rebases the reference, continuing further in the 
 test("insufficient holdings: partial sell fills only what is held, never goes negative", () => {
     const config = { ...BASE_CONFIG };
     let state = createInitialGridState(config);
-    state = { ...state, holdings: 50, lots: [{ qty: 50, price: 300 }], avgCost: 300, cash: 50000 };
-    const result = processPriceUpdate({ config, state, price: 345, eventTimestamp: tick(1) }); // crosses 343 up
+    state = { ...state, holdings: 50, lots: [{ qty: 50, price: 300 }], avgCost: 300, cash: 50000, pendingSellLevels: [343] };
+    const result = processPriceUpdate({ config, state, price: 345, eventTimestamp: tick(1) }); // crosses the armed 343 level
     assert.strictEqual(result.trades[0].type, "SELL");
     assert.strictEqual(result.trades[0].qtyFilled, 50);
     assert.strictEqual(result.trades[0].qtySkipped, 50);
@@ -308,7 +383,7 @@ test("insufficient holdings: partial sell fills only what is held, never goes ne
 });
 
 test("insufficient holdings: zero holdings produces a full skip, not a negative position", () => {
-    const state = createInitialGridState(BASE_CONFIG);
+    const state = { ...createInitialGridState(BASE_CONFIG), pendingSellLevels: [343] };
     const result = processPriceUpdate({ config: BASE_CONFIG, state, price: 345, eventTimestamp: tick(1) });
     assert.strictEqual(result.trades[0].qtyFilled, 0);
     assert.strictEqual(result.trades[0].reason, "insufficient_holdings");
@@ -358,40 +433,6 @@ test("an invalid price (non-finite or non-positive) is rejected, never fabricate
     assert.strictEqual(processPriceUpdate({ config: BASE_CONFIG, state, price: NaN, eventTimestamp: tick(1) }).skipped, true);
     assert.strictEqual(processPriceUpdate({ config: BASE_CONFIG, state, price: -5, eventTimestamp: tick(1) }).skipped, true);
     assert.strictEqual(processPriceUpdate({ config: BASE_CONFIG, state, price: 0, eventTimestamp: tick(1) }).skipped, true);
-});
-
-// --- commission/slippage: hand-verified accounting ---
-
-test("commission and slippage are applied exactly as hand-calculated (fees disclosed, not invented)", () => {
-    const config = { ...BASE_CONFIG, referencePrice: 100, gridInterval: 3, startingCapital: 100000, commissionPct: 1, slippagePct: 0.5 };
-    const state = createInitialGridState(config);
-    const result = processPriceUpdate({ config, state, price: 97, eventTimestamp: tick(1) }); // crosses level 97 (n=-1)
-
-    // Hand calculation:
-    // effectivePrice = 97 * 1.005 = 97.485 -> rounds to 97.49 (paise precision)
-    // unitCost = 97.49 * 1.01 = 98.4649 -> rounds to 98.46
-    // qty = 100 (affordable: floor(100000/98.46) = 1015 >= 100)
-    // cost = 100 * 98.46 = 9846.00
-    const trade = result.trades[0];
-    assert.strictEqual(trade.effectivePrice, 97.49);
-    assert.strictEqual(trade.qtyFilled, 100);
-    assert.strictEqual(result.state.cash, 100000 - 9846);
-    assert.strictEqual(result.state.avgCost, 98.46);
-});
-
-test("commission reduces sell proceeds exactly as hand-calculated", () => {
-    const config = { ...BASE_CONFIG, referencePrice: 100, gridInterval: 3, startingCapital: 0, commissionPct: 1, slippagePct: 0 };
-    let state = createInitialGridState(config);
-    state = { ...state, holdings: 100, lots: [{ qty: 100, price: 90 }], avgCost: 90, cash: 0 };
-    const result = processPriceUpdate({ config, state, price: 104, eventTimestamp: tick(1) }); // crosses 103 (n=1)
-
-    // unitProceeds = 104 * (1 - 0.01) = 102.96
-    // proceeds = 100 * 102.96 = 10296
-    // realizedPnLDelta = 100 * (102.96 - 90) = 1296
-    const trade = result.trades[0];
-    assert.strictEqual(trade.effectivePrice, 104);
-    assert.strictEqual(result.state.cash, 10296);
-    assert.strictEqual(result.state.realizedPnL, 1296);
 });
 
 // --- portfolio metrics ---
@@ -456,8 +497,6 @@ test("fixture: a profitable BUY-then-SELL cycle reconciles cash/holdings/realize
         gridInterval: 3,
         quantityPerLevel: 10,
         startingCapital: 100000,
-        commissionPct: 0,
-        slippagePct: 0,
     };
     let state = createInitialGridState(config);
 
@@ -466,7 +505,7 @@ test("fixture: a profitable BUY-then-SELL cycle reconciles cash/holdings/realize
     state = result.state;
     assert.strictEqual(result.trades.length, 1);
     assert.strictEqual(result.trades[0].type, "BUY");
-    assert.strictEqual(result.trades[0].effectivePrice, 97);
+    assert.strictEqual(result.trades[0].fillPrice, 97);
 
     // Up-cross from the rebased reference (97) through 100 and 103 (ADR-031:
     // 100 is no longer excluded just because it equals the immutable
@@ -477,7 +516,7 @@ test("fixture: a profitable BUY-then-SELL cycle reconciles cash/holdings/realize
     state = result.state;
     assert.strictEqual(result.trades.length, 2);
     assert.strictEqual(result.trades[0].type, "SELL");
-    assert.strictEqual(result.trades[0].effectivePrice, 103);
+    assert.strictEqual(result.trades[0].fillPrice, 103);
     assert.strictEqual(result.trades[0].qtyFilled, 10);
     assert.strictEqual(result.trades[1].qtyFilled, 0);
     assert.strictEqual(result.trades[1].reason, "insufficient_holdings");
@@ -496,30 +535,30 @@ test("fixture: a profitable BUY-then-SELL cycle reconciles cash/holdings/realize
 });
 
 test("fixture: starting inventory sold at a loss reconciles cash/holdings/realizedPnL/equity exactly", () => {
-    // Sell levels are always ABOVE the reference by construction, so a
-    // losing SELL (effective price below cost basis) is modeled via
-    // starting inventory acquired at a higher cost than the sell level —
-    // the same approach the existing dynamic-reference tests use for
-    // starting-inventory scenarios.
+    // A naturally-ARMED sell level is always above the lot's own cost
+    // (cost + sellVariance, a positive offset), so it can never naturally
+    // represent a loss. applySell's own math is still fully generic over
+    // WHICH price triggered it, though — this manually overrides the
+    // pending level to below cost to prove that, exactly like the
+    // original (pre-ADR-037) dynamic-reference fixture did.
     const config = {
         referencePrice: 94,
         gridInterval: 3,
         quantityPerLevel: 10,
         startingCapital: 100000,
-        commissionPct: 0,
-        slippagePct: 0,
         startingHoldings: 10,
         startingAvgCost: 103,
     };
     let state = createInitialGridState(config);
     assert.strictEqual(state.cash, 100000); // starting capital is independent of inventory cost basis
+    state = { ...state, pendingSellLevels: [97] }; // override the natural (always-above-cost) seed for this scenario
 
-    const result = processPriceUpdate({ config, state, price: 97, eventTimestamp: "2026-01-01T09:16:00.000Z" }); // up-cross through sell level 97
+    const result = processPriceUpdate({ config, state, price: 97, eventTimestamp: "2026-01-01T09:16:00.000Z" }); // up-cross through the armed 97 level
     state = result.state;
 
     assert.strictEqual(result.trades.length, 1);
     assert.strictEqual(result.trades[0].type, "SELL");
-    assert.strictEqual(result.trades[0].effectivePrice, 97);
+    assert.strictEqual(result.trades[0].fillPrice, 97);
     assert.strictEqual(result.trades[0].realizedPnLDelta, -60); // 10 * (97 - 103)
 
     assert.strictEqual(state.holdings, 0);
@@ -532,43 +571,6 @@ test("fixture: starting inventory sold at a loss reconciles cash/holdings/realiz
     assert.strictEqual(metrics.equity, 100970);
 });
 
-test("fixture: commission and slippage are reflected in cash and realized P&L, not double-counted", () => {
-    const config = {
-        referencePrice: 100,
-        gridInterval: 3,
-        quantityPerLevel: 10,
-        startingCapital: 100000,
-        commissionPct: 1, // 1%
-        slippagePct: 1, // 1%
-    };
-    let state = createInitialGridState(config);
-
-    // BUY: slippage raises the paid price, commission raises the paid cost.
-    let result = processPriceUpdate({ config, state, price: 97, eventTimestamp: "2026-01-01T09:16:00.000Z" });
-    state = result.state;
-    const buy = result.trades[0];
-    const expectedBuyEffective = roundPrice(97 * 1.01); // slippage
-    const expectedUnitCost = roundPrice(expectedBuyEffective * 1.01); // commission on top
-    assert.strictEqual(buy.effectivePrice, expectedBuyEffective);
-    assert.strictEqual(state.cash, roundPrice(100000 - 10 * expectedUnitCost));
-    assert.strictEqual(state.avgCost, expectedUnitCost);
-
-    // SELL: slippage lowers the received price, commission reduces proceeds.
-    result = processPriceUpdate({ config, state, price: 103, eventTimestamp: "2026-01-01T09:17:00.000Z" });
-    state = result.state;
-    const sell = result.trades[0];
-    const expectedSellEffective = roundPrice(103 * 0.99); // slippage
-    const expectedUnitProceeds = roundPrice(expectedSellEffective * 0.99); // commission
-    assert.strictEqual(sell.effectivePrice, expectedSellEffective);
-    assert.strictEqual(sell.realizedPnLDelta, roundPrice(10 * (expectedUnitProceeds - expectedUnitCost)));
-    assert.strictEqual(state.holdings, 0);
-
-    // Costs show up exactly once each in cash, not duplicated into realizedPnL
-    // beyond their effect on the buy/sell unit prices already applied above.
-    const metrics = computePortfolioMetrics(state, 103);
-    assert.strictEqual(metrics.equity, state.cash); // zero holdings -> equity is cash alone
-});
-
 // --- Dynamic-reference strategy: starting inventory + exact task-spec oscillations ---
 
 test("validateGridConfig requires startingAvgCost only when startingHoldings > 0", () => {
@@ -578,12 +580,13 @@ test("validateGridConfig requires startingAvgCost only when startingHoldings > 0
     assert.strictEqual(validateGridConfig(BASE_CONFIG).valid, true); // startingHoldings omitted entirely
 });
 
-test("createInitialGridState seeds holdings/avgCost from starting inventory, and the crossing watermark from the captured reference", () => {
+test("createInitialGridState seeds holdings/avgCost from starting inventory, the crossing watermark from the captured reference, and both pending-level arrays (ADR-037)", () => {
     const state = createInitialGridState({ ...BASE_CONFIG, startingHoldings: 200, startingAvgCost: 315, referenceCapturedAt: "2026-01-01T09:00:00.000Z" });
     assert.strictEqual(state.holdings, 200);
     assert.strictEqual(state.avgCost, 315);
     assert.strictEqual(state.lastPrice, BASE_CONFIG.referencePrice);
-    assert.strictEqual(state.activeReference, BASE_CONFIG.referencePrice); // starts equal to the immutable reference
+    assert.deepStrictEqual(state.pendingBuyLevels, [337]); // referencePrice(340) - gridInterval(3)
+    assert.deepStrictEqual(state.pendingSellLevels, [318]); // startingAvgCost(315) + gridInterval(3) — the starting lot's own sell target
     assert.strictEqual(state.lastEventTimestamp, "2026-01-01T09:00:00.000Z");
 });
 
@@ -591,6 +594,7 @@ test("createInitialGridState with zero starting holdings matches the original fl
     const state = createInitialGridState(BASE_CONFIG);
     assert.strictEqual(state.holdings, 0);
     assert.strictEqual(state.avgCost, 0);
+    assert.deepStrictEqual(state.pendingSellLevels, []); // nothing to sell yet
 });
 
 test("ADR-031 oscillation 320 -> 317 -> 314 -> 317 -> 320 (R=320, G=3): every leg trades, rebasing with it, net profit on the round trip", () => {
@@ -598,26 +602,29 @@ test("ADR-031 oscillation 320 -> 317 -> 314 -> 317 -> 320 (R=320, G=3): every le
     let state = createInitialGridState(config);
     const t = (n) => new Date(2026, 0, 1, 9, n).toISOString();
 
-    const r1 = processPriceUpdate({ config, state, price: 317, eventTimestamp: t(1) }); // buy @317
+    const r1 = processPriceUpdate({ config, state, price: 317, eventTimestamp: t(1) }); // buy @317, arms SELL@320, BUY@314
     assert.strictEqual(r1.trades.length, 1);
     assert.strictEqual(r1.trades[0].type, "BUY");
     assert.strictEqual(r1.trades[0].levelPrice, 317);
-    assert.strictEqual(r1.state.activeReference, 317);
+    assert.deepStrictEqual(r1.state.pendingBuyLevels, [314]);
+    assert.deepStrictEqual(r1.state.pendingSellLevels, [320]);
     state = r1.state;
 
-    const r2 = processPriceUpdate({ config, state, price: 314, eventTimestamp: t(2) }); // buy @314
+    const r2 = processPriceUpdate({ config, state, price: 314, eventTimestamp: t(2) }); // buy @314, arms SELL@317, BUY@311
     assert.strictEqual(r2.trades.length, 1);
     assert.strictEqual(r2.trades[0].levelPrice, 314);
-    assert.strictEqual(r2.state.activeReference, 314);
+    assert.deepStrictEqual(r2.state.pendingBuyLevels, [311]);
+    assert.deepStrictEqual(r2.state.pendingSellLevels, [320, 317]);
     state = r2.state;
 
-    // Reversal up through the rebased 314 reference's next level (317) is
-    // now a genuine SELL — no "re-arm only" dead zone under ADR-031.
+    // Reversal up: the NEARER sell target (317, armed by the 314 buy)
+    // fires, not 320.
     const r3 = processPriceUpdate({ config, state, price: 317, eventTimestamp: t(3) });
     assert.strictEqual(r3.trades.length, 1);
     assert.strictEqual(r3.trades[0].type, "SELL");
     assert.strictEqual(r3.trades[0].levelPrice, 317);
-    assert.strictEqual(r3.state.activeReference, 317);
+    assert.deepStrictEqual(r3.state.pendingBuyLevels, [311, 314]);
+    assert.deepStrictEqual(r3.state.pendingSellLevels, [320]);
     state = r3.state;
 
     const r4 = processPriceUpdate({ config, state, price: 320, eventTimestamp: t(4) }); // continues up through 320
@@ -633,40 +640,9 @@ test("ADR-031 oscillation 320 -> 317 -> 314 -> 317 -> 320 (R=320, G=3): every le
     assert.strictEqual(state.realizedPnL, 100 * (317 - 315.5) + 100 * (320 - 315.5));
 });
 
-test("ADR-031 oscillation 320 -> 323 -> 326 -> 323 (R=320, G=3) with zero starting holdings: skipped sells rebase the reference, then the reversal is a genuine BUY (the user's reported scenario)", () => {
-    const config = { ...BASE_CONFIG, referencePrice: 320, gridInterval: 3, startingCapital: 1000000 };
-    let state = createInitialGridState(config); // holdings = 0
-    const t = (n) => new Date(2026, 0, 1, 10, n).toISOString();
-
-    const r1 = processPriceUpdate({ config, state, price: 323, eventTimestamp: t(1) });
-    assert.strictEqual(r1.trades.length, 1);
-    assert.strictEqual(r1.trades[0].type, "SELL");
-    assert.strictEqual(r1.trades[0].qtyFilled, 0);
-    assert.strictEqual(r1.trades[0].reason, "insufficient_holdings");
-    assert.strictEqual(r1.state.activeReference, 323); // rebases even though skipped
-    state = r1.state;
-
-    const r2 = processPriceUpdate({ config, state, price: 326, eventTimestamp: t(2) });
-    assert.strictEqual(r2.trades.length, 1);
-    assert.strictEqual(r2.trades[0].qtyFilled, 0);
-    assert.strictEqual(r2.state.activeReference, 326);
-    state = r2.state;
-
-    // Reversal down through the rebased 326 reference's next level (323) is
-    // now a genuine BUY, not a dead "re-arm only" zone under the old model.
-    const r3 = processPriceUpdate({ config, state, price: 323, eventTimestamp: t(3) });
-    assert.strictEqual(r3.trades.length, 1);
-    assert.strictEqual(r3.trades[0].type, "BUY");
-    assert.strictEqual(r3.trades[0].levelPrice, 323);
-    assert.strictEqual(r3.trades[0].qtyFilled, 100);
-
-    assert.strictEqual(r3.state.holdings, 100);
-    assert.ok(r3.state.holdings >= 0);
-});
-
 test("multi-level gap 320 -> 330 (R=320, G=3): sells at 323/326/329 each fill at the ACTUAL 330 event price, theoretical level recorded separately, processed lowest-to-highest", () => {
     const config = { ...BASE_CONFIG, referencePrice: 320, gridInterval: 3, startingCapital: 0 };
-    const state = { ...createInitialGridState(config), holdings: 300, lots: [{ qty: 300, price: 310 }], avgCost: 310, cash: 0 };
+    const state = { ...createInitialGridState(config), holdings: 300, lots: [{ qty: 300, price: 310 }], avgCost: 310, cash: 0, pendingSellLevels: [323] };
     const result = processPriceUpdate({ config, state, price: 330, eventTimestamp: new Date(2026, 0, 1, 11, 0).toISOString() });
 
     assert.strictEqual(result.trades.length, 3);
@@ -771,29 +747,29 @@ test("ADR-034: asymmetric buy/sell variance — BUY steps use gridInterval, SELL
     let state = createInitialGridState(config);
     let t = Date.parse("2026-01-01T09:00:00.000Z");
 
-    // Down-cross 3 (buy variance) from 100 -> BUY at 97, reference rebases to 97.
+    // Down-cross 3 (buy variance) from 100 -> BUY at 97, arms SELL@102 (97+5).
     let r = processPriceUpdate({ config, state, price: 97, eventTimestamp: new Date(t += 1000).toISOString() });
     assert.strictEqual(r.trades.length, 1);
     assert.strictEqual(r.trades[0].type, "BUY");
     assert.strictEqual(r.trades[0].levelPrice, 97);
     state = r.state;
-    assert.strictEqual(state.activeReference, 97);
+    assert.deepStrictEqual(state.pendingSellLevels, [102]);
 
-    // Up-cross 5 (sell variance, NOT 3) from 97 -> SELL at 102, reference rebases to 102.
+    // Up-cross 5 (sell variance, NOT 3) from 97 -> SELL at 102, arms BUY@99 (102-3).
     r = processPriceUpdate({ config, state, price: 102, eventTimestamp: new Date(t += 1000).toISOString() });
     assert.strictEqual(r.trades.length, 1);
     assert.strictEqual(r.trades[0].type, "SELL");
     assert.strictEqual(r.trades[0].levelPrice, 102);
     state = r.state;
-    assert.strictEqual(state.activeReference, 102);
+    assert.deepStrictEqual(state.pendingBuyLevels, [94, 99]);
 
-    // Down-cross 3 (buy variance) from 102 -> BUY at 99, reference rebases to 99.
+    // Down-cross 3 (buy variance) from 102 -> BUY at 99, arms SELL@104 (99+5).
     r = processPriceUpdate({ config, state, price: 99, eventTimestamp: new Date(t += 1000).toISOString() });
     assert.strictEqual(r.trades.length, 1);
     assert.strictEqual(r.trades[0].type, "BUY");
     assert.strictEqual(r.trades[0].levelPrice, 99);
     state = r.state;
-    assert.strictEqual(state.activeReference, 99);
+    assert.deepStrictEqual(state.pendingSellLevels, [107, 104]);
 });
 
 test("ADR-034: sellVariance omitted (null) mirrors gridInterval exactly — identical to the pre-ADR-034 symmetric behavior", () => {

@@ -22,7 +22,6 @@ const gridSimulatorTradeSchema = new mongoose.Schema(
         level: { type: Number, required: true },
         levelPrice: { type: Number, required: true },
         fillPrice: { type: Number, required: true },
-        effectivePrice: { type: Number, required: true },
 
         qtyRequested: { type: Number, required: true },
         qtyFilled: { type: Number, required: true },

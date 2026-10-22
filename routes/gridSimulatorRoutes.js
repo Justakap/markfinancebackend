@@ -1,20 +1,22 @@
 const express = require("express");
 const { classifySegmentClass } = require("../services/gridChargesCalculator");
+const { nearestPendingLevels } = require("../services/gridSimulatorService");
 
-// "Sufficiently fresh" for the initial anchor quote — reject creation
-// rather than silently use a stale/cached price. Deliberately the same
-// order of magnitude as the realtime module's own staleness threshold
-// (services/gridSimulatorRealtime.js) for consistency, not coupled to it.
+// "Sufficiently fresh" for the initial anchor quote — reject starting
+// (ADR-038: captured at Start, not creation) rather than silently use a
+// stale/cached price. Deliberately the same order of magnitude as the
+// realtime module's own staleness threshold (services/
+// gridSimulatorRealtime.js) for consistency, not coupled to it.
 const QUOTE_FRESHNESS_MS = Number(process.env.GRID_SIMULATOR_QUOTE_FRESHNESS_MS || 15_000);
 
 /**
  * Captures the immutable initial reference (R) from a fresh, validated
  * live quote — never a user-typed value. Actively warms the quote first
- * (the instrument may not be subscribed/pinned by anything yet for a
- * brand-new session), then requires a genuinely recent timestamp. Returns
- * null (never throws) when no sufficiently fresh quote is available —
- * the caller rejects session creation rather than silently falling back
- * to a stale cached price.
+ * (the instrument may not be subscribed/pinned by anything yet, since a
+ * CREATED-but-not-started session was never pinned). Returns null (never
+ * throws) when no sufficiently fresh quote is available — the caller
+ * rejects starting the session rather than silently falling back to a
+ * stale cached price.
  */
 async function captureFreshReference(marketDataService, instrumentKey) {
     await marketDataService.warmLiveQuotes([instrumentKey]).catch(() => {});
@@ -72,7 +74,7 @@ function sessionDetail(session, getPortfolioMetrics, tradeCounts = null, charges
         ...sessionSummary(session),
         state: {
             lastPrice: session.state.lastPrice,
-            activeReference: session.state.activeReference ?? session.config.referencePrice,
+            ...nearestPendingLevels({ state: session.state, config: session.config }),
             lastEventTimestamp: session.state.lastEventTimestamp,
             sequence: session.state.sequence,
         },
@@ -90,7 +92,6 @@ function tradeSummary(trade) {
         level: trade.level,
         levelPrice: trade.levelPrice,
         fillPrice: trade.fillPrice,
-        effectivePrice: trade.effectivePrice,
         qtyRequested: trade.qtyRequested,
         qtyFilled: trade.qtyFilled,
         qtySkipped: trade.qtySkipped,
@@ -115,7 +116,7 @@ function createGridSimulatorRoutes({
     marketDataService,
     createSession,
     getOwnedSession,
-    startSession,
+    startSessionWithInitialBuy,
     pauseSession,
     resumeSession,
     stopSession,
@@ -150,8 +151,6 @@ function createGridSimulatorRoutes({
                 sellQuantityPerLevel,
                 startingCapital,
                 maxPositionSize,
-                commissionPct,
-                slippagePct,
                 startingHoldings,
                 startingAvgCost,
             } = req.body;
@@ -178,20 +177,17 @@ function createGridSimulatorRoutes({
                 });
             }
 
-            // The initial reference is ALWAYS a fresh, server-captured live
-            // quote — any client-supplied reference price is ignored.
-            // Reject creation outright rather than silently fall back to a
-            // stale/cached price.
-            const freshQuote = await captureFreshReference(marketDataService, instrumentKey);
-            if (!freshQuote) {
-                return res.status(400).json({
-                    message: "No sufficiently fresh market quote is available for this instrument right now. Try again in a moment.",
-                });
-            }
+            // ADR-038: the initial reference is NOT captured here anymore —
+            // it's captured the moment the user clicks Start (see the
+            // /start route below). A client-supplied reference price is
+            // still ignored either way, never trusted.
 
             // Immutable (ADR-035), captured once here from the resolved
             // instrument's own type/segment — drives the display-only
             // charges estimate, never re-derived or editable afterward.
+            // This doesn't need a live quote, only the instrument's static
+            // type/segment metadata, so it's independent of ADR-038's
+            // reference-at-start change.
             const segmentClass = classifySegmentClass(marketDataService.getInstrumentMeta?.(instrumentKey));
 
             const session = await createSession({
@@ -200,16 +196,12 @@ function createGridSimulatorRoutes({
                 instrumentKey,
                 symbol: symbol || bodyInstrumentKey,
                 config: {
-                    referencePrice: freshQuote.price,
-                    referenceCapturedAt: freshQuote.capturedAt,
                     gridInterval: Number(gridInterval),
                     sellVariance: sellVariance != null ? Number(sellVariance) : null,
                     quantityPerLevel: Number(quantityPerLevel),
                     sellQuantityPerLevel: sellQuantityPerLevel != null ? Number(sellQuantityPerLevel) : null,
                     startingCapital: Number(startingCapital),
                     maxPositionSize: maxPositionSize != null ? Number(maxPositionSize) : null,
-                    commissionPct: commissionPct != null ? Number(commissionPct) : 0,
-                    slippagePct: slippagePct != null ? Number(slippagePct) : 0,
                     startingHoldings: holdings,
                     startingAvgCost: holdings > 0 ? Number(startingAvgCost) : 0,
                     segmentClass,
@@ -241,7 +233,60 @@ function createGridSimulatorRoutes({
         };
     }
 
-    router.post("/v2/grid-simulator/sessions/:sessionId/start", requireAuth, validateObjectId("sessionId"), makeTransitionHandler(startSession, { afterActivate: true }));
+    // ADR-038: Start is the ONLY path that captures the reference price —
+    // right now, from a fresh live quote — and immediately executes one
+    // real BUY fill at that exact price. Resume (below) is a completely
+    // separate, unchanged path for a PAUSED session; it never re-captures
+    // a reference or re-buys.
+    router.post("/v2/grid-simulator/sessions/:sessionId/start", requireAuth, validateObjectId("sessionId"), async (req, res) => {
+        try {
+            const session = await getOwnedSession({ GridSimulatorSession, sessionId: req.params.sessionId, userId: req.user.mongoId });
+            if (session.status !== "CREATED") {
+                return res.status(409).json({ message: `Cannot start from its current state (${session.status})` });
+            }
+
+            const freshQuote = await captureFreshReference(marketDataService, session.instrumentKey);
+            if (!freshQuote) {
+                return res.status(400).json({
+                    message: "No sufficiently fresh market quote is available for this instrument right now. Try again in a moment.",
+                });
+            }
+
+            const updated = await startSessionWithInitialBuy({
+                GridSimulatorSession,
+                GridSimulatorTrade,
+                sessionId: session._id,
+                userId: req.user.mongoId,
+                referencePrice: freshQuote.price,
+                referenceCapturedAt: freshQuote.capturedAt,
+            });
+            registerRealtimeSession(updated);
+            return res.json({ session: sessionSummary(updated) });
+        } catch (error) {
+            return handleError(res, error, "Failed to start grid simulator session");
+        }
+    });
+    // Read-only live-quote preview for a session that hasn't been started
+    // yet (CREATED) — lets the UI show a live price before the user clicks
+    // Start, without capturing/persisting anything. Reuses the exact same
+    // captureFreshReference() helper Start itself uses, so "the price you
+    // see here" and "the price Start will actually buy at" are guaranteed
+    // to come from the same provenance/freshness check — just never
+    // written anywhere. Works for any status, not only CREATED, since it
+    // has no side effects worth restricting.
+    router.get("/v2/grid-simulator/sessions/:sessionId/preview-quote", requireAuth, validateObjectId("sessionId"), async (req, res) => {
+        try {
+            const session = await getOwnedSession({ GridSimulatorSession, sessionId: req.params.sessionId, userId: req.user.mongoId });
+            const freshQuote = await captureFreshReference(marketDataService, session.instrumentKey);
+            if (!freshQuote) {
+                return res.status(404).json({ message: "No live quote is currently available for this instrument." });
+            }
+            return res.json({ price: freshQuote.price, capturedAt: freshQuote.capturedAt });
+        } catch (error) {
+            return handleError(res, error, "Failed to fetch live quote preview");
+        }
+    });
+
     router.post("/v2/grid-simulator/sessions/:sessionId/pause", requireAuth, validateObjectId("sessionId"), makeTransitionHandler(pauseSession, { afterDeactivate: true }));
     router.post("/v2/grid-simulator/sessions/:sessionId/resume", requireAuth, validateObjectId("sessionId"), makeTransitionHandler(resumeSession, { afterActivate: true }));
     router.post("/v2/grid-simulator/sessions/:sessionId/stop", requireAuth, validateObjectId("sessionId"), makeTransitionHandler(stopSession, { afterDeactivate: true }));

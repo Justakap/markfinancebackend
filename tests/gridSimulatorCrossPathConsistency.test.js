@@ -19,7 +19,7 @@ delete process.env.UPSTOX_TOKEN;
 const marketDataService = require("../services/marketDataService");
 marketDataService.primeInstrumentsCacheForTests([]);
 
-const { createSession, startSession, getOwnedSession, getPortfolioMetrics } = require("../services/gridSimulatorService");
+const { createSession, startSessionWithInitialBuy, getOwnedSession, getPortfolioMetrics } = require("../services/gridSimulatorService");
 const realtime = require("../services/gridSimulatorRealtime");
 
 let passed = 0;
@@ -113,8 +113,6 @@ function makeFakeIo() {
 }
 
 const CONFIG = {
-    referencePrice: 340,
-    referenceCapturedAt: new Date(2026, 0, 1, 9, 15).toISOString(),
     gridInterval: 3,
     quantityPerLevel: 100,
     startingCapital: 1000000,
@@ -122,6 +120,11 @@ const CONFIG = {
     commissionPct: 0,
     slippagePct: 0,
 };
+
+// ADR-038: the reference is no longer part of config — it's captured and
+// passed explicitly to startSessionWithInitialBuy() at Start.
+const REFERENCE_PRICE = 340;
+const REFERENCE_CAPTURED_AT = new Date(2026, 0, 1, 9, 15);
 
 (async () => {
     console.log("Grid Trading Simulator — cross-path (REST vs Socket.IO) consistency\n");
@@ -133,13 +136,15 @@ const CONFIG = {
         const userId = new mongoose.Types.ObjectId();
 
         const session = await createSession({ GridSimulatorSession, userId, instrumentKey: "NSE_EQ|GICRE", symbol: "GICRE", config: CONFIG });
-        await startSession({ GridSimulatorSession, sessionId: session._id, userId });
+        // ADR-038: Start itself immediately buys 100 @ the captured reference (340).
+        await startSessionWithInitialBuy({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, userId, referencePrice: REFERENCE_PRICE, referenceCapturedAt: REFERENCE_CAPTURED_AT });
 
         realtime.init({ GridSimulatorSession, GridSimulatorTrade, io });
         realtime.registerSession({ _id: session._id, instrumentKey: "NSE_EQ|GICRE" });
 
-        // Genuine WS ticks: down-cross through 337 (BUY), then a non-crossing
-        // move so equity/unrealizedPnL get re-priced without a new trade.
+        // Genuine WS ticks: down-cross through 337 (a second BUY, on top of
+        // Start's own), then a non-crossing move so equity/unrealizedPnL get
+        // re-priced without a new trade.
         realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 336, timestamp: Date.now() }, "ws");
         await new Promise((resolve) => setTimeout(resolve, 20));
         realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 336.5, timestamp: Date.now() }, "ws");
@@ -151,30 +156,40 @@ const CONFIG = {
         const restPortfolio = getPortfolioMetrics(restSession, restSession.lastFeedPrice ?? restSession.state.lastPrice);
 
         assert.deepStrictEqual(lastPush.portfolio, restPortfolio, "REST and Socket.IO must agree exactly on cash/holdings/avgCost/equity/unrealizedPnL/marketValue/realizedPnL");
-        assert.strictEqual(restPortfolio.holdings, 100);
-        assert.strictEqual(restPortfolio.equity, restPortfolio.cash + 100 * 336.5);
+        assert.strictEqual(restPortfolio.holdings, 200); // Start's 100 @ 340 + the crossing's 100 @ 336
+        assert.strictEqual(restPortfolio.equity, restPortfolio.cash + 200 * 336.5);
 
-        // Trade ledger agrees with the one real fill that occurred.
-        assert.strictEqual(GridSimulatorTrade.docs.length, 1);
+        // Trade ledger agrees with the two real fills that occurred (Start's own + the crossing).
+        assert.strictEqual(GridSimulatorTrade.docs.length, 2);
         assert.strictEqual(GridSimulatorTrade.docs[0].type, "BUY");
         assert.strictEqual(GridSimulatorTrade.docs[0].qtyFilled, 100);
+        assert.strictEqual(GridSimulatorTrade.docs[0].fillPrice, 340);
+        assert.strictEqual(GridSimulatorTrade.docs[1].type, "BUY");
+        assert.strictEqual(GridSimulatorTrade.docs[1].qtyFilled, 100);
+        assert.strictEqual(GridSimulatorTrade.docs[1].fillPrice, 336);
 
         realtime.unregisterSession(session._id);
     });
 
     await test("REST detail and Socket.IO push still agree after a skipped SELL (insufficient holdings)", async () => {
+        // ADR-038: Start's own immediate BUY (100 @ 340) arms one pending
+        // sell at 343. A single gap tick straight to 350 cascades through
+        // 343 (fully filled from the 100 held), then 346 and 349 (both
+        // genuinely skipped — zero holdings left) — a naturally-reached
+        // full skip (qtyFilled 0, reason insufficient_holdings), all within
+        // one event.
         const GridSimulatorSession = makeFakeSessionModel();
         const GridSimulatorTrade = makeFakeTradeModel();
         const io = makeFakeIo();
         const userId = new mongoose.Types.ObjectId();
 
         const session = await createSession({ GridSimulatorSession, userId, instrumentKey: "NSE_EQ|GICRE", symbol: "GICRE", config: CONFIG });
-        await startSession({ GridSimulatorSession, sessionId: session._id, userId });
+        await startSessionWithInitialBuy({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, userId, referencePrice: REFERENCE_PRICE, referenceCapturedAt: REFERENCE_CAPTURED_AT });
 
         realtime.init({ GridSimulatorSession, GridSimulatorTrade, io });
         realtime.registerSession({ _id: session._id, instrumentKey: "NSE_EQ|GICRE" });
 
-        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 343, timestamp: Date.now() }, "ws"); // skipped SELL, zero holdings
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 350, timestamp: Date.now() }, "ws");
         await new Promise((resolve) => setTimeout(resolve, 20));
 
         const lastPush = io.emitted.filter((e) => e.event === "gridSimulatorUpdate").pop().payload;
@@ -185,41 +200,61 @@ const CONFIG = {
         assert.strictEqual(restPortfolio.holdings, 0);
         assert.strictEqual(restPortfolio.unrealizedPnL, 0);
         assert.strictEqual(restPortfolio.equity, restPortfolio.cash);
-        assert.strictEqual(GridSimulatorTrade.docs.length, 1);
-        assert.strictEqual(GridSimulatorTrade.docs[0].qtyFilled, 0);
-        assert.strictEqual(GridSimulatorTrade.docs[0].reason, "insufficient_holdings");
+        assert.strictEqual(GridSimulatorTrade.docs.length, 4); // Start's BUY + 1 filled SELL + 2 skipped SELLs
+        assert.strictEqual(GridSimulatorTrade.docs[1].qtyFilled, 100);
+        assert.strictEqual(GridSimulatorTrade.docs[2].qtyFilled, 0);
+        assert.strictEqual(GridSimulatorTrade.docs[2].reason, "insufficient_holdings");
+        assert.strictEqual(GridSimulatorTrade.docs[3].qtyFilled, 0);
+        assert.strictEqual(GridSimulatorTrade.docs[3].reason, "insufficient_holdings");
 
         realtime.unregisterSession(session._id);
     });
 
-    await test("ADR-031: REST and Socket.IO agree on the rebased activeReference after the user's reported 320->329->326 scenario", async () => {
+    await test("ADR-037/ADR-038: REST and Socket.IO agree on the nearest pending buy/sell levels after the user's reported 320->329->317 scenario", async () => {
         const GridSimulatorSession = makeFakeSessionModel();
         const GridSimulatorTrade = makeFakeTradeModel();
         const io = makeFakeIo();
         const userId = new mongoose.Types.ObjectId();
-        const rebaseConfig = { ...CONFIG, referencePrice: 320 };
 
-        const session = await createSession({ GridSimulatorSession, userId, instrumentKey: "NSE_EQ|GICRE", symbol: "GICRE", config: rebaseConfig });
-        await startSession({ GridSimulatorSession, sessionId: session._id, userId });
+        const session = await createSession({ GridSimulatorSession, userId, instrumentKey: "NSE_EQ|GICRE", symbol: "GICRE", config: CONFIG });
+        // ADR-038: Start itself immediately buys 100 @ 320, arming a pending
+        // sell at 323 alongside the seeded pending buy at 317.
+        await startSessionWithInitialBuy({ GridSimulatorSession, GridSimulatorTrade, sessionId: session._id, userId, referencePrice: 320, referenceCapturedAt: REFERENCE_CAPTURED_AT });
 
         realtime.init({ GridSimulatorSession, GridSimulatorTrade, io });
         realtime.registerSession({ _id: session._id, instrumentKey: "NSE_EQ|GICRE" });
 
-        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 329, timestamp: Date.now() }, "ws"); // 3 skipped sells, rebase -> 329
+        // Up to 329 cascades through the armed sell ladder (323, 326, 329),
+        // filling the first (the only 100 held) and skipping the rest (zero
+        // holdings left). Down to 317 then cascades through every pending
+        // buy level now in range (317, 320, 323, 326), each filling fully.
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 329, timestamp: Date.now() }, "ws");
         await new Promise((resolve) => setTimeout(resolve, 20));
-        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 326, timestamp: Date.now() }, "ws"); // pullback -> genuine BUY
+        realtime.handleUpstreamTick({ instrumentKey: "NSE_EQ|GICRE", ltp: 317, timestamp: Date.now() }, "ws");
         await new Promise((resolve) => setTimeout(resolve, 20));
 
         const lastPush = io.emitted.filter((e) => e.event === "gridSimulatorUpdate").pop().payload;
         const restSession = await getOwnedSession({ GridSimulatorSession, sessionId: session._id, userId });
 
-        assert.strictEqual(restSession.state.activeReference, 326);
-        assert.strictEqual(lastPush.state.activeReference, restSession.state.activeReference);
-        assert.strictEqual(restSession.state.holdings, 100);
+        assert.strictEqual(restSession.state.holdings, 400);
+        assert.deepStrictEqual(restSession.state.pendingSellLevels, [332, 329, 326, 323, 320]);
+        assert.deepStrictEqual(restSession.state.pendingBuyLevels, [314]);
+        assert.strictEqual(lastPush.state.nextSellLevel, 320);
+        assert.strictEqual(lastPush.state.nextBuyLevel, 314);
 
         const trades = GridSimulatorTrade.docs;
-        assert.strictEqual(trades.length, 4); // 3 skipped sells + 1 buy
-        assert.strictEqual(trades.filter((t) => t.type === "BUY" && t.qtyFilled > 0).length, 1);
+        assert.strictEqual(trades.length, 8); // Start's BUY, 1 filled + 2 skipped SELL, 4 filled BUY
+        assert.strictEqual(trades[0].type, "BUY");
+        assert.strictEqual(trades[0].fillPrice, 320);
+        assert.strictEqual(trades[1].type, "SELL");
+        assert.strictEqual(trades[1].qtyFilled, 100);
+        assert.strictEqual(trades[2].qtyFilled, 0);
+        assert.strictEqual(trades[3].qtyFilled, 0);
+        trades.slice(4).forEach((trade) => {
+            assert.strictEqual(trade.type, "BUY");
+            assert.strictEqual(trade.qtyFilled, 100);
+            assert.strictEqual(trade.fillPrice, 317);
+        });
 
         realtime.unregisterSession(session._id);
     });

@@ -13,7 +13,7 @@ const { createGridSimulatorRoutes } = require("../routes/gridSimulatorRoutes");
 const {
     createSession,
     getOwnedSession,
-    startSession,
+    startSessionWithInitialBuy,
     pauseSession,
     resumeSession,
     stopSession,
@@ -208,7 +208,7 @@ function makeRouter(models, resolveInstrumentKey = async (symbol, key) => key ||
         marketDataService,
         createSession,
         getOwnedSession,
-        startSession,
+        startSessionWithInitialBuy,
         pauseSession,
         resumeSession,
         stopSession,
@@ -364,7 +364,7 @@ function validConfigBody(overrides = {}) {
 
         const tradesRes = fakeRes();
         await tradesHandle({ user: { mongoId: userId }, params: { sessionId }, query: {} }, tradesRes);
-        assert.strictEqual(tradesRes.body.total, 0); // no WS/processTick activity was simulated in this route-level test
+        assert.strictEqual(tradesRes.body.total, 1); // ADR-038: Start itself executes one immediate BUY
     });
 
     // ADR-028: the frontend-pushed /tick endpoint is DISPLAY-ONLY — a
@@ -397,13 +397,13 @@ function validConfigBody(overrides = {}) {
 
         const detailRes = fakeRes();
         await detailHandle({ user: { mongoId: userId }, params: { sessionId } }, detailRes);
-        assert.strictEqual(detailRes.body.portfolio.holdings, 0); // unchanged
+        assert.strictEqual(detailRes.body.portfolio.holdings, 100); // ADR-038: Start's own immediate BUY, unchanged by the tick
         assert.strictEqual(detailRes.body.state.lastPrice, 340); // crossing watermark untouched
         assert.strictEqual(detailRes.body.lastFeedPrice, 336); // display field IS updated
 
         const tradesRes = fakeRes();
         await tradesHandle({ user: { mongoId: userId }, params: { sessionId }, query: {} }, tradesRes);
-        assert.strictEqual(tradesRes.body.total, 0); // no ledger row was created
+        assert.strictEqual(tradesRes.body.total, 1); // only Start's own BUY — the tick created no ledger row
     });
 
     await test("tick endpoint rejects a non-positive price (never fabricates a fill)", async () => {
@@ -443,7 +443,7 @@ function validConfigBody(overrides = {}) {
         assert.strictEqual(res.statusCode, 404);
     });
 
-    await test("POST /sessions auto-captures the reference from a fresh live quote, ignoring any client-supplied referencePrice", async () => {
+    await test("POST /sessions does not capture any reference price — it stays null until Start (ADR-038)", async () => {
         const models = makeFakeModels();
         const marketDataService = makeFakeMarketDataService();
         marketDataService.liveData.set("NSE_EQ|GICRE", { ltp: 351.25, timestamp: Date.now() });
@@ -453,36 +453,130 @@ function validConfigBody(overrides = {}) {
         const res = fakeRes();
         await handle({ user: { mongoId: new mongoose.Types.ObjectId() }, body: validConfigBody({ referencePrice: 999 }) }, res);
         assert.strictEqual(res.statusCode, 201, JSON.stringify(res.body));
-        assert.strictEqual(res.body.session.config.referencePrice, 351.25, "must use the captured live quote, never the client-supplied value");
-        assert.ok(res.body.session.config.referenceCapturedAt, "referenceCapturedAt must be persisted");
+        assert.strictEqual(res.body.session.config.referencePrice, null);
+        assert.strictEqual(res.body.session.config.referenceCapturedAt, null);
     });
 
-    await test("POST /sessions rejects creation when no live quote is available at all", async () => {
+    await test("POST .../start auto-captures the reference from a fresh live quote, ignoring any client-supplied referencePrice, and buys immediately (ADR-038)", async () => {
+        const models = makeFakeModels();
+        const marketDataService = makeFakeMarketDataService();
+        marketDataService.liveData.set("NSE_EQ|GICRE", { ltp: 351.25, timestamp: Date.now() });
+        const router = makeRouter(models, undefined, marketDataService);
+        const createHandle = finalHandlerFor(router, "post", "/v2/grid-simulator/sessions");
+        const startHandle = finalHandlerFor(router, "post", "/v2/grid-simulator/sessions/:sessionId/start");
+        const userId = new mongoose.Types.ObjectId();
+
+        const createRes = fakeRes();
+        await createHandle({ user: { mongoId: userId }, body: validConfigBody({ referencePrice: 999 }) }, createRes);
+        const sessionId = createRes.body.session.sessionId;
+
+        const startRes = fakeRes();
+        await startHandle({ user: { mongoId: userId }, params: { sessionId } }, startRes);
+        assert.strictEqual(startRes.statusCode, 200, JSON.stringify(startRes.body));
+        assert.strictEqual(startRes.body.session.config.referencePrice, 351.25, "must use the captured live quote, never the client-supplied value");
+        assert.ok(startRes.body.session.config.referenceCapturedAt, "referenceCapturedAt must be persisted");
+    });
+
+    await test("POST .../start rejects when no live quote is available at all", async () => {
         const models = makeFakeModels();
         const marketDataService = makeFakeMarketDataService();
         // warmLiveQuotes() is a no-op that never populates liveData for this test.
         marketDataService.warmLiveQuotes = async () => {};
         const router = makeRouter(models, undefined, marketDataService);
-        const handle = finalHandlerFor(router, "post", "/v2/grid-simulator/sessions");
+        const createHandle = finalHandlerFor(router, "post", "/v2/grid-simulator/sessions");
+        const startHandle = finalHandlerFor(router, "post", "/v2/grid-simulator/sessions/:sessionId/start");
+        const userId = new mongoose.Types.ObjectId();
+
+        const createRes = fakeRes();
+        await createHandle({ user: { mongoId: userId }, body: validConfigBody() }, createRes);
+        const sessionId = createRes.body.session.sessionId;
 
         const res = fakeRes();
-        await handle({ user: { mongoId: new mongoose.Types.ObjectId() }, body: validConfigBody() }, res);
+        await startHandle({ user: { mongoId: userId }, params: { sessionId } }, res);
         assert.strictEqual(res.statusCode, 400);
         assert.ok(/fresh market quote/.test(res.body.message));
     });
 
-    await test("POST /sessions rejects creation when the only available quote is stale", async () => {
+    await test("POST .../start rejects when the only available quote is stale", async () => {
         const models = makeFakeModels();
         const marketDataService = makeFakeMarketDataService();
         marketDataService.liveData.set("NSE_EQ|GICRE", { ltp: 340, timestamp: Date.now() - 60_000 }); // 60s old
         marketDataService.warmLiveQuotes = async () => {}; // simulate the warm call not refreshing it (e.g. instrument unreachable)
         const router = makeRouter(models, undefined, marketDataService);
-        const handle = finalHandlerFor(router, "post", "/v2/grid-simulator/sessions");
+        const createHandle = finalHandlerFor(router, "post", "/v2/grid-simulator/sessions");
+        const startHandle = finalHandlerFor(router, "post", "/v2/grid-simulator/sessions/:sessionId/start");
+        const userId = new mongoose.Types.ObjectId();
+
+        const createRes = fakeRes();
+        await createHandle({ user: { mongoId: userId }, body: validConfigBody() }, createRes);
+        const sessionId = createRes.body.session.sessionId;
 
         const res = fakeRes();
-        await handle({ user: { mongoId: new mongoose.Types.ObjectId() }, body: validConfigBody() }, res);
+        await startHandle({ user: { mongoId: userId }, params: { sessionId } }, res);
         assert.strictEqual(res.statusCode, 400);
         assert.ok(/fresh market quote/.test(res.body.message));
+    });
+
+    await test("GET .../preview-quote returns the live quote for a CREATED session without starting it (read-only)", async () => {
+        const models = makeFakeModels();
+        const marketDataService = makeFakeMarketDataService();
+        marketDataService.liveData.set("NSE_EQ|GICRE", { ltp: 351.25, timestamp: Date.now() });
+        const router = makeRouter(models, undefined, marketDataService);
+        const createHandle = finalHandlerFor(router, "post", "/v2/grid-simulator/sessions");
+        const previewHandle = finalHandlerFor(router, "get", "/v2/grid-simulator/sessions/:sessionId/preview-quote");
+        const userId = new mongoose.Types.ObjectId();
+
+        const createRes = fakeRes();
+        await createHandle({ user: { mongoId: userId }, body: validConfigBody() }, createRes);
+        const sessionId = createRes.body.session.sessionId;
+
+        const res = fakeRes();
+        await previewHandle({ user: { mongoId: userId }, params: { sessionId } }, res);
+        assert.strictEqual(res.statusCode, 200, JSON.stringify(res.body));
+        assert.strictEqual(res.body.price, 351.25);
+        assert.ok(res.body.capturedAt);
+
+        // Still CREATED — this endpoint never starts the session or captures a reference.
+        const detailRes = fakeRes();
+        await finalHandlerFor(router, "get", "/v2/grid-simulator/sessions/:sessionId")({ user: { mongoId: userId }, params: { sessionId } }, detailRes);
+        assert.strictEqual(detailRes.body.status, "CREATED");
+        assert.strictEqual(detailRes.body.config.referencePrice, null);
+    });
+
+    await test("GET .../preview-quote 404s when no live quote is available", async () => {
+        const models = makeFakeModels();
+        const marketDataService = makeFakeMarketDataService();
+        marketDataService.warmLiveQuotes = async () => {};
+        const router = makeRouter(models, undefined, marketDataService);
+        const createHandle = finalHandlerFor(router, "post", "/v2/grid-simulator/sessions");
+        const previewHandle = finalHandlerFor(router, "get", "/v2/grid-simulator/sessions/:sessionId/preview-quote");
+        const userId = new mongoose.Types.ObjectId();
+
+        const createRes = fakeRes();
+        await createHandle({ user: { mongoId: userId }, body: validConfigBody() }, createRes);
+        const sessionId = createRes.body.session.sessionId;
+
+        const res = fakeRes();
+        await previewHandle({ user: { mongoId: userId }, params: { sessionId } }, res);
+        assert.strictEqual(res.statusCode, 404);
+    });
+
+    await test("GET .../preview-quote is ownership-scoped (404 for another user's session)", async () => {
+        const models = makeFakeModels();
+        const marketDataService = makeFakeMarketDataService();
+        const router = makeRouter(models, undefined, marketDataService);
+        const createHandle = finalHandlerFor(router, "post", "/v2/grid-simulator/sessions");
+        const previewHandle = finalHandlerFor(router, "get", "/v2/grid-simulator/sessions/:sessionId/preview-quote");
+        const owner = new mongoose.Types.ObjectId();
+        const other = new mongoose.Types.ObjectId();
+
+        const createRes = fakeRes();
+        await createHandle({ user: { mongoId: owner }, body: validConfigBody() }, createRes);
+        const sessionId = createRes.body.session.sessionId;
+
+        const res = fakeRes();
+        await previewHandle({ user: { mongoId: other }, params: { sessionId } }, res);
+        assert.strictEqual(res.statusCode, 404);
     });
 
     await test("POST /sessions requires startingAvgCost when startingHoldings > 0", async () => {

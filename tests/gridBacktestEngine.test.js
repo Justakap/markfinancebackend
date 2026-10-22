@@ -96,31 +96,28 @@ test("ADR-031 finer-grained replay: 320 -> 317 -> 314 -> 317 -> 320 rebases with
     assert.strictEqual(result.equitySeries.length, 4);
 });
 
-test("ADR-031 finer-grained replay: 320 -> 323 -> 326 -> 323 with zero starting holdings skips both sells, rebases, then the reversal is a genuine BUY", () => {
+test("ADR-037: with zero starting holdings, an upward move before any BUY finds no pending sell level to cross — zero trades, then a pullback still buys normally", () => {
     const candles = [
-        candle(1, { open: 320, high: 323, low: 320, close: 323 }),
-        candle(2, { open: 323, high: 326, low: 323, close: 326 }),
-        candle(3, { open: 326, high: 326, low: 323, close: 323 }),
+        candle(1, { open: 320, high: 323, low: 320, close: 323 }), // nothing to sell yet — zero trades
+        candle(2, { open: 323, high: 326, low: 323, close: 326 }), // still nothing to sell — zero trades
+        candle(3, { open: 326, high: 326, low: 317, close: 317 }), // pullback through the original seeded BUY level (317)
     ];
     const result = replayCandles({ config: BASE_CONFIG, candles, isFinerGrained: true });
 
-    assert.strictEqual(result.trades.length, 3);
-    assert.strictEqual(result.trades[0].type, "SELL");
-    assert.strictEqual(result.trades[0].qtyFilled, 0);
-    assert.strictEqual(result.trades[0].reason, "insufficient_holdings");
-    assert.strictEqual(result.trades[1].type, "SELL");
-    assert.strictEqual(result.trades[1].qtyFilled, 0);
-    // The reversal down through the rebased 326 reference's next level
-    // (323) is now a genuine BUY, not a dead "re-arm only" zone.
-    assert.strictEqual(result.trades[2].type, "BUY");
-    assert.strictEqual(result.trades[2].qtyFilled, 100);
+    assert.strictEqual(result.trades.length, 1);
+    assert.strictEqual(result.trades[0].type, "BUY");
+    assert.strictEqual(result.trades[0].levelPrice, 317);
+    assert.strictEqual(result.trades[0].qtyFilled, 100);
     assert.strictEqual(result.state.holdings, 100);
-    assert.ok(result.state.holdings >= 0);
 });
 
 test("multi-level gap 320 -> 330 across a single finer-grained candle: observed fill price vs. theoretical level stay distinct", () => {
+    // Seeded with starting inventory (cost = the reference itself) so the
+    // starting lot's own sell target (320+3=323) is in range for this gap —
+    // ADR-037 sell targets are per-lot, not a standing reference-only level.
+    const config = { ...BASE_CONFIG, startingHoldings: 300, startingAvgCost: 320 };
     const candles = [candle(1, { open: 320, high: 330, low: 320, close: 330 })];
-    const result = replayCandles({ config: BASE_CONFIG, candles, isFinerGrained: true });
+    const result = replayCandles({ config, candles, isFinerGrained: true });
 
     assert.strictEqual(result.trades.length, 3); // levels 323, 326, 329
     result.trades.forEach((t) => {
@@ -128,6 +125,7 @@ test("multi-level gap 320 -> 330 across a single finer-grained candle: observed 
         assert.strictEqual(t.fillPrice, 330, "every fill uses the actual observed price");
     });
     assert.deepStrictEqual(result.trades.map((t) => t.levelPrice), [323, 326, 329]);
+    assert.strictEqual(result.state.holdings, 0);
 });
 
 // --- conservative fallback intrabar policy ---

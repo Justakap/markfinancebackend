@@ -99,7 +99,7 @@ const {
 const {
     createSession: createGridSession,
     getOwnedSession: getOwnedGridSession,
-    startSession: startGridSession,
+    startSessionWithInitialBuy: startGridSessionWithInitialBuy,
     pauseSession: pauseGridSession,
     resumeSession: resumeGridSession,
     stopSession: stopGridSession,
@@ -319,7 +319,7 @@ app.use(
         marketDataService: upstoxMarketData,
         createSession: createGridSession,
         getOwnedSession: getOwnedGridSession,
-        startSession: startGridSession,
+        startSessionWithInitialBuy: startGridSessionWithInitialBuy,
         pauseSession: pauseGridSession,
         resumeSession: resumeGridSession,
         stopSession: stopGridSession,
