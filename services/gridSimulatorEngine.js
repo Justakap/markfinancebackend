@@ -188,6 +188,32 @@ function validateGridConfig(config = {}) {
         }
     }
 
+    // ADR-040: optional price limits — a floor below which BUYs pause and a
+    // ceiling above which SELLs pause (see processPriceUpdate). Both null/
+    // absent by default (no limit). When either is provided it must be a
+    // positive number; when both are provided, upperLimit must exceed
+    // lowerLimit (an inverted or equal band can never be meaningfully
+    // traded).
+    if (config.lowerLimit !== undefined && config.lowerLimit !== null) {
+        if (!isFiniteNumber(config.lowerLimit) || config.lowerLimit <= 0) {
+            errors.push("lowerLimit must be a positive number when provided");
+        }
+    }
+    if (config.upperLimit !== undefined && config.upperLimit !== null) {
+        if (!isFiniteNumber(config.upperLimit) || config.upperLimit <= 0) {
+            errors.push("upperLimit must be a positive number when provided");
+        }
+    }
+    if (
+        config.lowerLimit != null &&
+        config.upperLimit != null &&
+        isFiniteNumber(config.lowerLimit) &&
+        isFiniteNumber(config.upperLimit) &&
+        config.upperLimit <= config.lowerLimit
+    ) {
+        errors.push("upperLimit must be greater than lowerLimit");
+    }
+
     return { valid: errors.length === 0, errors };
 }
 
@@ -208,6 +234,10 @@ function normalizeConfig(config) {
         maxPositionSize: config.maxPositionSize ?? null,
         startingHoldings: Math.max(0, Math.trunc(config.startingHoldings || 0)),
         startingAvgCost: config.startingHoldings > 0 ? roundPrice(config.startingAvgCost) : 0,
+        // ADR-040: optional price band. null/absent means no limit on that
+        // side.
+        lowerLimit: config.lowerLimit != null ? roundPrice(config.lowerLimit) : null,
+        upperLimit: config.upperLimit != null ? roundPrice(config.upperLimit) : null,
     };
 }
 
@@ -561,6 +591,17 @@ function processPriceUpdate({ config: rawConfig, state, price, eventTimestamp })
     let pendingSellLevels = [...(state.pendingSellLevels || [])];
     const trades = [];
 
+    // ADR-040: optional price band — BUYs pause once the current price is
+    // at/below lowerLimit (every fill in this event would execute at
+    // roundedPrice, so if that price already breaches the floor, no buy
+    // this event can avoid breaching it either), SELLs pause once price is
+    // at/above upperLimit. This is a live gate, not a one-time trip: armed
+    // levels are untouched (never consumed/removed) while paused, and the
+    // very next event where price is back within bounds cascades through
+    // them normally.
+    const buysLimited = direction === "down" && config.lowerLimit != null && roundedPrice <= config.lowerLimit;
+    const sellsLimited = direction === "up" && config.upperLimit != null && roundedPrice >= config.upperLimit;
+
     // ADR-037: direction alone decides which array is even reachable this
     // event (see the file doc comment's invariant — a newly-armed SELL
     // level is always above current price at creation, a newly-armed BUY
@@ -570,6 +611,7 @@ function processPriceUpdate({ config: rawConfig, state, price, eventTimestamp })
     // may ALSO fall within the remaining range — a gap must still cascade
     // through every level it passes, exactly as ADR-031 did.
     for (;;) {
+        if (buysLimited || sellsLimited) break;
         const levelPriceValue = findNearestInRangeLevel(direction === "down" ? pendingBuyLevels : pendingSellLevels, loCents, hiCents, direction);
         if (levelPriceValue == null) break;
 

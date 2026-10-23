@@ -80,6 +80,8 @@ async function createSession({ GridSimulatorSession, userId, instrumentKey, symb
                 maxPositionSize: config.maxPositionSize ?? null,
                 startingHoldings: config.startingHoldings ?? 0,
                 startingAvgCost: config.startingHoldings > 0 ? config.startingAvgCost : 0,
+                lowerLimit: config.lowerLimit ?? null,
+                upperLimit: config.upperLimit ?? null,
                 segmentClass: config.segmentClass || "EQUITY_DELIVERY",
             },
             state: initialState,
@@ -148,6 +150,14 @@ async function startSessionWithInitialBuy({ GridSimulatorSession, GridSimulatorT
         throw makeError(409, `Cannot start from its current state (${session.status})`);
     }
 
+    const { lowerLimit, upperLimit } = session.config;
+    if (lowerLimit != null && referencePrice <= lowerLimit) {
+        throw makeError(400, `The captured live price (₹${referencePrice}) is already at or below the configured Lower Limit (₹${lowerLimit}) — adjust the limit or try again once price recovers.`);
+    }
+    if (upperLimit != null && referencePrice >= upperLimit) {
+        throw makeError(400, `The captured live price (₹${referencePrice}) is already at or above the configured Upper Limit (₹${upperLimit}) — adjust the limit or try again once price pulls back.`);
+    }
+
     const config = {
         referencePrice,
         gridInterval: session.config.gridInterval,
@@ -158,6 +168,8 @@ async function startSessionWithInitialBuy({ GridSimulatorSession, GridSimulatorT
         maxPositionSize: session.config.maxPositionSize,
         startingHoldings: session.config.startingHoldings,
         startingAvgCost: session.config.startingAvgCost,
+        lowerLimit,
+        upperLimit,
     };
 
     const { state, trade } = startWithInitialBuy(config, referenceCapturedAt);
@@ -474,10 +486,16 @@ function getPortfolioMetrics(session, currentPrice) {
 function nearestPendingLevels({ state, config }) {
     const hasMigrated = Array.isArray(state.pendingBuyLevels) && state.pendingBuyLevels.length > 0;
     if (hasMigrated) {
+        const buys = state.pendingBuyLevels;
         const sells = state.pendingSellLevels || [];
+        // ADR-040 UI follow-up: the full ladder, not just the nearest level
+        // on each side — nearest-first, so the UI can show "+N more armed"
+        // without re-sorting itself.
         return {
-            nextBuyLevel: Math.max(...state.pendingBuyLevels),
+            nextBuyLevel: Math.max(...buys),
             nextSellLevel: sells.length ? Math.min(...sells) : null,
+            pendingBuyLevels: [...buys].sort((a, b) => b - a),
+            pendingSellLevels: [...sells].sort((a, b) => a - b),
         };
     }
     // ADR-038: a CREATED session not yet started has no reference at all
@@ -485,12 +503,16 @@ function nearestPendingLevels({ state, config }) {
     // genuinely nothing to report yet, never fabricate a number from null.
     const legacyReference = state.activeReference ?? config.referencePrice;
     if (legacyReference == null) {
-        return { nextBuyLevel: null, nextSellLevel: null };
+        return { nextBuyLevel: null, nextSellLevel: null, pendingBuyLevels: [], pendingSellLevels: [] };
     }
     const sellVariance = config.sellVariance ?? config.gridInterval;
+    const legacyBuy = legacyReference - config.gridInterval;
+    const legacySell = state.holdings > 0 ? legacyReference + sellVariance : null;
     return {
-        nextBuyLevel: legacyReference - config.gridInterval,
-        nextSellLevel: state.holdings > 0 ? legacyReference + sellVariance : null,
+        nextBuyLevel: legacyBuy,
+        nextSellLevel: legacySell,
+        pendingBuyLevels: [legacyBuy],
+        pendingSellLevels: legacySell != null ? [legacySell] : [],
     };
 }
 

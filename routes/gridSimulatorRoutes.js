@@ -153,6 +153,9 @@ function createGridSimulatorRoutes({
                 maxPositionSize,
                 startingHoldings,
                 startingAvgCost,
+                usePriceLimits,
+                lowerLimit,
+                upperLimit,
             } = req.body;
 
             if (!symbol && !bodyInstrumentKey) {
@@ -168,6 +171,23 @@ function createGridSimulatorRoutes({
             }
             if (sellQuantityPerLevel != null && !(Number.isInteger(Number(sellQuantityPerLevel)) && Number(sellQuantityPerLevel) > 0)) {
                 return res.status(400).json({ message: "sellQuantityPerLevel must be a positive integer when provided" });
+            }
+
+            // ADR-040: optional price band — require both bounds, as positive
+            // numbers with upperLimit > lowerLimit, whenever the client opts
+            // in via usePriceLimits. Never silently accept a half-specified
+            // or inverted band.
+            let normalizedLowerLimit = null;
+            let normalizedUpperLimit = null;
+            if (usePriceLimits) {
+                if (!(Number.isFinite(Number(lowerLimit)) && Number(lowerLimit) > 0) || !(Number.isFinite(Number(upperLimit)) && Number(upperLimit) > 0)) {
+                    return res.status(400).json({ message: "Both an Upper Limit and a Lower Limit are required and must be positive numbers when price limits are enabled" });
+                }
+                if (Number(upperLimit) <= Number(lowerLimit)) {
+                    return res.status(400).json({ message: "Upper Limit must be greater than Lower Limit" });
+                }
+                normalizedLowerLimit = Number(lowerLimit);
+                normalizedUpperLimit = Number(upperLimit);
             }
 
             const instrumentKey = await resolveInstrumentKey(symbol, bodyInstrumentKey);
@@ -204,6 +224,8 @@ function createGridSimulatorRoutes({
                     maxPositionSize: maxPositionSize != null ? Number(maxPositionSize) : null,
                     startingHoldings: holdings,
                     startingAvgCost: holdings > 0 ? Number(startingAvgCost) : 0,
+                    lowerLimit: normalizedLowerLimit,
+                    upperLimit: normalizedUpperLimit,
                     segmentClass,
                 },
             });

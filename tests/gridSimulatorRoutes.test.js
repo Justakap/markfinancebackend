@@ -612,6 +612,66 @@ function validConfigBody(overrides = {}) {
         assert.strictEqual(res.statusCode, 201, JSON.stringify(res.body));
     });
 
+    // --- ADR-040: optional price limits ---
+
+    await test("POST /sessions persists lowerLimit/upperLimit when usePriceLimits is set", async () => {
+        const models = makeFakeModels();
+        const router = makeRouter(models);
+        const handle = finalHandlerFor(router, "post", "/v2/grid-simulator/sessions");
+
+        const res = fakeRes();
+        await handle({ user: { mongoId: new mongoose.Types.ObjectId() }, body: validConfigBody({ usePriceLimits: true, lowerLimit: 300, upperLimit: 400 }) }, res);
+        assert.strictEqual(res.statusCode, 201, JSON.stringify(res.body));
+        assert.strictEqual(res.body.session.config.lowerLimit, 300);
+        assert.strictEqual(res.body.session.config.upperLimit, 400);
+    });
+
+    await test("POST /sessions rejects usePriceLimits:true with a missing or inverted band", async () => {
+        const models = makeFakeModels();
+        const router = makeRouter(models);
+        const handle = finalHandlerFor(router, "post", "/v2/grid-simulator/sessions");
+        const userId = new mongoose.Types.ObjectId();
+
+        const missing = fakeRes();
+        await handle({ user: { mongoId: userId }, body: validConfigBody({ usePriceLimits: true, lowerLimit: 300 }) }, missing);
+        assert.strictEqual(missing.statusCode, 400);
+
+        const inverted = fakeRes();
+        await handle({ user: { mongoId: userId }, body: validConfigBody({ symbol: "GICRE2", usePriceLimits: true, lowerLimit: 400, upperLimit: 300 }) }, inverted);
+        assert.strictEqual(inverted.statusCode, 400);
+    });
+
+    await test("POST /sessions leaves lowerLimit/upperLimit null when usePriceLimits is not set, even if stray values are supplied", async () => {
+        const models = makeFakeModels();
+        const router = makeRouter(models);
+        const handle = finalHandlerFor(router, "post", "/v2/grid-simulator/sessions");
+
+        const res = fakeRes();
+        await handle({ user: { mongoId: new mongoose.Types.ObjectId() }, body: validConfigBody({ lowerLimit: 300, upperLimit: 400 }) }, res);
+        assert.strictEqual(res.statusCode, 201, JSON.stringify(res.body));
+        assert.strictEqual(res.body.session.config.lowerLimit, null);
+        assert.strictEqual(res.body.session.config.upperLimit, null);
+    });
+
+    await test("POST .../start rejects when the captured live price is already outside the configured price limits", async () => {
+        const models = makeFakeModels();
+        const marketDataService = makeFakeMarketDataService();
+        marketDataService.liveData.set("NSE_EQ|GICRE", { ltp: 290, timestamp: Date.now() }); // below lowerLimit
+        const router = makeRouter(models, undefined, marketDataService);
+        const createHandle = finalHandlerFor(router, "post", "/v2/grid-simulator/sessions");
+        const startHandle = finalHandlerFor(router, "post", "/v2/grid-simulator/sessions/:sessionId/start");
+        const userId = new mongoose.Types.ObjectId();
+
+        const createRes = fakeRes();
+        await createHandle({ user: { mongoId: userId }, body: validConfigBody({ usePriceLimits: true, lowerLimit: 300, upperLimit: 400 }) }, createRes);
+        const sessionId = createRes.body.session.sessionId;
+
+        const res = fakeRes();
+        await startHandle({ user: { mongoId: userId }, params: { sessionId } }, res);
+        assert.strictEqual(res.statusCode, 400);
+        assert.ok(/Lower Limit/.test(res.body.message));
+    });
+
     // --- PATCH .../config (ADR-034 live edit) ---
 
     await test("PATCH .../config rejects editing a session that isn't PAUSED", async () => {

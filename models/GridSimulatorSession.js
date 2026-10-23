@@ -59,6 +59,12 @@ const gridSimulatorSessionSchema = new mongoose.Schema(
             // startingHoldings > 0.
             startingHoldings: { type: Number, default: 0 },
             startingAvgCost: { type: Number, default: 0 },
+            // ADR-040: optional price band, set at creation only (not live-
+            // editable). While price is at/below lowerLimit, BUYs pause;
+            // while at/above upperLimit, SELLs pause — a live gate, not a
+            // one-time trip (see gridSimulatorEngine.js's processPriceUpdate).
+            lowerLimit: { type: Number, default: null },
+            upperLimit: { type: Number, default: null },
             // ADR-035: immutable, captured once at session creation (same
             // precedent as referencePrice) from the resolved instrument's
             // type/segment — drives the DISPLAY-ONLY statutory charges

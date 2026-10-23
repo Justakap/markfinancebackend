@@ -836,5 +836,62 @@ test("ADR-035: sellQuantityPerLevel omitted (null) mirrors quantityPerLevel exac
     assert.deepStrictEqual(stateA, stateB);
 });
 
+// --- ADR-040: optional price limits (pause BUYs/SELLs beyond a band) ---
+
+test("validateGridConfig rejects a non-positive lowerLimit/upperLimit, and an inverted/equal band", () => {
+    assert.strictEqual(validateGridConfig({ ...BASE_CONFIG, lowerLimit: 0 }).valid, false);
+    assert.strictEqual(validateGridConfig({ ...BASE_CONFIG, upperLimit: -5 }).valid, false);
+    assert.strictEqual(validateGridConfig({ ...BASE_CONFIG, lowerLimit: 330, upperLimit: 330 }).valid, false);
+    assert.strictEqual(validateGridConfig({ ...BASE_CONFIG, lowerLimit: 340, upperLimit: 330 }).valid, false);
+    assert.strictEqual(validateGridConfig({ ...BASE_CONFIG, lowerLimit: 330, upperLimit: 350 }).valid, true);
+    assert.strictEqual(validateGridConfig(BASE_CONFIG).valid, true); // both omitted -> no limit, still valid
+});
+
+test("a lowerLimit pauses BUYs once price is at/below it, and resumes automatically once price recovers above it", () => {
+    const config = { referencePrice: 50, gridInterval: 2, quantityPerLevel: 10, startingCapital: 1000000, lowerLimit: 45 };
+    let state = createInitialGridState(config);
+    const t = (n) => new Date(2026, 0, 1, 9, n).toISOString();
+
+    let r = processPriceUpdate({ config, state, price: 48, eventTimestamp: t(1) }); // BUY@48, arms BUY@46
+    state = r.state;
+    assert.strictEqual(r.trades.length, 1);
+
+    r = processPriceUpdate({ config, state, price: 44, eventTimestamp: t(2) }); // 44 <= 45 -> paused, BUY@46 stays pending
+    state = r.state;
+    assert.strictEqual(r.trades.length, 0);
+    assert.deepStrictEqual(state.pendingBuyLevels, [46]);
+
+    r = processPriceUpdate({ config, state, price: 47, eventTimestamp: t(3) }); // up move, nothing to sell, just repositions
+    state = r.state;
+    assert.strictEqual(r.trades.length, 0);
+
+    r = processPriceUpdate({ config, state, price: 45.5, eventTimestamp: t(4) }); // down through 46, price (45.5) > lowerLimit -> resumes
+    state = r.state;
+    assert.strictEqual(r.trades.length, 1);
+    assert.strictEqual(r.trades[0].type, "BUY");
+    assert.strictEqual(r.trades[0].fillPrice, 45.5);
+});
+
+test("an upperLimit pauses SELLs once price is at/above it, and resumes automatically once price pulls back below it", () => {
+    const config = { referencePrice: 50, gridInterval: 2, quantityPerLevel: 10, startingCapital: 1000000, startingHoldings: 10, startingAvgCost: 50, upperLimit: 53 };
+    let state = createInitialGridState(config); // seeds a pending sell at 50+2=52
+    const t = (n) => new Date(2026, 0, 1, 9, n).toISOString();
+
+    let r = processPriceUpdate({ config, state, price: 60, eventTimestamp: t(1) }); // straight through 52, but 60 >= 53 -> paused
+    state = r.state;
+    assert.strictEqual(r.trades.length, 0);
+    assert.deepStrictEqual(state.pendingSellLevels, [52]);
+
+    r = processPriceUpdate({ config, state, price: 51.5, eventTimestamp: t(2) }); // down move, irrelevant to sells
+    state = r.state;
+    assert.strictEqual(r.trades.length, 0);
+
+    r = processPriceUpdate({ config, state, price: 52, eventTimestamp: t(3) }); // up to 52 (< 53) -> resumes
+    state = r.state;
+    assert.strictEqual(r.trades.length, 1);
+    assert.strictEqual(r.trades[0].type, "SELL");
+    assert.strictEqual(r.trades[0].fillPrice, 52);
+});
+
 console.log(`\nGrid simulator engine tests: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
